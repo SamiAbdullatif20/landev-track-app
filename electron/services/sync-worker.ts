@@ -14,11 +14,13 @@ export type SyncStatus = {
 
 type SyncWorkerOptions = {
   readToken: () => string | null;
+  readSessionCookie: () => string | null;
   window: BrowserWindow;
 };
 
 export class SyncWorker {
   private readonly readToken: () => string | null;
+  private readonly readSessionCookie: () => string | null;
   private readonly window: BrowserWindow;
   private interval: NodeJS.Timeout | null = null;
   private syncInProgress = false;
@@ -33,6 +35,7 @@ export class SyncWorker {
 
   constructor(options: SyncWorkerOptions) {
     this.readToken = options.readToken;
+    this.readSessionCookie = options.readSessionCookie;
     this.window = options.window;
     this.status.pendingCount = getPendingCount();
   }
@@ -62,8 +65,9 @@ export class SyncWorker {
       return this.getStatus();
     }
 
-    const token = this.readToken();
-    if (!token) {
+    const token = this.readToken() ?? undefined;
+    const sessionCookie = this.readSessionCookie() ?? undefined;
+    if (!token && !sessionCookie) {
       this.status.pendingCount = getPendingCount();
       this.publishStatus();
       return this.getStatus();
@@ -86,7 +90,7 @@ export class SyncWorker {
               eventUuid: event.eventUuid,
               eventKind: event.eventKind
             } as api.TrackingEventInput,
-            { token }
+            { token, sessionCookie }
           );
           markEventDelivered(event.id);
           this.status.online = true;

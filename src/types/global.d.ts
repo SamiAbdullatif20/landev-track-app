@@ -11,6 +11,8 @@ type TrackingStatus = {
 type Project = {
   id: string;
   name: string;
+  projectNumber: string | null;
+  clientName: string | null;
 };
 
 type SyncStatus = {
@@ -33,6 +35,17 @@ type AppInfo = {
   apiBaseUrl: string;
 };
 
+type StopSessionResult = {
+  ok: true;
+  queued: boolean;
+  endpointPath: string;
+  status: number | null;
+  confirmedBy: "tracking" | "attendance" | "idempotent";
+  sessionId: string | null;
+  timesheetId: string | null;
+  responsePreview: string | null;
+};
+
 declare global {
   interface Window {
     desktopAPI: {
@@ -42,8 +55,8 @@ declare global {
       getAppInfo: () => Promise<AppInfo>;
       testConnection: () => Promise<{ reachable: boolean; message: string }>;
       getProjects: () => Promise<{ projects: Project[] }>;
-      startSession: (payload: { projectId: string; description: string }) => Promise<{ sessionId: string }>;
-      stopSession: (payload: { stoppedAt: string }) => Promise<{ ok: true }>;
+      startSession: (payload: { projectId: string; description: string }) => Promise<{ sessionId: string | null }>;
+      stopSession: (payload: { stoppedAt: string }) => Promise<StopSessionResult>;
       trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => Promise<{ queued: boolean }>;
       getStatus: () => Promise<TrackingStatus>;
       getSyncStatus: () => Promise<SyncStatus>;

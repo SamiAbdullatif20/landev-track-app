@@ -58,6 +58,27 @@ export function getPendingCount(): number {
   return row.total;
 }
 
+function isSyntheticSessionId(value: unknown): boolean {
+  return typeof value === "string" && /^\d{13,}$/.test(value.trim());
+}
+
+export function clearSyntheticSessionPendingEvents(limit = 5000): number {
+  const events = getPendingEvents(limit);
+  let cleared = 0;
+  for (const event of events) {
+    try {
+      const payload = JSON.parse(event.payloadJson) as Record<string, unknown>;
+      if (isSyntheticSessionId(payload.sessionId)) {
+        markEventDelivered(event.id);
+        cleared += 1;
+      }
+    } catch {
+      // Ignore malformed payload rows.
+    }
+  }
+  return cleared;
+}
+
 export function getSessionState(): SessionState {
   const db = getDb();
   return db.prepare("SELECT * FROM active_session WHERE id = 1").get() as SessionState;

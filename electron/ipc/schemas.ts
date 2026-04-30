@@ -6,8 +6,8 @@ export const loginSchema = z.object({
 });
 
 export const startSchema = z.object({
-  projectId: z.string().min(1),
-  description: z.string().min(10)
+  projectId: z.string().trim().min(1),
+  description: z.string().trim().min(3).max(2000)
 });
 
 export const eventSchema = z.object({

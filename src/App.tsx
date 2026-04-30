@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "./store/authStore";
 import { useTrackingStore } from "./store/trackingStore";
 import { useActivityTracker } from "./hooks/useActivityTracker";
@@ -7,13 +7,23 @@ import { toFriendlyMessage } from "./utils/errors";
 import { sanitizeDisplayText } from "./utils/sanitize";
 import "./App.css";
 
-const DESCRIPTION_MIN_LENGTH = 10;
+const DESCRIPTION_MIN_LENGTH = 3;
+const DESCRIPTION_MAX_LENGTH = 2000;
 
 function App() {
   const [password, setPassword] = useState("");
   const [showAbout, setShowAbout] = useState(false);
   const [connectionTesting, setConnectionTesting] = useState(false);
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [stopInfo, setStopInfo] = useState<{
+    confirmedBy: "tracking" | "attendance" | "idempotent";
+    endpointPath: string;
+    status: number | null;
+    sessionId: string | null;
+    timesheetId: string | null;
+    queued: boolean;
+  } | null>(null);
   const [appInfo, setAppInfo] = useState<{
     appName: string;
     appVersion: string;
@@ -32,6 +42,7 @@ function App() {
     lastError: null as string | null,
     lastSyncAt: null as string | null
   });
+  const stopInFlightRef = useRef(false);
 
   const { toasts, pushToast } = useToasts();
 
@@ -65,6 +76,34 @@ function App() {
     window.desktopAPI.getAppInfo().then(setAppInfo).catch(() => undefined);
   }, []);
 
+  const fetchProjectsWithRetry = useCallback(async (attempts = 3): Promise<void> => {
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+          const projectResult = await window.desktopAPI.getProjects();
+          setProjects(projectResult.projects.map((project) => ({
+            id: project.id,
+            name: sanitizeDisplayText(project.name),
+            projectNumber: project.projectNumber,
+            clientName: project.clientName ? sanitizeDisplayText(project.clientName) : null
+          })));
+          return;
+        } catch (error) {
+          if (attempt === attempts) {
+            const message = toFriendlyMessage(error);
+            setProjectsError(message);
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+        }
+      }
+    } finally {
+      setProjectsLoading(false);
+    }
+  }, [setProjects, setProjectsLoading]);
+
   useEffect(() => {
     const initialize = async () => {
       setAuthLoading(true);
@@ -78,10 +117,7 @@ function App() {
 
         setAuthStatus("authenticated");
         setRoles(status.roles);
-        const [statusResult, projectResult] = await Promise.all([
-          window.desktopAPI.getStatus(),
-          window.desktopAPI.getProjects()
-        ]);
+        const statusResult = await window.desktopAPI.getStatus();
 
         setSession({
           active: statusResult.active,
@@ -90,7 +126,7 @@ function App() {
           description: statusResult.description ?? "",
           startedAt: statusResult.startedAt
         });
-        setProjects(projectResult.projects);
+        await fetchProjectsWithRetry();
       } catch (error) {
         setAuthStatus("anonymous");
         setAuthError(toFriendlyMessage(error));
@@ -121,17 +157,27 @@ function App() {
       unsubscribe();
       unsubscribeSync();
     };
-  }, [setAuthError, setAuthLoading, setAuthStatus, setProjects, setRoles, setSession]);
+  }, [fetchProjectsWithRetry, setAuthError, setAuthLoading, setAuthStatus, setRoles, setSession]);
 
   const canStart = useMemo(() => {
+    const trimmedDescription = session.description.trim();
     return (
       authStatus === "authenticated" &&
       !session.active &&
       !sessionLoading &&
       session.projectId.trim().length > 0 &&
-      session.description.trim().length >= DESCRIPTION_MIN_LENGTH
+      trimmedDescription.length >= DESCRIPTION_MIN_LENGTH &&
+      trimmedDescription.length <= DESCRIPTION_MAX_LENGTH
     );
   }, [authStatus, session.active, session.description, session.projectId, sessionLoading]);
+
+  const trimmedDescriptionLength = session.description.trim().length;
+  const descriptionValidationError =
+    trimmedDescriptionLength > 0 && trimmedDescriptionLength < DESCRIPTION_MIN_LENGTH
+      ? "Add a short description (min 3 characters)."
+      : trimmedDescriptionLength > DESCRIPTION_MAX_LENGTH
+        ? `Description is too long (max ${DESCRIPTION_MAX_LENGTH} characters).`
+        : null;
 
   const onTestConnection = async () => {
     setConnectionTesting(true);
@@ -160,15 +206,7 @@ function App() {
       setRoles(loginResult.roles);
       setPassword("");
 
-      setProjectsLoading(true);
-      const [projectResult, statusResult] = await Promise.all([
-        window.desktopAPI.getProjects(),
-        window.desktopAPI.getStatus()
-      ]);
-      setProjects(projectResult.projects.map((project) => ({
-        id: project.id,
-        name: sanitizeDisplayText(project.name)
-      })));
+      const statusResult = await window.desktopAPI.getStatus();
       setSession({
         active: statusResult.active,
         sessionId: statusResult.sessionId,
@@ -177,13 +215,13 @@ function App() {
         startedAt: statusResult.startedAt
       });
 
+      await fetchProjectsWithRetry();
       await window.desktopAPI.syncNow();
       pushToast("success", "Logged in successfully.");
     } catch (error) {
       setAuthError(toFriendlyMessage(error));
       pushToast("error", "Login failed.");
     } finally {
-      setProjectsLoading(false);
       setAuthLoading(false);
     }
   };
@@ -196,6 +234,7 @@ function App() {
       await window.desktopAPI.logout();
       resetTracking();
       resetAuth();
+      setProjectsError(null);
       pushToast("info", "Logged out.");
     } catch (error) {
       setAuthError(toFriendlyMessage(error));
@@ -207,12 +246,22 @@ function App() {
 
   const onStart = async () => {
     if (sessionLoading || session.active) return;
+    const trimmedDescription = session.description.trim();
+    if (!session.projectId.trim()) {
+      setTrackingError("Select a project before starting work.");
+      return;
+    }
+    if (trimmedDescription.length < DESCRIPTION_MIN_LENGTH || trimmedDescription.length > DESCRIPTION_MAX_LENGTH) {
+      setTrackingError("Add a short description (min 3 characters).");
+      return;
+    }
     setSessionLoading(true);
     setTrackingError(null);
+    setStopInfo(null);
     try {
       const result = await window.desktopAPI.startSession({
         projectId: session.projectId,
-        description: session.description.trim()
+        description: trimmedDescription
       });
       setSession({ active: true, sessionId: result.sessionId, startedAt: new Date().toISOString() });
       pushToast("success", "Tracking session started.");
@@ -225,18 +274,32 @@ function App() {
   };
 
   const onStop = async () => {
-    if (sessionLoading || !session.active) return;
+    if (sessionLoading || !session.active || stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
     setSessionLoading(true);
     setTrackingError(null);
-    setSession({ active: false, sessionId: null, startedAt: null });
     try {
-      await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
-      pushToast("success", "Tracking session stopped.");
+      const result = await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
+      setSession({ active: false, sessionId: null, startedAt: null });
+      setStopInfo({
+        confirmedBy: result.confirmedBy,
+        endpointPath: result.endpointPath,
+        status: result.status,
+        sessionId: result.sessionId,
+        timesheetId: result.timesheetId,
+        queued: result.queued
+      });
+      if (result.queued) {
+        pushToast("info", "Queued for sync.");
+      } else {
+        pushToast("success", "Stopped and synced.");
+      }
     } catch (error) {
       setTrackingError(toFriendlyMessage(error));
       pushToast("error", "Failed to stop session.");
     } finally {
       setSessionLoading(false);
+      stopInFlightRef.current = false;
     }
   };
 
@@ -256,10 +319,10 @@ function App() {
         <header className="header">
           <h1>LANDev Employee Tracker</h1>
           <div className="sync-indicator">
-            {syncStatus.online ? "Online synced" : "Offline queueing"} � Pending {syncStatus.pendingCount}
-            {syncStatus.nextRetryAt ? ` � Retry ${new Date(syncStatus.nextRetryAt).toLocaleTimeString()}` : ""}
-            {syncStatus.lastSyncAt ? ` � Last sync ${new Date(syncStatus.lastSyncAt).toLocaleTimeString()}` : ""}
-            {syncStatus.syncing ? " � Syncing..." : ""}
+            {syncStatus.online ? "Online synced" : "Offline queueing"} ? Pending {syncStatus.pendingCount}
+            {syncStatus.nextRetryAt ? ` ? Retry ${new Date(syncStatus.nextRetryAt).toLocaleTimeString()}` : ""}
+            {syncStatus.lastSyncAt ? ` ? Last sync ${new Date(syncStatus.lastSyncAt).toLocaleTimeString()}` : ""}
+            {syncStatus.syncing ? " ? Syncing..." : ""}
           </div>
           <div className="header-actions">
             <button className="ghost" onClick={() => setShowAbout(true)}>About</button>
@@ -315,6 +378,19 @@ function App() {
             <p className="meta">Role guard: {roles.length > 0 ? roles.join(", ") : "No roles returned"}</p>
             {trackingError && <p className="error">{trackingError}</p>}
             <p className="status-chip">Status: {session.active ? "Running" : "Stopped"}</p>
+            {stopInfo && (
+              <p className="meta">
+                Stop sync: {stopInfo.queued ? "Queued" : "Confirmed"} via {stopInfo.endpointPath}
+                {stopInfo.status ? ` (HTTP ${stopInfo.status})` : ""}
+                {stopInfo.sessionId ? ` ? sessionId ${stopInfo.sessionId}` : ""}
+                {stopInfo.timesheetId ? ` ? timesheetId ${stopInfo.timesheetId}` : ""}
+              </p>
+            )}
+            {!session.active && syncStatus.pendingCount > 0 && (
+              <p className="warning">
+                Pending sync items: {syncStatus.pendingCount}. Last sync {syncStatus.lastSyncAt ? new Date(syncStatus.lastSyncAt).toLocaleTimeString() : "not yet"}.
+              </p>
+            )}
 
             <label>
               Project
@@ -325,10 +401,24 @@ function App() {
               >
                 <option value="">Select project</option>
                 {projects.map((project) => (
-                  <option key={project.id} value={project.id}>{project.name}</option>
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                    {project.projectNumber ? ` ? #${project.projectNumber}` : ""}
+                    {project.clientName ? ` ? ${project.clientName}` : ""}
+                  </option>
                 ))}
               </select>
             </label>
+            {projectsLoading && <p className="meta">Loading projects...</p>}
+            {!projectsLoading && projects.length === 0 && !projectsError && (
+              <p className="warning">No assigned/active projects for this account.</p>
+            )}
+            {projectsError && (
+              <div className="projects-error-row">
+                <p className="error">{projectsError}</p>
+                <button className="ghost" onClick={() => fetchProjectsWithRetry()}>Retry project fetch</button>
+              </div>
+            )}
 
             <label>
               Description
@@ -337,8 +427,11 @@ function App() {
                 onChange={(event) => setSession({ description: event.target.value })}
                 disabled={session.active || sessionLoading}
                 placeholder="Describe what you are working on..."
+                maxLength={DESCRIPTION_MAX_LENGTH}
               />
-              <span className="hint">Minimum {DESCRIPTION_MIN_LENGTH} characters</span>
+              <span className="hint">Enter work details ({DESCRIPTION_MIN_LENGTH}-{DESCRIPTION_MAX_LENGTH} characters)</span>
+              {descriptionValidationError && <span className="error-inline">{descriptionValidationError}</span>}
+              <span className="char-counter">{session.description.length}/{DESCRIPTION_MAX_LENGTH}</span>
             </label>
 
             <div className="actions">

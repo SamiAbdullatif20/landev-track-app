@@ -115,6 +115,32 @@ button:not(:disabled):hover {
   font-size: 13px;
 }
 
+.warning {
+  margin: 0;
+  color: #facc15;
+  font-size: 13px;
+}
+
+.error-inline {
+  margin: 0;
+  color: #fca5a5;
+  font-size: 12px;
+}
+
+.char-counter {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 12px;
+  justify-self: end;
+}
+
+.projects-error-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
 .sync-indicator {
   color: #93c5fd;
   font-size: 12px;

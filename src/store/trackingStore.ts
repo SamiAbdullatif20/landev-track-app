@@ -3,6 +3,8 @@ import { create } from "zustand";
 export type Project = {
   id: string;
   name: string;
+  projectNumber: string | null;
+  clientName: string | null;
 };
 
 export type SessionState = {

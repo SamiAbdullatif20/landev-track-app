@@ -2,8 +2,15 @@ import { BrowserWindow, ipcMain, app } from "electron";
 import { IPC_CHANNELS } from "./channels";
 import { eventSchema, loginSchema, startSchema, stopSchema } from "./schemas";
 import * as api from "../api/client";
-import { clearToken, readToken, saveToken } from "../security/token-store";
-import { enqueueEvent, getSessionState, saveSessionState } from "../db/queue-repo";
+import {
+  clearSessionCookie,
+  clearToken,
+  readSessionCookie,
+  readToken,
+  saveSessionCookie,
+  saveToken
+} from "../security/token-store";
+import { clearSyntheticSessionPendingEvents, enqueueEvent, getSessionState, saveSessionState } from "../db/queue-repo";
 import { logger } from "../config/logger";
 import { SyncWorker } from "../services/sync-worker";
 import { collectActivityContext } from "../services/activity-metadata";
@@ -23,9 +30,13 @@ function asUserError(error: unknown): Error {
 
 function normalizeSessionState() {
   const state = getSessionState();
+  const normalizedSessionId =
+    typeof state.sessionId === "string" && /^\d{13,}$/.test(state.sessionId)
+      ? null
+      : state.sessionId;
   return {
     active: Boolean(state.active),
-    sessionId: state.sessionId,
+    sessionId: normalizedSessionId,
     projectId: state.projectId,
     description: state.description,
     startedAt: state.startedAt
@@ -36,9 +47,26 @@ function sendSessionStatus(mainWindow: BrowserWindow): void {
   mainWindow.webContents.send("tracking:status-push", normalizeSessionState());
 }
 
+function hasUsableSessionId(sessionId: string | null | undefined): boolean {
+  if (!sessionId) return false;
+  return !/^\d{13,}$/.test(sessionId.trim());
+}
+
+function authContext() {
+  return {
+    token: readToken() ?? undefined,
+    sessionCookie: readSessionCookie() ?? undefined,
+    onSessionCookie: saveSessionCookie
+  };
+}
+
 export function registerIpc(mainWindow: BrowserWindow): void {
   const env = readEnv();
-  const worker = new SyncWorker({ readToken, window: mainWindow });
+  const worker = new SyncWorker({ readToken, readSessionCookie, window: mainWindow });
+  const clearedOnBoot = clearSyntheticSessionPendingEvents();
+  if (clearedOnBoot > 0) {
+    logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedOnBoot });
+  }
   worker.start();
 
   mainWindow.on("closed", () => {
@@ -63,19 +91,15 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGIN, async (_event, payload) => {
     try {
       const parsed = loginSchema.parse(payload);
-      const result = await api.login(parsed);
+      const result = await api.login(parsed, authContext());
       if (result.token) {
         saveToken(result.token);
       }
-      let roles: string[] = [];
-      try {
-        const me = await api.me({ token: readToken() ?? undefined });
-        roles = me.roles;
-      } catch (meError) {
-        logger.warn("auth-me-unavailable-after-login", { error: meError });
+      if (result.sessionCookie) {
+        saveSessionCookie(result.sessionCookie);
       }
       await worker.flush();
-      return { ok: true, roles };
+      return { ok: true, roles: [] };
     } catch (error) {
       throw asUserError(error);
     }
@@ -83,41 +107,30 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.AUTH_STATUS, async () => {
     try {
-      const token = readToken();
-      if (!token) {
-        return { authenticated: false, roles: [] };
-      }
-
-      const me = await api.me({ token });
-      return { authenticated: true, roles: me.roles };
+      const probe = await api.probeSession(authContext());
+      return { authenticated: probe.authenticated, roles: [] };
     } catch {
       clearToken();
+      clearSessionCookie();
       return { authenticated: false, roles: [] };
     }
   });
 
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGOUT, async () => {
     try {
-      const token = readToken();
-      if (token) {
-        await api.logout({ token });
-      }
+      await api.logout(authContext());
     } catch (error) {
       logger.warn("backend-logout-failed", { error });
     } finally {
       clearToken();
+      clearSessionCookie();
     }
     return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.TRACKING_PROJECTS, async () => {
     try {
-      const token = readToken();
-      if (!token) {
-        throw new Error("AUTH: Not authenticated");
-      }
-
-      const projects = await api.getProjects({ token });
+      const projects = await api.getProjects(authContext());
       return { projects };
     } catch (error) {
       throw asUserError(error);
@@ -129,16 +142,21 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.SESSION_START, async (_event, payload) => {
     try {
       const parsed = startSchema.parse(payload);
-      const token = readToken();
       const currentState = getSessionState();
 
-      if (!token) throw new Error("AUTH: Not authenticated");
+      if (!readToken() && !readSessionCookie()) {
+        throw new Error("AUTH: Not authenticated");
+      }
       if (currentState.active) throw new Error("VALIDATION: Session already running.");
 
-      const result = await api.startSession(parsed, { token });
+      logger.info("tracking-start-validated", {
+        hasProjectId: parsed.projectId.length > 0,
+        descriptionLength: parsed.description.length
+      });
+      const result = await api.startSession(parsed, authContext());
       saveSessionState({
         active: 1,
-        sessionId: result.sessionId,
+        sessionId: result.sessionId ?? null,
         projectId: parsed.projectId,
         description: parsed.description,
         startedAt: new Date().toISOString()
@@ -155,7 +173,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     try {
       const parsed = eventSchema.parse(payload);
       const state = getSessionState();
-      if (!state.sessionId) return { queued: false };
+      if (!hasUsableSessionId(state.sessionId)) return { queued: false };
 
       const context = await collectActivityContext();
       const eventPayload = {
@@ -179,15 +197,26 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.SESSION_STOP, async (_event, payload) => {
     try {
       const parsed = stopSchema.parse(payload);
-      const token = readToken();
       const state = getSessionState();
 
-      if (!token || !state.sessionId) {
+      if ((!readToken() && !readSessionCookie()) || !state.active) {
         throw new Error("VALIDATION: No active session to stop.");
       }
 
+      logger.info("tracking-stop-flow-start", {
+        localSessionId: state.sessionId,
+        stoppedAt: parsed.stoppedAt
+      });
+      logger.info("tracking-stop-followup", { step: "flush-before-stop" });
       await worker.flush();
-      await api.stopSession({ sessionId: state.sessionId, stoppedAt: parsed.stoppedAt }, { token });
+      const stopResult = await api.stopSession({ sessionId: state.sessionId, stoppedAt: parsed.stoppedAt }, authContext());
+      logger.info("tracking-stop-flow-result", stopResult);
+      logger.info("tracking-stop-followup", { step: "flush-after-stop" });
+      const clearedAfterStop = clearSyntheticSessionPendingEvents();
+      if (clearedAfterStop > 0) {
+        logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "after-stop" });
+      }
+      await worker.flush();
 
       saveSessionState({
         active: 0,
@@ -198,7 +227,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       });
 
       sendSessionStatus(mainWindow);
-      return { ok: true };
+      return stopResult;
     } catch (error) {
       throw asUserError(error);
     }

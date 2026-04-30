@@ -34,6 +34,17 @@ type AppInfo = {
   apiBaseUrl: string;
 };
 
+type StopSessionResult = {
+  ok: true;
+  queued: boolean;
+  endpointPath: string;
+  status: number | null;
+  confirmedBy: "tracking" | "attendance" | "idempotent";
+  sessionId: string | null;
+  timesheetId: string | null;
+  responsePreview: string | null;
+};
+
 contextBridge.exposeInMainWorld("desktopAPI", {
   login: (payload: { username: string; password: string }) => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGIN, payload) as Promise<{ ok: true; roles: string[] }>,
   authStatus: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_STATUS) as Promise<{ authenticated: boolean; roles: string[] }>,
@@ -41,8 +52,8 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   getAppInfo: () => ipcRenderer.invoke(IPC_CHANNELS.APP_INFO) as Promise<AppInfo>,
   testConnection: () => ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{ reachable: boolean; message: string }>,
   getProjects: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[] }>,
-  startSession: (payload: { projectId: string; description: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_START, payload),
-  stopSession: (payload: { stoppedAt: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STOP, payload),
+  startSession: (payload: { projectId: string; description: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_START, payload) as Promise<{ sessionId: string | null }>,
+  stopSession: (payload: { stoppedAt: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STOP, payload) as Promise<StopSessionResult>,
   trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_EVENT, payload),
   getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STATUS) as Promise<TrackingStatus>,
   getSyncStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_SYNC_STATUS) as Promise<SyncStatus>,
