@@ -1,0 +1,46 @@
+// Electron Builder configuration for Windows production packaging.
+// Code signing placeholders:
+// - Set CSC_LINK and CSC_KEY_PASSWORD env vars in CI for real signing.
+// - Optional: add WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD for Windows-specific certs.
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.landev.track",
+  "asar": true,
+  "productName": "LANDev Track",
+  "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+  "directories": {
+    "output": "release/${version}",
+    "buildResources": "build"
+  },
+  "extraMetadata": {
+    "main": "dist-electron/main.js"
+  },
+  "files": [
+    "dist",
+    "dist-electron",
+    "build/icons/**/*",
+    "package.json"
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "build/icons/icon.ico",
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  },
+  "publish": [
+    {
+      "provider": "generic",
+      "url": "https://updates.example.com/landev-track/"
+    }
+  ]
+}

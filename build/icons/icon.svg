@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <text x="50%" y="48%" dominant-baseline="middle" text-anchor="middle" fill="#93c5fd" font-size="180" font-family="Segoe UI, Arial">LT</text>
+  <text x="50%" y="75%" dominant-baseline="middle" text-anchor="middle" fill="#cbd5e1" font-size="42" font-family="Segoe UI, Arial">LANDev Track</text>
+</svg>

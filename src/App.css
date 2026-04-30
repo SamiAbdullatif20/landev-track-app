@@ -1,0 +1,172 @@
+.screen {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.shell {
+  max-width: 840px;
+  margin: 0 auto;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+.card {
+  display: grid;
+  gap: 12px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid #334155;
+  border-radius: 14px;
+  padding: 18px;
+  box-shadow: 0 14px 32px rgba(2, 6, 23, 0.45);
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+}
+
+input,
+textarea,
+select {
+  border: 1px solid #334155;
+  border-radius: 10px;
+  background: #0b1220;
+  color: #e2e8f0;
+  padding: 9px 11px;
+}
+
+textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+button {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #2563eb;
+  color: #f8fafc;
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+.ghost {
+  background: transparent;
+  border: 1px solid #475569;
+}
+
+.danger {
+  background: #dc2626;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+}
+
+.error {
+  margin: 0;
+  color: #fca5a5;
+}
+
+.status-chip {
+  margin: 0;
+  color: #93c5fd;
+}
+
+.meta,
+.hint {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.sync-indicator {
+  color: #93c5fd;
+  font-size: 12px;
+}
+
+.toasts {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  gap: 8px;
+  z-index: 40;
+}
+
+.toast {
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  border: 1px solid transparent;
+}
+
+.toast-success {
+  background: #14532d;
+  border-color: #22c55e;
+}
+
+.toast-error {
+  background: #7f1d1d;
+  border-color: #f87171;
+}
+
+.toast-info {
+  background: #1e3a8a;
+  border-color: #60a5fa;
+}
+
+.about-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.65);
+  display: grid;
+  place-items: center;
+}
+
+.about-card {
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 16px;
+  min-width: 320px;
+}
+
+.about-card p {
+  margin: 4px 0;
+}
