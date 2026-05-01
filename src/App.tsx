@@ -10,6 +10,35 @@ import "./App.css";
 const DESCRIPTION_MIN_LENGTH = 3;
 const DESCRIPTION_MAX_LENGTH = 2000;
 
+type TrackingDebugSnapshot = {
+  counters: {
+    totalCaptured: number;
+    totalSynced: number;
+    missingWindowTitleCount: number;
+    fallbackAppNameCount: number;
+    normalizedAppNameCount: number;
+  };
+  lastSync: {
+    ok: boolean;
+    statusCode: number | null;
+    message: string;
+    at: string | null;
+  };
+  events: Array<{
+    capturedAt: string;
+    eventId: string;
+    eventType: string;
+    rawApplication: string;
+    rawWindowTitle: string;
+    processName: string;
+    application: string;
+    hasWindowTitle: boolean;
+    hasForegroundWindowHandle: boolean;
+    source: string;
+    windowReasonCode: string | null;
+  }>;
+};
+
 function App() {
   const [password, setPassword] = useState("");
   const [showAbout, setShowAbout] = useState(false);
@@ -24,6 +53,7 @@ function App() {
     timesheetId: string | null;
     queued: boolean;
   } | null>(null);
+  const [trackingDebug, setTrackingDebug] = useState<TrackingDebugSnapshot | null>(null);
   const [appInfo, setAppInfo] = useState<{
     appName: string;
     appVersion: string;
@@ -74,6 +104,15 @@ function App() {
 
   useEffect(() => {
     window.desktopAPI.getAppInfo().then(setAppInfo).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const pullDebug = () => {
+      window.desktopAPI.getTrackingDebugEvents().then(setTrackingDebug).catch(() => undefined);
+    };
+    pullDebug();
+    const timer = window.setInterval(pullDebug, 3000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const fetchProjectsWithRetry = useCallback(async (attempts = 3): Promise<void> => {
@@ -192,6 +231,16 @@ function App() {
       pushToast("error", message);
     } finally {
       setConnectionTesting(false);
+    }
+  };
+
+  const onCopyDiagnostics = async () => {
+    if (!trackingDebug) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(trackingDebug, null, 2));
+      pushToast("info", "Diagnostics copied.");
+    } catch {
+      pushToast("error", "Failed to copy diagnostics.");
     }
   };
 
@@ -373,6 +422,7 @@ function App() {
             </button>
           </section>
         ) : (
+          <>
           <section className="card">
             <h2>Tracking Session</h2>
             <p className="meta">Role guard: {roles.length > 0 ? roles.join(", ") : "No roles returned"}</p>
@@ -447,6 +497,36 @@ function App() {
               Session ID: {session.sessionId ?? "-"} {session.startedAt ? `| Started: ${new Date(session.startedAt).toLocaleString()}` : ""}
             </p>
           </section>
+          <section className="card">
+            <h2>Tracking Debug</h2>
+            <p className="meta">
+              Captured: {trackingDebug?.counters.totalCaptured ?? 0} · Synced: {trackingDebug?.counters.totalSynced ?? 0}
+              · Missing titles: {trackingDebug?.counters.missingWindowTitleCount ?? 0}
+            </p>
+            <p className="meta">
+              Fallback app names: {trackingDebug?.counters.fallbackAppNameCount ?? 0} · Normalized names: {trackingDebug?.counters.normalizedAppNameCount ?? 0}
+            </p>
+            <p className="meta">
+              Last sync: {trackingDebug?.lastSync.at ? `${trackingDebug.lastSync.ok ? "ok" : "failed"} ${trackingDebug.lastSync.statusCode ?? "-"} @ ${new Date(trackingDebug.lastSync.at).toLocaleTimeString()}` : "none"}
+            </p>
+            <div className="actions">
+              <button className="ghost" onClick={onCopyDiagnostics}>Copy diagnostics JSON</button>
+            </div>
+            <div className="debug-table">
+              <div className="debug-head">
+                <span>Time</span><span>App</span><span>Window</span><span>Process</span>
+              </div>
+              {(trackingDebug?.events.slice(-20).reverse() ?? []).map((event) => (
+                <div className="debug-row" key={event.eventId}>
+                  <span>{new Date(event.capturedAt).toLocaleTimeString()}</span>
+                  <span>{event.application}</span>
+                  <span>{event.hasWindowTitle ? event.rawWindowTitle : "N/A"}</span>
+                  <span>{event.processName}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+          </>
         )}
 
         {showAbout && (

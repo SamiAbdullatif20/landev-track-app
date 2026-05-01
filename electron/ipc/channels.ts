@@ -10,5 +10,6 @@ export const IPC_CHANNELS = {
   SESSION_STATUS: "tracking:status",
   TRACKING_PROJECTS: "tracking:projects",
   TRACKING_SYNC_STATUS: "tracking:sync-status",
+  TRACKING_DEBUG_LAST_EVENTS: "tracking:debug:last-events",
   SYNC_NOW: "tracking:sync"
 } as const;

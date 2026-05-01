@@ -1,0 +1,130 @@
+LANDev Track Desktop - Tracking Diagnostics & Metadata Summary
+Date: 2026-05-01
+
+Web system action needed (likely):
+- Ensure web report/query/UI reads event metadata fields from ingest records:
+  - metadata.application
+  - metadata.windowTitle
+  - metadata.mouseMovePercent
+  - metadata.totalSamples
+  - metadata.mouseMoveSamples
+  - metadata.trackerElapsedMs
+  - metadata.processName
+  - metadata.rawApplication
+  - metadata.rawWindowTitle
+
+Desktop changes implemented:
+
+1) Foreground app/window detection improvements
+- electron/services/activity-metadata.ts
+  - Uses foreground window APIs and window text retrieval on Windows.
+  - Captures:
+    - application
+    - windowTitle
+    - appName
+    - processName
+    - processId
+    - executablePath
+    - hasForegroundWindowHandle
+    - windowReasonCode
+    - sourceModule
+  - Adds explicit reason codes when title/window capture fails.
+
+2) App name normalization + required metadata builder
+- electron/services/tracking-event-utils.ts (new)
+  - normalizeAppName mappings:
+    - chrome.exe -> chrome
+    - firefox.exe -> firefox
+    - msedge.exe/edge.exe -> edge
+    - acad.exe/revit.exe/autodesk* -> autodesk
+    - code.exe -> vscode
+  - buildTrackingMetadata ensures required metadata keys always exist.
+
+3) End-to-end diagnostics buffer and counters
+- electron/services/tracking-diagnostics.ts (new)
+  - Rolling in-memory buffer of last 200 captured events.
+  - Counters:
+    - totalCaptured
+    - totalSynced
+    - missingWindowTitleCount
+    - fallbackAppNameCount
+    - normalizedAppNameCount
+  - Last sync result object:
+    - ok
+    - statusCode
+    - message
+    - at
+
+4) IPC for diagnostics inspection
+- electron/ipc/channels.ts
+  - Added TRACKING_DEBUG_LAST_EVENTS: "tracking:debug:last-events"
+- electron/ipc/handlers.ts
+  - Added IPC handler returning diagnostics snapshot.
+- electron/preload.ts
+  - Exposed getTrackingDebugEvents() to renderer.
+- src/types/global.d.ts
+  - Added TrackingDebugSnapshot type and getTrackingDebugEvents() API typing.
+
+5) Event pipeline diagnostics and payload guarantees
+- electron/ipc/handlers.ts
+  - Per sampled event logs include:
+    - eventId
+    - raw app/process and raw window title
+    - normalized application
+    - hasWindowTitle
+    - hasForegroundWindowHandle
+    - source function/module
+    - windowReasonCode
+  - Metadata payload now always includes:
+    - application
+    - windowTitle (empty string if unavailable)
+    - processName
+    - rawApplication
+    - rawWindowTitle
+    - mouseMovePercent
+    - totalSamples
+    - mouseMoveSamples
+    - trackerElapsedMs
+    - projectId
+    - workDescription
+  - Missing app defaults to "unknown".
+
+6) Sync diagnostics
+- electron/services/sync-worker.ts
+  - Reports sync success/failure to diagnostics store.
+  - Keeps existing sync/auth behavior unchanged.
+
+7) Renderer debug screen
+- src/App.tsx
+  - Added "Tracking Debug" card showing:
+    - counters
+    - last sync result/status
+    - last 20 captured events (time, application, windowTitle, processName)
+  - Added "Copy diagnostics JSON" button.
+- src/App.css
+  - Added debug table styles.
+
+8) Mouse movement percentage metrics
+- src/hooks/useActivityTracker.ts
+  - Tracks rolling:
+    - totalSamples
+    - mouseMoveSamples
+    - mouseMovePercent
+    - trackerElapsedMs
+  - Sends these in event metadata each sample.
+
+9) Tests added
+- electron/services/tracking-event-utils.test.ts (new)
+  - normalizeAppName mapping tests
+  - metadata builder required-key tests
+  - missing window-title fallback test
+- package.json
+  - Added test script: "test": "vitest run"
+  - Added dev dependency: vitest
+
+Validation run results:
+- npm run test: PASS
+- npm run typecheck: PASS
+- npm run build: PASS
+- ReadLints on edited files: no linter errors
+

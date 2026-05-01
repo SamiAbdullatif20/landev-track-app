@@ -16,12 +16,14 @@ type SyncWorkerOptions = {
   readToken: () => string | null;
   readSessionCookie: () => string | null;
   window: BrowserWindow;
+  onSyncResult?: (result: { ok: boolean; statusCode: number | null; message: string }) => void;
 };
 
 export class SyncWorker {
   private readonly readToken: () => string | null;
   private readonly readSessionCookie: () => string | null;
   private readonly window: BrowserWindow;
+  private readonly onSyncResult?: (result: { ok: boolean; statusCode: number | null; message: string }) => void;
   private interval: NodeJS.Timeout | null = null;
   private syncInProgress = false;
   private status: SyncStatus = {
@@ -37,6 +39,7 @@ export class SyncWorker {
     this.readToken = options.readToken;
     this.readSessionCookie = options.readSessionCookie;
     this.window = options.window;
+    this.onSyncResult = options.onSyncResult;
     this.status.pendingCount = getPendingCount();
   }
 
@@ -84,6 +87,11 @@ export class SyncWorker {
       for (const event of events) {
         try {
           const payload = JSON.parse(event.payloadJson) as Record<string, unknown>;
+          logger.info("sync-event-attempt", {
+            eventId: event.id,
+            eventKind: event.eventKind,
+            hasSessionId: Boolean((payload as { sessionId?: unknown }).sessionId)
+          });
           await api.ingestEvent(
             {
               ...payload,
@@ -93,10 +101,22 @@ export class SyncWorker {
             { token, sessionCookie }
           );
           markEventDelivered(event.id);
+          logger.info("sync-event-delivered", { eventId: event.id, eventKind: event.eventKind });
+          this.onSyncResult?.({ ok: true, statusCode: 200, message: "delivered" });
           this.status.online = true;
           this.status.lastError = null;
           this.status.lastSyncAt = new Date().toISOString();
         } catch (error) {
+          logger.warn("sync-event-failed", {
+            eventId: event.id,
+            eventKind: event.eventKind,
+            error: error instanceof Error ? error.message : "unknown"
+          });
+          this.onSyncResult?.({
+            ok: false,
+            statusCode: error instanceof api.ApiError && error.kind === "validation" ? 400 : null,
+            message: error instanceof Error ? error.message : "sync_failed"
+          });
           const scheduled = markEventForRetry(event.id, event.attempts + 1);
           nextRetryAt = nextRetryAt ?? scheduled;
           if (error instanceof api.ApiError && error.kind === "network") {

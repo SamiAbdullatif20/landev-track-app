@@ -6,16 +6,32 @@ export function useActivityTracker(enabled: boolean): void {
 
     let lastSent = 0;
     const MIN_MS = 4000;
+    const trackingStartedAtMs = Date.now();
+    let totalSamples = 0;
+    let mouseMoveSamples = 0;
 
     const sendActivity = (type: string) => {
       const now = Date.now();
       if (now - lastSent < MIN_MS) return;
       lastSent = now;
+      totalSamples += 1;
+      if (type === "mouse_move") {
+        mouseMoveSamples += 1;
+      }
+      const mouseMovePercent = totalSamples > 0
+        ? Number(((mouseMoveSamples / totalSamples) * 100).toFixed(2))
+        : 0;
 
       window.desktopAPI.trackEvent({
         type,
         occurredAt: new Date(now).toISOString(),
-        metadata: { source: "renderer" }
+        metadata: {
+          source: "renderer",
+          trackerElapsedMs: now - trackingStartedAtMs,
+          totalSamples,
+          mouseMoveSamples,
+          mouseMovePercent
+        }
       }).catch(() => {
         // kept in local queue by main process
       });

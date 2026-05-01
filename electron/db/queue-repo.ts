@@ -63,7 +63,13 @@ function isSyntheticSessionId(value: unknown): boolean {
 }
 
 export function clearSyntheticSessionPendingEvents(limit = 5000): number {
-  const events = getPendingEvents(limit);
+  const db = getDb();
+  const events = db.prepare(`
+    SELECT * FROM queued_events
+    WHERE status IN ('pending', 'retry')
+    ORDER BY id ASC
+    LIMIT @limit
+  `).all({ limit }) as QueuedEvent[];
   let cleared = 0;
   for (const event of events) {
     try {

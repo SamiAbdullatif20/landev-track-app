@@ -196,3 +196,27 @@ button:not(:disabled):hover {
 .about-card p {
   margin: 4px 0;
 }
+
+.debug-table {
+  border: 1px solid #334155;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.debug-head,
+.debug-row {
+  display: grid;
+  grid-template-columns: 120px 120px 1fr 140px;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.debug-head {
+  background: #0f1a31;
+  color: #93c5fd;
+}
+
+.debug-row {
+  border-top: 1px solid #1e293b;
+}

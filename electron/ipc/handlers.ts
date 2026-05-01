@@ -15,6 +15,8 @@ import { logger } from "../config/logger";
 import { SyncWorker } from "../services/sync-worker";
 import { collectActivityContext } from "../services/activity-metadata";
 import { readEnv } from "../config/env";
+import { buildTrackingMetadata } from "../services/tracking-event-utils";
+import { trackingDiagnostics } from "../services/tracking-diagnostics";
 
 function asUserError(error: unknown): Error {
   if (error instanceof api.ApiError) {
@@ -62,7 +64,12 @@ function authContext() {
 
 export function registerIpc(mainWindow: BrowserWindow): void {
   const env = readEnv();
-  const worker = new SyncWorker({ readToken, readSessionCookie, window: mainWindow });
+  const worker = new SyncWorker({
+    readToken,
+    readSessionCookie,
+    window: mainWindow,
+    onSyncResult: (result) => trackingDiagnostics.recordSync(result.ok, result.statusCode, result.message)
+  });
   const clearedOnBoot = clearSyntheticSessionPendingEvents();
   if (clearedOnBoot > 0) {
     logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedOnBoot });
@@ -173,20 +180,75 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     try {
       const parsed = eventSchema.parse(payload);
       const state = getSessionState();
-      if (!hasUsableSessionId(state.sessionId)) return { queued: false };
+      if (!state.active) return { queued: false };
 
       const context = await collectActivityContext();
+      const built = buildTrackingMetadata({
+        source: "ipc.handlers.tracking:event",
+        projectId: state.projectId,
+        workDescription: state.description,
+        mouseMovePercent: typeof parsed.metadata?.mouseMovePercent === "number" ? parsed.metadata.mouseMovePercent : undefined,
+        totalSamples: typeof parsed.metadata?.totalSamples === "number" ? parsed.metadata.totalSamples : undefined,
+        mouseMoveSamples: typeof parsed.metadata?.mouseMoveSamples === "number" ? parsed.metadata.mouseMoveSamples : undefined,
+        trackerElapsedMs: typeof parsed.metadata?.trackerElapsedMs === "number" ? parsed.metadata.trackerElapsedMs : undefined,
+        rawApplication: context.application ?? context.appName ?? context.processName,
+        rawWindowTitle: context.windowTitle ?? context.activeWindowTitle,
+        processName: context.processName ?? context.appName,
+        application: context.application ?? context.appName,
+        windowTitle: context.windowTitle ?? context.activeWindowTitle
+      });
       const eventPayload = {
-        sessionId: state.sessionId,
+        ...(hasUsableSessionId(state.sessionId) ? { sessionId: state.sessionId } : {}),
         type: parsed.type,
         occurredAt: parsed.occurredAt,
         metadata: {
           ...(parsed.metadata ?? {}),
+          ...built.metadata,
+          hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
+          windowReasonCode: context.windowReasonCode ?? null,
           ...context
         }
       };
 
+      const eventId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      trackingDiagnostics.recordCaptured(
+        {
+          capturedAt: parsed.occurredAt,
+          eventId,
+          eventType: parsed.type,
+          rawApplication: built.metadata.rawApplication,
+          rawWindowTitle: built.metadata.rawWindowTitle,
+          processName: built.metadata.processName,
+          application: built.metadata.application,
+          hasWindowTitle: built.metadata.windowTitle.length > 0,
+          hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
+          source: "ipc.handlers.tracking:event",
+          windowReasonCode: context.windowReasonCode ?? null
+        },
+        {
+          missingWindowTitle: built.missingWindowTitle,
+          fallbackAppName: built.usedFallbackAppName,
+          normalizedAppName: built.usedNormalizedName
+        }
+      );
+      logger.info("tracking-event-diagnostics", {
+        eventId,
+        rawApp: built.metadata.rawApplication,
+        rawWindowTitle: built.metadata.rawWindowTitle,
+        application: built.metadata.application,
+        hasWindowTitle: built.metadata.windowTitle.length > 0,
+        hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
+        source: "ipc.handlers.tracking:event",
+        windowReasonCode: context.windowReasonCode ?? null
+      });
+
       enqueueEvent("activity", eventPayload);
+      logger.info("tracking-event-queued", {
+        type: parsed.type,
+        hasSessionId: hasUsableSessionId(state.sessionId),
+        hasAppName: Boolean((context.appName ?? context.application)),
+        hasWindowTitle: Boolean((context.activeWindowTitle ?? context.windowTitle))
+      });
       await worker.flush();
       return { queued: true };
     } catch (error) {
@@ -234,6 +296,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   });
 
   ipcMain.handle(IPC_CHANNELS.TRACKING_SYNC_STATUS, () => worker.getStatus());
+  ipcMain.handle(IPC_CHANNELS.TRACKING_DEBUG_LAST_EVENTS, () => trackingDiagnostics.snapshot(200));
 
   ipcMain.handle(IPC_CHANNELS.SYNC_NOW, async () => {
     try {

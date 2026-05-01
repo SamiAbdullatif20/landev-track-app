@@ -28,7 +28,7 @@ export type SessionStartInput = {
 };
 
 export type TrackingEventInput = {
-  sessionId: string;
+  sessionId?: string;
   type: string;
   occurredAt: string;
   eventUuid?: string;
@@ -251,8 +251,32 @@ function extractIds(data: unknown): { sessionId: string | null; timesheetId: str
     return { sessionId: null, timesheetId: null };
   }
   const record = data as Record<string, unknown>;
-  const sessionId = asStringOrNull(record.sessionId ?? record.session_id ?? record.id ?? record.trackingSessionId);
-  const timesheetId = asStringOrNull(record.timesheetId ?? record.timesheet_id ?? record.attendanceId ?? record.entryId);
+  const sessionObj = record.session && typeof record.session === "object"
+    ? (record.session as Record<string, unknown>)
+    : null;
+  const timesheetObj = record.timesheet && typeof record.timesheet === "object"
+    ? (record.timesheet as Record<string, unknown>)
+    : null;
+  const sessionId = asStringOrNull(
+    record.sessionId
+    ?? record.session_id
+    ?? record.id
+    ?? record.trackingSessionId
+    ?? sessionObj?.sessionId
+    ?? sessionObj?.session_id
+    ?? sessionObj?.id
+    ?? sessionObj?._id
+  );
+  const timesheetId = asStringOrNull(
+    record.timesheetId
+    ?? record.timesheet_id
+    ?? record.attendanceId
+    ?? record.entryId
+    ?? timesheetObj?.timesheetId
+    ?? timesheetObj?.timesheet_id
+    ?? timesheetObj?.id
+    ?? timesheetObj?._id
+  );
   return { sessionId, timesheetId };
 }
 

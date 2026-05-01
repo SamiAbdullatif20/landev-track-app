@@ -46,6 +46,35 @@ type StopSessionResult = {
   responsePreview: string | null;
 };
 
+type TrackingDebugSnapshot = {
+  counters: {
+    totalCaptured: number;
+    totalSynced: number;
+    missingWindowTitleCount: number;
+    fallbackAppNameCount: number;
+    normalizedAppNameCount: number;
+  };
+  lastSync: {
+    ok: boolean;
+    statusCode: number | null;
+    message: string;
+    at: string | null;
+  };
+  events: Array<{
+    capturedAt: string;
+    eventId: string;
+    eventType: string;
+    rawApplication: string;
+    rawWindowTitle: string;
+    processName: string;
+    application: string;
+    hasWindowTitle: boolean;
+    hasForegroundWindowHandle: boolean;
+    source: string;
+    windowReasonCode: string | null;
+  }>;
+};
+
 declare global {
   interface Window {
     desktopAPI: {
@@ -60,6 +89,7 @@ declare global {
       trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => Promise<{ queued: boolean }>;
       getStatus: () => Promise<TrackingStatus>;
       getSyncStatus: () => Promise<SyncStatus>;
+      getTrackingDebugEvents: () => Promise<TrackingDebugSnapshot>;
       syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
       onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
       onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;
