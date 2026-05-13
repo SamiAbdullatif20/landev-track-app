@@ -74,6 +74,12 @@ function runMigration(database: Database.Database): void {
 
     INSERT OR IGNORE INTO active_session (id, active, updatedAt)
     VALUES (1, 0, CURRENT_TIMESTAMP);
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
   `);
 
   const hasLegacyQueueTable = database

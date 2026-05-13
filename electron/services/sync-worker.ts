@@ -44,6 +44,9 @@ export class SyncWorker {
   }
 
   public start(): void {
+    if (this.interval) {
+      return;
+    }
     this.publishStatus();
     this.interval = setInterval(() => {
       this.flush().catch((error) => {

@@ -41,6 +41,15 @@ export type SessionStopInput = {
   stoppedAt: string;
 };
 
+export type ScreenshotIngestInput = {
+  capturedAt: string;
+  imageBase64: string;
+  mimeType: "image/png";
+  projectId: string | null;
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type SessionStopResult = {
   ok: true;
   queued: boolean;
@@ -190,7 +199,14 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
       if (!shouldRetry || attempt === retries - 1) {
         break;
       }
-      await new Promise((resolve) => setTimeout(resolve, 450 * (attempt + 1)));
+      const retryAfterHeader = axiosError.response?.headers?.["retry-after"];
+      const retryAfterRaw = Array.isArray(retryAfterHeader) ? retryAfterHeader[0] : retryAfterHeader;
+      const retryAfterSeconds = Number(retryAfterRaw);
+      const retryAfterMs =
+        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(30_000, Math.max(250, retryAfterSeconds * 1000))
+          : 450 * (attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
     }
   }
   throw mapAxiosError(lastError);
@@ -468,6 +484,16 @@ export async function ingestEvent(payload: TrackingEventInput, options: RequestO
   await withRetry(async () => {
     const client = getClient();
     const response = await firstSuccess(API_ENDPOINTS.tracking.eventsIngest, (path) =>
+      client.post(path, payload, { headers: authHeader(options) })
+    );
+    persistCookieIfPresent(response, options);
+  });
+}
+
+export async function ingestScreenshot(payload: ScreenshotIngestInput, options: RequestOptions): Promise<void> {
+  await withRetry(async () => {
+    const client = getClient();
+    const response = await firstSuccess(API_ENDPOINTS.tracking.screenshotsIngest, (path) =>
       client.post(path, payload, { headers: authHeader(options) })
     );
     persistCookieIfPresent(response, options);

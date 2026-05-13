@@ -1,6 +1,7 @@
 import { app, BrowserWindow } from "electron";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import fs from "node:fs";
 import { registerIpc } from "./ipc/handlers";
 import { logger } from "./config/logger";
 import dotenv from "dotenv";
@@ -8,8 +9,25 @@ import { setupCrashAndDiagnostics } from "./services/diagnostics";
 import { setupAutoUpdate } from "./services/auto-update";
 import { readEnv } from "./config/env";
 
-dotenv.config({ path: `.env.${process.env.VITE_APP_ENV ?? "development"}` });
-dotenv.config();
+function loadEnvFiles(): void {
+  const envProfile = process.env.VITE_APP_ENV ?? (app.isPackaged ? "prod" : "development");
+  const profileFile = `.env.${envProfile}`;
+  const candidates = [
+    path.join(process.cwd(), ".env"),
+    path.join(process.resourcesPath, ".env"),
+    path.join(app.getAppPath(), ".env"),
+    path.join(process.cwd(), profileFile),
+    path.join(process.resourcesPath, profileFile),
+    path.join(app.getAppPath(), profileFile),
+  ];
+
+  for (const envPath of candidates) {
+    if (!fs.existsSync(envPath)) continue;
+    dotenv.config({ path: envPath, override: true });
+  }
+}
+
+loadEnvFiles();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 

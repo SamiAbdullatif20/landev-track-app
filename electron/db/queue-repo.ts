@@ -110,3 +110,18 @@ export function saveSessionState(state: Omit<SessionState, "id" | "updatedAt">):
     updatedAt: new Date().toISOString()
   });
 }
+
+export function getSetting(key: string): string | null {
+  const db = getDb();
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = @key").get({ key }) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setSetting(key: string, value: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updatedAt)
+    VALUES (@key, @value, @updatedAt)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt
+  `).run({ key, value, updatedAt: new Date().toISOString() });
+}

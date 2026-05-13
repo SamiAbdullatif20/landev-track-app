@@ -87,6 +87,8 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STATUS) as Promise<TrackingStatus>,
   getSyncStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_SYNC_STATUS) as Promise<SyncStatus>,
   getTrackingDebugEvents: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_DEBUG_LAST_EVENTS) as Promise<TrackingDebugSnapshot>,
+  getTrackingConsentStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_STATUS) as Promise<{ accepted: boolean }>,
+  acceptTrackingConsent: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_ACCEPT) as Promise<{ accepted: true }>,
   syncNow: () => ipcRenderer.invoke(IPC_CHANNELS.SYNC_NOW),
   onStatusPush: (cb: (status: TrackingStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: TrackingStatus) => cb(payload);

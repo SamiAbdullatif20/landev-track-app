@@ -90,6 +90,8 @@ declare global {
       getStatus: () => Promise<TrackingStatus>;
       getSyncStatus: () => Promise<SyncStatus>;
       getTrackingDebugEvents: () => Promise<TrackingDebugSnapshot>;
+      getTrackingConsentStatus: () => Promise<{ accepted: boolean }>;
+      acceptTrackingConsent: () => Promise<{ accepted: true }>;
       syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
       onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
       onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;

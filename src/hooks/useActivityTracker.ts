@@ -4,18 +4,35 @@ export function useActivityTracker(enabled: boolean): void {
   useEffect(() => {
     if (!enabled) return;
 
-    let lastSent = 0;
+    let lastSentAtPerfMs = 0;
     const MIN_MS = 4000;
-    const trackingStartedAtMs = Date.now();
+    const IDLE_THRESHOLD_MS = 60_000;
+    const MAX_INTERVAL_MS = 300_000;
+    let lastEventAtPerfMs = performance.now();
+    let lastInputAtPerfMs = lastEventAtPerfMs;
     let totalSamples = 0;
     let mouseMoveSamples = 0;
 
-    const sendActivity = (type: string) => {
-      const now = Date.now();
-      if (now - lastSent < MIN_MS) return;
-      lastSent = now;
+    const sendActivity = (triggerType: string, isInput: boolean) => {
+      const nowWallMs = Date.now();
+      const nowPerfMs = performance.now();
+      if (nowPerfMs - lastSentAtPerfMs < MIN_MS) return;
+      lastSentAtPerfMs = nowPerfMs;
+      const rawIntervalMs = nowPerfMs - lastEventAtPerfMs;
+      const safeIntervalMs = Math.min(MAX_INTERVAL_MS, Math.max(0, rawIntervalMs));
+      const intervalStartPerfMs = lastEventAtPerfMs;
+      const intervalEndPerfMs = intervalStartPerfMs + safeIntervalMs;
+      lastEventAtPerfMs = nowPerfMs;
+
+      // Active time is only the portion before idle threshold is crossed.
+      const activeCutoffPerfMs = lastInputAtPerfMs + IDLE_THRESHOLD_MS;
+      const activeMs = Math.max(0, Math.min(intervalEndPerfMs, activeCutoffPerfMs) - intervalStartPerfMs);
+      const idleMs = Math.max(0, safeIntervalMs - activeMs);
+      if (isInput) {
+        lastInputAtPerfMs = nowPerfMs;
+      }
       totalSamples += 1;
-      if (type === "mouse_move") {
+      if (triggerType === "mouse_move") {
         mouseMoveSamples += 1;
       }
       const mouseMovePercent = totalSamples > 0
@@ -23,11 +40,18 @@ export function useActivityTracker(enabled: boolean): void {
         : 0;
 
       window.desktopAPI.trackEvent({
-        type,
-        occurredAt: new Date(now).toISOString(),
+        type: "APP_FOCUS",
+        occurredAt: new Date(nowWallMs).toISOString(),
         metadata: {
           source: "renderer",
-          trackerElapsedMs: now - trackingStartedAtMs,
+          triggerType,
+          activeSeconds: Number((activeMs / 1000).toFixed(3)),
+          idleSeconds: Number((idleMs / 1000).toFixed(3)),
+          trackerElapsedMs: safeIntervalMs,
+          telemetryRawIntervalMs: Number(rawIntervalMs.toFixed(3)),
+          telemetryIsIncremental: true,
+          telemetryDerivedFrom: "renderer-interval",
+          telemetryCapped: rawIntervalMs > MAX_INTERVAL_MS,
           totalSamples,
           mouseMoveSamples,
           mouseMovePercent
@@ -37,15 +61,15 @@ export function useActivityTracker(enabled: boolean): void {
       });
     };
 
-    const onMouseMove = () => sendActivity("mouse_move");
-    const onKeyDown = () => sendActivity("key_down");
-    const onClick = () => sendActivity("click");
+    const onMouseMove = () => sendActivity("mouse_move", true);
+    const onKeyDown = () => sendActivity("key_down", true);
+    const onClick = () => sendActivity("click", true);
 
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("click", onClick);
 
-    const heartbeat = window.setInterval(() => sendActivity("heartbeat"), 30_000);
+    const heartbeat = window.setInterval(() => sendActivity("heartbeat", false), 30_000);
 
     return () => {
       window.removeEventListener("mousemove", onMouseMove);
