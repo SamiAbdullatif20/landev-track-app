@@ -5,6 +5,8 @@ export type Project = {
   name: string;
   projectNumber: string | null;
   clientName: string | null;
+  isNonChargeable?: boolean;
+  isCatalogDefault?: boolean;
 };
 
 export type SessionState = {

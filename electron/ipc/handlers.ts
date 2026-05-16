@@ -15,10 +15,20 @@ import { logger } from "../config/logger";
 import { SyncWorker } from "../services/sync-worker";
 import { collectActivityContext } from "../services/activity-metadata";
 import { readEnv } from "../config/env";
+import { getClientIanaTimeZone } from "../config/client-timezone";
 import { buildTrackingMetadata } from "../services/tracking-event-utils";
 import { trackingDiagnostics } from "../services/tracking-diagnostics";
 import { ScreenshotWorker } from "../services/screenshot-worker";
 import { detectMeetingOrCallPresence } from "../services/meeting-detection";
+import {
+  DESIGNER_PROJECT_NAMES,
+  isCatalogProjectId,
+  isModeratorRole,
+  mergeCatalogWithApi,
+  MODERATOR_PROJECT_NAMES,
+  resolveProjectsForRoles
+} from "../config/role-project-catalog";
+import { clearCachedUserRoles, fetchUserRoles, readCachedUserRoles } from "../api/client";
 
 function asUserError(error: unknown): Error {
   if (error instanceof api.ApiError) {
@@ -157,7 +167,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         saveSessionCookie(result.sessionCookie);
       }
       await worker.flush();
-      return { ok: true, roles: [] };
+      const roles = result.roles.length > 0 ? result.roles : await fetchUserRoles(authContext());
+      return { ok: true, roles };
     } catch (error) {
       throw asUserError(error);
     }
@@ -165,11 +176,14 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.AUTH_STATUS, async () => {
     try {
-      const probe = await api.probeSession(authContext());
-      return { authenticated: probe.authenticated, roles: [] };
+      const ctx = authContext();
+      const probe = await api.probeSession(ctx);
+      const roles = await fetchUserRoles(ctx);
+      return { authenticated: probe.authenticated, roles };
     } catch {
       clearToken();
       clearSessionCookie();
+      clearCachedUserRoles();
       return { authenticated: false, roles: [] };
     }
   });
@@ -184,14 +198,40 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     } finally {
       clearToken();
       clearSessionCookie();
+      clearCachedUserRoles();
     }
     return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.TRACKING_PROJECTS, async () => {
     try {
-      const projects = await api.getProjects(authContext());
-      return { projects };
+      const ctx = authContext();
+      let apiProjects: api.Project[] = [];
+      try {
+        apiProjects = await api.getProjects(ctx);
+      } catch (error) {
+        logger.warn("projects-api-fetch-failed", {
+          error: error instanceof Error ? error.message : "unknown"
+        });
+      }
+
+      let roles = readCachedUserRoles();
+      if (roles.length === 0) {
+        roles = await api.fetchUserRoles(ctx);
+      }
+
+      let projects = resolveProjectsForRoles(apiProjects, roles);
+      if (projects.length === 0) {
+        projects = isModeratorRole(roles)
+          ? mergeCatalogWithApi(apiProjects, MODERATOR_PROJECT_NAMES)
+          : mergeCatalogWithApi(apiProjects, DESIGNER_PROJECT_NAMES);
+      }
+      logger.info("projects-role-filter", {
+        roles,
+        apiCount: apiProjects.length,
+        visibleCount: projects.length
+      });
+      return { projects, roles };
     } catch (error) {
       throw asUserError(error);
     }
@@ -212,11 +252,25 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       }
       if (currentState.active) throw new Error("VALIDATION: Session already running.");
 
+      const catalogProject = isCatalogProjectId(parsed.projectId);
       logger.info("tracking-start-validated", {
-        hasProjectId: parsed.projectId.length > 0,
+        hasProjectId: !catalogProject && parsed.projectId.length > 0,
+        catalogProject,
+        projectName: parsed.projectName,
         descriptionLength: parsed.description.length
       });
-      const result = await api.startSession(parsed, authContext());
+      const startTimeUtc = new Date().toISOString();
+      const result = await api.startSession(
+        {
+          projectId: parsed.projectId,
+          projectName: parsed.projectName,
+          isNonChargeable: parsed.isNonChargeable,
+          description: parsed.description,
+          clientTimeZone: getClientIanaTimeZone(),
+          startTimeUtc
+        },
+        authContext()
+      );
       saveSessionState({
         active: 1,
         sessionId: result.sessionId ?? null,
@@ -226,7 +280,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       });
       worker.start();
       await screenshotWorker.start({
-        projectId: parsed.projectId,
+        projectId: catalogProject ? null : parsed.projectId,
         sessionId: result.sessionId ?? null
       });
 
@@ -325,7 +379,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
             : {}),
           hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
           windowReasonCode: context.windowReasonCode ?? null,
-          ...context
+          ...context,
+          clientTimeZone: getClientIanaTimeZone()
         }
       };
 
@@ -446,7 +501,14 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       });
       logger.info("tracking-stop-followup", { step: "flush-before-stop" });
       await worker.flush();
-      const stopResult = await api.stopSession({ sessionId: state.sessionId, stoppedAt: parsed.stoppedAt }, authContext());
+      const stopResult = await api.stopSession(
+        {
+          sessionId: state.sessionId,
+          stoppedAt: parsed.stoppedAt,
+          clientTimeZone: getClientIanaTimeZone()
+        },
+        authContext()
+      );
       logger.info("tracking-stop-flow-result", stopResult);
       logger.info("tracking-stop-followup", { step: "flush-after-stop" });
       const clearedAfterStop = clearSyntheticSessionPendingEvents();

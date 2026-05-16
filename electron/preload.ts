@@ -80,8 +80,14 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   logout: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGOUT),
   getAppInfo: () => ipcRenderer.invoke(IPC_CHANNELS.APP_INFO) as Promise<AppInfo>,
   testConnection: () => ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{ reachable: boolean; message: string }>,
-  getProjects: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[] }>,
-  startSession: (payload: { projectId: string; description: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_START, payload) as Promise<{ sessionId: string | null }>,
+  getProjects: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[]; roles: string[] }>,
+  startSession: (payload: {
+    projectId: string;
+    projectName?: string;
+    isNonChargeable?: boolean;
+    description: string;
+  }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_START, payload) as Promise<{ sessionId: string | null }>,
   stopSession: (payload: { stoppedAt: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STOP, payload) as Promise<StopSessionResult>,
   trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_EVENT, payload),
   getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STATUS) as Promise<TrackingStatus>,

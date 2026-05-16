@@ -13,6 +13,8 @@ type Project = {
   name: string;
   projectNumber: string | null;
   clientName: string | null;
+  isNonChargeable?: boolean;
+  isCatalogDefault?: boolean;
 };
 
 type SyncStatus = {
@@ -83,8 +85,13 @@ declare global {
       logout: () => Promise<{ ok: true }>;
       getAppInfo: () => Promise<AppInfo>;
       testConnection: () => Promise<{ reachable: boolean; message: string }>;
-      getProjects: () => Promise<{ projects: Project[] }>;
-      startSession: (payload: { projectId: string; description: string }) => Promise<{ sessionId: string | null }>;
+      getProjects: () => Promise<{ projects: Project[]; roles?: string[] }>;
+      startSession: (payload: {
+        projectId: string;
+        projectName?: string;
+        isNonChargeable?: boolean;
+        description: string;
+      }) => Promise<{ sessionId: string | null }>;
       stopSession: (payload: { stoppedAt: string }) => Promise<StopSessionResult>;
       trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => Promise<{ queued: boolean }>;
       getStatus: () => Promise<TrackingStatus>;

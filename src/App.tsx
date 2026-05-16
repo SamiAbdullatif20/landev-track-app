@@ -4,6 +4,7 @@ import { useTrackingStore } from "./store/trackingStore";
 import { useActivityTracker } from "./hooks/useActivityTracker";
 import { useToasts } from "./hooks/useToasts";
 import { toFriendlyMessage } from "./utils/errors";
+import { designerCatalogFallbackProjects } from "./config/designer-project-fallback";
 import { sanitizeDisplayText } from "./utils/sanitize";
 import "./App.css";
 
@@ -86,12 +87,18 @@ function App() {
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
           const projectResult = await window.desktopAPI.getProjects();
-          setProjects(projectResult.projects.map((project) => ({
+          if (projectResult.roles?.length) {
+            setRoles(projectResult.roles);
+          }
+          const mapped = (projectResult.projects ?? []).map((project) => ({
             id: project.id,
             name: sanitizeDisplayText(project.name),
             projectNumber: project.projectNumber,
-            clientName: project.clientName ? sanitizeDisplayText(project.clientName) : null
-          })));
+            clientName: project.clientName ? sanitizeDisplayText(project.clientName) : null,
+            isNonChargeable: Boolean(project.isNonChargeable),
+            isCatalogDefault: Boolean(project.isCatalogDefault)
+          }));
+          setProjects(mapped.length > 0 ? mapped : designerCatalogFallbackProjects());
           return;
         } catch (error) {
           if (attempt === attempts) {
@@ -105,7 +112,7 @@ function App() {
     } finally {
       setProjectsLoading(false);
     }
-  }, [setProjects, setProjectsLoading]);
+  }, [setProjects, setProjectsLoading, setRoles]);
 
   useEffect(() => {
     const initialize = async () => {
@@ -276,8 +283,11 @@ function App() {
     setTrackingError(null);
     setStopInfo(null);
     try {
+      const selectedProject = projects.find((project) => project.id === session.projectId);
       const result = await window.desktopAPI.startSession({
         projectId: session.projectId,
+        projectName: selectedProject?.name,
+        isNonChargeable: selectedProject?.isNonChargeable,
         description: trimmedDescription
       });
       setSession({ active: true, sessionId: result.sessionId, startedAt: new Date().toISOString() });
@@ -395,7 +405,7 @@ function App() {
               />
             </label>
             <button
-              disabled={authLoading || username.trim().length < 3 || password.trim().length < 8}
+              disabled={authLoading || username.trim().length < 3 || password.trim().length < 6}
               onClick={onLogin}
             >
               {authLoading ? "Signing in..." : "Login"}
@@ -436,11 +446,12 @@ function App() {
                 {projects.map((project) => (
                   <option key={project.id} value={project.id}>
                     {project.name}
-                    {project.projectNumber ? ` ? #${project.projectNumber}` : ""}
-                    {project.clientName ? ` ? ${project.clientName}` : ""}
                   </option>
                 ))}
               </select>
+              <span className="hint">
+                &quot;Admin -&quot; tasks are non-chargeable admin work.
+              </span>
             </label>
             {projectsLoading && <p className="meta">Loading projects...</p>}
             {!projectsLoading && projects.length === 0 && !projectsError && (

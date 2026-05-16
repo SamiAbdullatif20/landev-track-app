@@ -3,6 +3,8 @@ import { z } from "zod";
 import { readEnv } from "../config/env";
 import { API_ENDPOINTS } from "./endpoints";
 import { logger } from "../config/logger";
+import { getSetting, setSetting } from "../db/queue-repo";
+import { isCatalogProjectId, isNonChargeableProjectName } from "../config/role-project-catalog";
 
 export type LoginInput = {
   username: string;
@@ -20,11 +22,19 @@ export type Project = {
   name: string;
   projectNumber: string | null;
   clientName: string | null;
+  isNonChargeable?: boolean;
 };
 
 export type SessionStartInput = {
   projectId: string;
+  /** Display name for catalog / admin rows (no backend project id). */
+  projectName?: string;
+  isNonChargeable?: boolean;
   description: string;
+  /** IANA zone from desktop OS (e.g. Europe/Istanbul) for per-employee reporting / late-start bands */
+  clientTimeZone: string;
+  /** ISO-8601 UTC instant when user pressed Start; forwarded for WorkSession.startTime alignment */
+  startTimeUtc?: string;
 };
 
 export type TrackingEventInput = {
@@ -39,6 +49,8 @@ export type TrackingEventInput = {
 export type SessionStopInput = {
   sessionId?: string | null;
   stoppedAt: string;
+  /** IANA zone at stop time (desktop); optional for older backends */
+  clientTimeZone?: string;
 };
 
 export type ScreenshotIngestInput = {
@@ -101,7 +113,8 @@ const projectSchema = z.object({
     .union([z.string(), z.number()])
     .transform((value) => String(value)),
   projectNumber: z.string().nullable(),
-  clientName: z.string().nullable()
+  clientName: z.string().nullable(),
+  isNonChargeable: z.boolean().nullish()
 });
 const projectsResponseSchema = z.array(projectSchema);
 const startResponseSchema = z.object({ sessionId: z.string().min(1).nullable().optional() });
@@ -322,7 +335,119 @@ async function firstSuccess<T>(paths: readonly string[], call: (path: string) =>
   throw lastError;
 }
 
-export async function login(payload: LoginInput, options: RequestOptions): Promise<{ token: string | null; sessionCookie: string | null }> {
+const ROLES_SETTING_KEY = "userRoles";
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : null))
+    .filter((item): item is string => Boolean(item));
+}
+
+function roleStringsFromValue(value: unknown): string[] {
+  if (typeof value === "string" && value.trim()) {
+    return [value.trim()];
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const row = value as Record<string, unknown>;
+    for (const key of ["role", "name", "type", "value"] as const) {
+      if (typeof row[key] === "string" && row[key].trim()) {
+        return [row[key].trim()];
+      }
+    }
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item === "string" && item.trim()) {
+      out.push(item.trim());
+      continue;
+    }
+    if (item && typeof item === "object") {
+      const row = item as Record<string, unknown>;
+      if (typeof row.role === "string" && row.role.trim()) {
+        out.push(row.role.trim());
+      }
+      if (typeof row.name === "string" && row.name.trim()) {
+        out.push(row.name.trim());
+      }
+    }
+  }
+  return out;
+}
+
+function extractRolesFromPayload(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const record = data as Record<string, unknown>;
+
+  const direct = roleStringsFromValue(record.roles);
+  if (direct.length > 0) return direct;
+
+  for (const key of ["role", "userRole", "employeeRole"] as const) {
+    const fromKey = roleStringsFromValue(record[key]);
+    if (fromKey.length > 0) return fromKey;
+  }
+
+  const user = record.user;
+  if (user && typeof user === "object") {
+    const userRecord = user as Record<string, unknown>;
+    const userRoles = roleStringsFromValue(userRecord.roles);
+    if (userRoles.length > 0) return userRoles;
+    const nestedRole = roleStringsFromValue(userRecord.role);
+    if (nestedRole.length > 0) return nestedRole;
+  }
+
+  const employee = record.employee;
+  if (employee && typeof employee === "object") {
+    const employeeRecord = employee as Record<string, unknown>;
+    const employeeRole = roleStringsFromValue(employeeRecord.role);
+    if (employeeRole.length > 0) return employeeRole;
+  }
+
+  return [];
+}
+
+export function readCachedUserRoles(): string[] {
+  const raw = getSetting(ROLES_SETTING_KEY);
+  if (!raw) return [];
+  try {
+    return roleStringsFromValue(JSON.parse(raw) as unknown);
+  } catch {
+    return [];
+  }
+}
+
+export function saveCachedUserRoles(roles: string[]): void {
+  setSetting(ROLES_SETTING_KEY, JSON.stringify(roles));
+}
+
+export function clearCachedUserRoles(): void {
+  setSetting(ROLES_SETTING_KEY, "[]");
+}
+
+export async function fetchUserRoles(options: RequestOptions): Promise<string[]> {
+  const client = getClient();
+  try {
+    const response = await firstSuccess(API_ENDPOINTS.auth.me, (path) =>
+      client.get(path, { headers: authHeader(options) })
+    );
+    persistCookieIfPresent(response, options);
+    const roles = extractRolesFromPayload(response.data);
+    if (roles.length > 0) {
+      saveCachedUserRoles(roles);
+      logger.info("user-roles-fetched", { count: roles.length });
+      return roles;
+    }
+  } catch (error) {
+    logger.warn("user-roles-fetch-failed", { error });
+  }
+  return readCachedUserRoles();
+}
+
+export async function login(payload: LoginInput, options: RequestOptions): Promise<{ token: string | null; sessionCookie: string | null; roles: string[] }> {
   return withRetry(async () => {
     const client = getClient();
     const finalUrl = `${client.defaults.baseURL}${API_ENDPOINTS.auth.login}`;
@@ -335,7 +460,12 @@ export async function login(payload: LoginInput, options: RequestOptions): Promi
       persistCookieIfPresent(response, options);
       const parsed = loginResponseSchema.parse(response.data);
       const sessionCookie = extractCookieHeader(response.headers["set-cookie"] as string[] | undefined);
-      return { token: parsed.token ?? null, sessionCookie };
+      const loginRoles = extractRolesFromPayload(response.data);
+      if (loginRoles.length > 0) {
+        saveCachedUserRoles(loginRoles);
+      }
+      const roles = loginRoles.length > 0 ? loginRoles : await fetchUserRoles(options);
+      return { token: parsed.token ?? null, sessionCookie, roles };
     } catch (error) {
       if (axios.isAxiosError(error) && error.response) {
         const preview =
@@ -426,43 +556,135 @@ export async function getProjects(options: RequestOptions): Promise<Project[]> {
             ?? (clientRaw as Record<string, unknown>).companyName
             ?? null
           : clientRaw;
+      const isNonChargeable =
+        typeof source.isNonChargeable === "boolean"
+          ? source.isNonChargeable
+          : typeof source.nonChargeable === "boolean"
+            ? source.nonChargeable
+            : typeof source.chargeable === "boolean"
+              ? !source.chargeable
+              : isNonChargeableProjectName(name);
+
       return {
         id,
         name,
         projectNumber: asStringOrNull(projectNumberRaw),
-        clientName: asStringOrNull(clientName)
+        clientName: asStringOrNull(clientName),
+        isNonChargeable
       };
     }).filter((item): item is NonNullable<typeof item> => item !== null);
 
-    const parsed = projectsResponseSchema.parse(items);
+    const parsed = items
+      .map((item) => {
+        const result = projectSchema.safeParse(item);
+        return result.success ? result.data : null;
+      })
+      .filter((item): item is z.infer<typeof projectSchema> => item !== null)
+      .map((item) => ({
+        ...item,
+        isNonChargeable: item.isNonChargeable ?? isNonChargeableProjectName(item.name)
+      }));
+
     logger.info("projects-fetch-count", { count: parsed.length });
     return parsed;
   });
 }
 
+function buildSessionStartBody(payload: SessionStartInput, clockStartUtc: string): Record<string, unknown> {
+  const trimmedDescription = payload.description.trim();
+  const base: Record<string, unknown> = {
+    description: trimmedDescription,
+    workDetails: trimmedDescription,
+    work_details: trimmedDescription,
+    details: trimmedDescription,
+    clientTimeZone: payload.clientTimeZone,
+    startTime: clockStartUtc,
+    startedAt: clockStartUtc,
+    occurredAt: clockStartUtc
+  };
+
+  if (isCatalogProjectId(payload.projectId)) {
+    const projectName = (payload.projectName ?? "").trim();
+    return {
+      ...base,
+      projectName,
+      project_name: projectName,
+      isNonChargeable: true,
+      nonChargeable: true
+    };
+  }
+
+  return {
+    ...base,
+    projectId: payload.projectId.trim(),
+    ...(payload.isNonChargeable
+      ? { isNonChargeable: true, nonChargeable: true }
+      : {})
+  };
+}
+
 export async function startSession(payload: SessionStartInput, options: RequestOptions): Promise<{ sessionId: string | null }> {
+  const clockStartUtc = payload.startTimeUtc ?? new Date().toISOString();
   return withRetry(async () => {
     const client = getClient();
     const trimmedDescription = payload.description.trim();
+    const headers = authHeader(options);
+    const sharedDescriptionFields = buildSessionStartBody(payload, clockStartUtc);
+    const usesCatalogProject = isCatalogProjectId(payload.projectId);
+
+    const sessionStartPath = API_ENDPOINTS.tracking.sessionStart;
+    const sessionStartUrl = `${client.defaults.baseURL}${sessionStartPath}`;
+    try {
+      logger.info("tracking-session-start-request", {
+        url: sessionStartUrl,
+        hasCookie: Boolean(options.sessionCookie),
+        clientTimeZone: payload.clientTimeZone,
+        startTimeUtc: clockStartUtc,
+        usesCatalogProject,
+        projectName: usesCatalogProject ? payload.projectName : undefined
+      });
+      const response = await client.post(sessionStartPath, sharedDescriptionFields, { headers });
+      persistCookieIfPresent(response, options);
+      const responsePreview = toPreview(response.data);
+      const parsed = startResponseSchema.safeParse(response.data);
+      const ids = extractIds(response.data);
+      const sessionId = parsed.success ? parsed.data.sessionId ?? ids.sessionId : ids.sessionId;
+      logger.info("tracking-session-start-response", {
+        path: sessionStartPath,
+        status: response.status,
+        hasSessionId: Boolean(sessionId),
+        responsePreview
+      });
+      return { sessionId };
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        logger.info("tracking-session-start-fallback", {
+          reason: "route_not_found_404",
+          fallbackPath: API_ENDPOINTS.attendance.today[0]
+        });
+      } else {
+        throw error;
+      }
+    }
+
     const response = await firstSuccess(API_ENDPOINTS.attendance.today, async (path) => {
       const requestUrl = `${client.defaults.baseURL}${path}`;
       logger.info("tracking-start-request", {
         url: requestUrl,
         hasCookie: Boolean(options.sessionCookie),
-        hasProjectId: payload.projectId.trim().length > 0,
-        descriptionLength: trimmedDescription.length
+        hasProjectId: !usesCatalogProject && payload.projectId.trim().length > 0,
+        usesCatalogProject,
+        descriptionLength: trimmedDescription.length,
+        clientTimeZone: payload.clientTimeZone,
+        startTimeUtc: clockStartUtc
       });
       return client.post(
         path,
         {
           action: "start",
-          projectId: payload.projectId.trim(),
-          description: trimmedDescription,
-          workDetails: trimmedDescription,
-          work_details: trimmedDescription,
-          details: trimmedDescription
+          ...sharedDescriptionFields
         },
-        { headers: authHeader(options) }
+        { headers }
       );
     });
     persistCookieIfPresent(response, options);
@@ -506,12 +728,19 @@ export async function stopSession(payload: SessionStopInput, options: RequestOpt
     const headers = authHeader(options);
     const endpointPath = API_ENDPOINTS.attendance.today[0];
     const requestUrl = `${client.defaults.baseURL}${endpointPath}`;
-    const body = { action: "end", stoppedAt: payload.stoppedAt };
+    const body: Record<string, unknown> = {
+      action: "end",
+      stoppedAt: payload.stoppedAt
+    };
+    if (payload.clientTimeZone) {
+      body.clientTimeZone = payload.clientTimeZone;
+    }
     logger.info("tracking-stop-request", {
       url: requestUrl,
       hasCookie: Boolean(options.sessionCookie),
       hasSessionId: false,
-      payloadKeys: Object.keys(body)
+      payloadKeys: Object.keys(body),
+      hasClientTimeZone: Boolean(payload.clientTimeZone)
     });
     try {
       const response = await client.post(endpointPath, body, { headers });

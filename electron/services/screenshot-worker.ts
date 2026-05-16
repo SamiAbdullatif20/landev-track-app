@@ -1,6 +1,7 @@
 import { desktopCapturer } from "electron";
 import axios from "axios";
 import { logger } from "../config/logger";
+import { getClientIanaTimeZone } from "../config/client-timezone";
 
 const SCREENSHOT_INTERVAL_MS = 6 * 60 * 1000;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -26,6 +27,7 @@ type ScreenshotUploadInput = {
     width: number;
     height: number;
     source: string;
+    clientTimeZone: string;
   };
 };
 
@@ -103,7 +105,8 @@ export class ScreenshotWorker {
           metadata: {
             width: source.thumbnail.getSize().width,
             height: source.thumbnail.getSize().height,
-            source: "desktop-agent"
+            source: "desktop-agent",
+            clientTimeZone: getClientIanaTimeZone()
           }
         });
         logger.info("screenshot-uploaded", {
