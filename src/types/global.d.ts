@@ -11,7 +11,10 @@ type TrackingStatus = {
 type Project = {
   id: string;
   name: string;
+  displayLabel: string;
+  searchLabel: string;
   projectNumber: string | null;
+  projectAddress: string | null;
   clientName: string | null;
   isNonChargeable?: boolean;
   isCatalogDefault?: boolean;
@@ -86,6 +89,20 @@ declare global {
       getAppInfo: () => Promise<AppInfo>;
       testConnection: () => Promise<{ reachable: boolean; message: string }>;
       getProjects: () => Promise<{ projects: Project[]; roles?: string[] }>;
+      onProjectsPush: (
+        cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void
+      ) => () => void;
+      getNotificationSoundEnabled: () => Promise<{ enabled: boolean }>;
+      setNotificationSoundEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>;
+      getWebNotificationsStatus: () => Promise<{ unreadCount: number }>;
+      onNotificationCountPush: (cb: (status: { unreadCount: number }) => void) => () => void;
+      getAppUpdateStatus: () => Promise<import("./app-update").AppUpdateStatus>;
+      checkForAppUpdates: () => Promise<import("./app-update").AppUpdateStatus>;
+      downloadAppUpdate: () => Promise<import("./app-update").AppUpdateStatus>;
+      installAppUpdate: () => Promise<{ ok: true }>;
+      onAppUpdateStatusPush: (cb: (status: import("./app-update").AppUpdateStatus) => void) => () => void;
+      getRecentTasks: () => Promise<import("./recent-task").RecentWorkTask[]>;
+      getWorkSummary: () => Promise<import("./work-summary").WorkSummary>;
       startSession: (payload: {
         projectId: string;
         projectName?: string;

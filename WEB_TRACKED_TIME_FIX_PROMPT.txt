@@ -1,0 +1,281 @@
+Copy everything below this line into your Landev web/backend Cursor chat.
+
+---
+
+You are my senior full-stack engineer on the Landev web/backend project.
+
+Employees report working **longer** than the tracker/admin UI shows. The **desktop app has been updated** to send authoritative session duration fields. Fix the web/backend so **reported tracked time matches wall-clock session time** (Start → Stop), summed across all segments in a work day.
+
+**Do NOT change the desktop app in this task — web/backend + admin UI only.**
+
+---
+
+## Problem summary
+
+| Symptom | Likely cause |
+|---------|----------------|
+| Employee worked 8h, report shows 4–5h | Report uses **latest WorkSession only**, not all segments that day |
+| Time missing after Stop → Start | Same — only last `workSessionId` counted |
+| Time lower than desktop timer | Server ignores client `startedAt` / uses server insert time instead |
+| App-time much lower than session time | UI sums **`APP_FOCUS.activeSeconds`** instead of session duration |
+| Cross-midnight shift wrong day | Missing `workDateKey` + `clientTimeZone` on start/stop |
+
+**Tracked time (billable/session time)** must come from **WorkSession start/stop wall clock**, NOT from summing activity events.
+
+Activity events (`APP_FOCUS`, `INPUT_ACTIVITY`) measure *what happened during* tracking — they must **not** be the primary source for total hours worked.
+
+---
+
+## What the desktop sends now
+
+### POST `/api/tracking/session/start` (fallback: `POST /api/attendance/today` action `start`)
+
+```json
+{
+  "projectId": "uuid-or-catalog",
+  "description": "Site drawings",
+  "clientTimeZone": "Pacific/Auckland",
+  "workDateKey": "2026-06-02",
+  "startTime": "2026-06-02T07:00:00.000Z",
+  "startedAt": "2026-06-02T07:00:00.000Z",
+  "startTimeUtc": "2026-06-02T07:00:00.000Z",
+  "occurredAt": "2026-06-02T07:00:00.000Z"
+}
+```
+
+**Persist:** `startedAt` / `startTime` exactly as sent (client clock at Start press). Do **not** replace with server `now()` if client timestamps are present.
+
+Response must include stable ids:
+
+```json
+{
+  "sessionId": "clx...",
+  "workSessionId": "clx...",
+  "workSession": { "id": "clx...", "startTime": "2026-06-02T07:00:00.000Z" }
+}
+```
+
+### POST `/api/tracking/session/stop` (fallback: `POST /api/attendance/today` action `end`)
+
+```json
+{
+  "sessionId": "clx...",
+  "workSessionId": "clx...",
+  "stoppedAt": "2026-06-02T15:30:00.000Z",
+  "stopTimeUtc": "2026-06-02T15:30:00.000Z",
+  "endTime": "2026-06-02T15:30:00.000Z",
+  "startedAt": "2026-06-02T07:00:00.000Z",
+  "startTimeUtc": "2026-06-02T07:00:00.000Z",
+  "durationMs": 30600000,
+  "trackedDurationMs": 30600000,
+  "durationSeconds": 30600,
+  "workDateKey": "2026-06-02",
+  "sessionSegmentStartedAt": "2026-06-02T07:00:00.000Z",
+  "projectId": "uuid",
+  "clientTimeZone": "Pacific/Auckland"
+}
+```
+
+**Authoritative duration rule (REQUIRED on stop ingest):**
+
+```ts
+const startedMs = Date.parse(body.startedAt ?? body.startTimeUtc ?? existing.startTime);
+const stoppedMs = Date.parse(body.stoppedAt ?? body.stopTimeUtc);
+const clientDurationMs =
+  typeof body.durationMs === "number" && body.durationMs > 0
+    ? body.durationMs
+    : Math.max(0, stoppedMs - startedMs);
+
+// Store on WorkSession:
+workSession.startTime = clientStartedAt;
+workSession.stopTime = clientStoppedAt;
+workSession.durationMs = clientDurationMs;
+```
+
+Prefer `durationMs` from desktop when present; otherwise compute from client `startedAt` + `stoppedAt`. **Never** shorten duration because activity events are sparse.
+
+---
+
+## How to compute total tracked time for a work day (REQUIRED)
+
+```ts
+function totalTrackedMsForDay(
+  workSessions: WorkSession[],
+  userId: string,
+  workDateKey: string,
+  clientTimeZone: string
+): number {
+  let total = 0;
+
+  for (const session of workSessions.filter((s) => s.userId === userId)) {
+    if (!session.startTime || !session.stopTime) continue;
+
+    const overlapMs = overlapLocalWorkDayMs(
+      session.startTime,
+      session.stopTime,
+      workDateKey,
+      clientTimeZone
+    );
+    total += overlapMs;
+  }
+
+  return total;
+}
+```
+
+- Include **every** WorkSession row for that employee whose interval overlaps `workDateKey` (local timezone).
+- Multiple Stop/Start segments **add together** — e.g. 3h + 2h + 3h = **8h**, not 3h.
+
+### WRONG (do not use for total hours)
+
+```ts
+// ❌ Latest session only
+const ms = latestSession.stopTime - latestSession.startTime;
+
+// ❌ Sum of app focus (under-counts when focus probe gaps, tracker foreground, etc.)
+const ms = sum(appFocusEvents.map((e) => e.activeSeconds)) * 1000;
+
+// ❌ Sum of input activity windows
+const ms = sum(inputActivityEvents.map((e) => e.trackerElapsedMs));
+
+// ❌ Average or max of session durations
+```
+
+### RIGHT (use for admin “hours tracked” / timesheet total)
+
+```ts
+// ✅ Sum wall-clock WorkSession durations for the day (with midnight split)
+const totalTrackedMs = totalTrackedMsForDay(sessions, userId, workDateKey, clientTimeZone);
+```
+
+Use `APP_FOCUS` only for **“apps used”** breakdown, not headline hours.
+
+---
+
+## Multi-segment days (Stop → Start)
+
+Each desktop Stop/Start creates a **new segment** with:
+
+- New `workSessionId` (preferred) OR same id with new `sessionSegmentStartedAt` on events
+- Same or new `workDateKey` depending on local date
+
+Report query key = **`userId + workDateKey`**, NOT `workSessionId = activeSession`.
+
+### Acceptance
+
+1. Start 9:00 → Stop 12:00 (3h) → Start 13:00 → Stop 18:00 (5h) → **day total = 8h**
+2. Events/screenshots from **both** segments visible
+3. Stopping does **not** delete prior segment duration
+
+---
+
+## Cross-midnight sessions
+
+When a session spans local midnight (e.g. 22:00–02:00):
+
+- Split duration across `workDateKey` boundaries using `clientTimeZone`
+- June 2 report gets 2h, June 3 report gets 2h — not 0h on one day
+
+Helper logic (same as desktop):
+
+```ts
+function overlapLocalWorkDayMs(
+  startIso: string,
+  endIso: string,
+  workDateKey: string,
+  timeZone: string
+): number {
+  const startMs = Date.parse(startIso);
+  const endMs = Date.parse(endIso);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+
+  const dayStartMs = resolveLocalMidnightMs(workDateKey, timeZone);
+  const dayEndMs = resolveLocalMidnightMs(nextCalendarDate(workDateKey), timeZone);
+  return Math.max(0, Math.min(endMs, dayEndMs) - Math.max(startMs, dayStartMs));
+}
+```
+
+---
+
+## API / ingest checklist
+
+| Endpoint | Fix |
+|----------|-----|
+| `POST /api/tracking/session/start` | Store client `startedAt`, `workDateKey`, `clientTimeZone`; return `sessionId` |
+| `POST /api/tracking/session/stop` | Store client `stoppedAt`, `startedAt`, `durationMs`; set `stopTime` on correct session row |
+| `POST /api/attendance/today` (`start`/`end`) | Same fields on fallback paths |
+| Session report API | Return `totalTrackedMs` from WorkSessions, separate from app/activity metrics |
+| Admin UI | Label clearly: **Time tracked** = session wall clock; **Apps used** = activity breakdown |
+
+---
+
+## Related event fields (for linking, not primary duration)
+
+Tracking events still include:
+
+```json
+{
+  "workDateKey": "2026-06-02",
+  "workSessionId": "clx...",
+  "sessionSegmentStartedAt": "2026-06-02T07:00:00.000Z",
+  "clientTimeZone": "Pacific/Auckland"
+}
+```
+
+Use these to attach apps/activity/screenshots to the day — **not** to derive total hours unless WorkSession rows are missing (legacy backfill only).
+
+---
+
+## Legacy / backfill
+
+Old stops without `durationMs`:
+
+```ts
+durationMs = stopTime - startTime; // from stored WorkSession
+```
+
+If `startedAt` missing on old rows, infer from first `sessionSegmentStartedAt` on events for that `workSessionId`.
+
+---
+
+## Files to search
+
+```
+workDateKey
+workSessionId
+sessionSegmentStartedAt
+durationMs
+trackedDurationMs
+totalTracked
+hours tracked
+session report
+timesheet
+APP_FOCUS
+activeSeconds
+attendance/today
+tracking/session/stop
+tracking/session/start
+```
+
+---
+
+## Acceptance tests (must pass)
+
+1. **Single segment:** Start → work 2h → Stop → report shows **~2h** (±1 min).
+2. **Multi segment:** Two segments same day (3h + 5h) → report **8h**, not 5h.
+3. **Typing-only / reading:** Session 1h with low mouse activity → still **1h** tracked (activity % low, hours correct).
+4. **Cross midnight:** 4h shift spanning midnight → split correctly across two `workDateKey`s.
+5. **Compare to desktop:** Desktop “today total” and web admin report agree within **1 minute** for same user/day.
+
+---
+
+## Deliverables
+
+1. Root cause — which query/formula under-counted (latest session only, APP_FOCUS sum, server timestamps, etc.).
+2. Code changes — stop/start ingest, WorkSession duration storage, report API, admin UI.
+3. List files changed.
+4. Note legacy handling.
+
+---
+
+EOF

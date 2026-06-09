@@ -6,8 +6,7 @@
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
   "appId": "com.landev.track",
   "asar": true,
-  "productName": "LANDev Track",
-  "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+  "productName": "LANDEV Tracker",
   "directories": {
     "output": "release/${version}",
     "buildResources": "build"
@@ -19,9 +18,22 @@
     "dist",
     "dist-electron",
     "build/icons/**/*",
-    "package.json",
-    ".env.prod"
+    "package.json"
   ],
+  "asarUnpack": [
+    "**/node_modules/better-sqlite3/**"
+  ],
+  "extraResources": [
+    {
+      "from": ".env.prod",
+      "to": ".env.prod"
+    },
+    {
+      "from": "build/sounds",
+      "to": "sounds"
+    }
+  ],
+  "npmRebuild": true,
   "win": {
     "target": [
       {
@@ -30,18 +42,25 @@
       }
     ],
     "icon": "build/icons/icon.ico",
-    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}",
+    "signAndEditExecutable": false
   },
   "nsis": {
     "oneClick": false,
     "perMachine": false,
     "allowToChangeInstallationDirectory": true,
-    "deleteAppDataOnUninstall": true
+    "deleteAppDataOnUninstall": true,
+    "unicode": true,
+    "installerLanguages": ["en_US"]
   },
+  // GitHub Releases (recommended): set owner/repo, then publish with GH_TOKEN.
+  // See RELEASE_UPDATES.md for setup and costs.
   "publish": [
     {
-      "provider": "generic",
-      "url": "https://updates.example.com/landev-track/"
+      "provider": "github",
+      "owner": "YOUR_GITHUB_ORG",
+      "repo": "landev-track-app",
+      "releaseType": "release"
     }
   ]
 }

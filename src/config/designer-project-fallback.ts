@@ -24,7 +24,10 @@ export function designerCatalogFallbackProjects(): Project[] {
   return DESIGNER_CATALOG_NAMES.map((name) => ({
     id: catalogIdForName(name),
     name,
+    displayLabel: name,
+    searchLabel: name,
     projectNumber: null,
+    projectAddress: null,
     clientName: null,
     isNonChargeable: name.trim().toLowerCase().startsWith("admin -"),
     isCatalogDefault: true

@@ -17,16 +17,41 @@ export function enqueueEvent(eventType: string, payload: unknown): void {
 }
 
 export function getPendingEvents(limit = 50): QueuedEvent[] {
+  return getPendingEventsByKinds(null, limit);
+}
+
+export function getPendingEventsByKinds(kinds: readonly string[] | null, limit = 50): QueuedEvent[] {
   const db = getDb();
   const stmt = db.prepare(`
     SELECT * FROM queued_events
     WHERE status IN ('pending', 'retry')
       AND (nextRunAt IS NULL OR nextRunAt <= @now)
     ORDER BY id ASC
-    LIMIT @limit
+    LIMIT @fetchLimit
   `);
+  const fetchLimit = kinds && kinds.length > 0 ? Math.max(limit * 4, limit) : limit;
+  const rows = stmt.all({
+    now: new Date().toISOString(),
+    fetchLimit
+  }) as QueuedEvent[];
+  if (!kinds || kinds.length === 0) {
+    return rows.slice(0, limit);
+  }
+  const allowed = new Set(kinds);
+  return rows.filter((row) => allowed.has(row.eventKind)).slice(0, limit);
+}
 
-  return stmt.all({ now: new Date().toISOString(), limit }) as QueuedEvent[];
+export function markEventsDelivered(ids: number[]): void {
+  if (ids.length === 0) {
+    return;
+  }
+  const db = getDb();
+  const placeholders = ids.map(() => "?").join(", ");
+  db.prepare(`
+    UPDATE queued_events
+    SET status = 'delivered', nextRunAt = NULL
+    WHERE id IN (${placeholders})
+  `).run(...ids);
 }
 
 export function markEventDelivered(id: number): void {
@@ -88,6 +113,24 @@ export function clearSyntheticSessionPendingEvents(limit = 5000): number {
 export function getSessionState(): SessionState {
   const db = getDb();
   return db.prepare("SELECT * FROM active_session WHERE id = 1").get() as SessionState;
+}
+
+export function clearUndeliveredQueuedEvents(): number {
+  const db = getDb();
+  const result = db
+    .prepare("DELETE FROM queued_events WHERE status IN ('pending', 'retry')")
+    .run();
+  return result.changes;
+}
+
+export function resetActiveSessionState(): void {
+  saveSessionState({
+    active: 0,
+    sessionId: null,
+    projectId: null,
+    description: null,
+    startedAt: null
+  });
 }
 
 export function saveSessionState(state: Omit<SessionState, "id" | "updatedAt">): void {

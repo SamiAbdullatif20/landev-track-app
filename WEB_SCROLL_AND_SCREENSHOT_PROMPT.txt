@@ -1,0 +1,75 @@
+Copy everything below into your web/backend Cursor chat.
+
+---
+
+## Task: Align web tracking/report logic with latest desktop input + screenshot behavior
+
+Desktop tracking was updated and web aggregation should be aligned.
+
+## 1) INPUT_ACTIVITY changes to consume
+
+Each INPUT_ACTIVITY event can now include:
+
+- `mouseMoveCount` (meaningful movement ticks)
+- `clickCount`
+- `scrollCount` (new; wheel activity)
+- `mouseMovePercent` (0..100, already de-biased)
+- `activeSeconds`, `idleSeconds`, `trackerElapsedMs`
+- `metadata.mouseMoveSamples`, `metadata.totalSamples`
+- `metadata.scrollCount` (same semantic as top-level)
+
+### Mouse activity metric (reporting)
+
+Keep existing time-weighted aggregation for `mouseMovePercent`:
+
+```ts
+weightedPct = sum(mouseMovePercent * weightSeconds) / sum(weightSeconds)
+```
+
+Where `weightSeconds` is `activeSeconds` fallback `trackerElapsedMs / 1000`.
+
+### New scroll metric (add to API/UI)
+
+Please add a scroll metric in report responses:
+
+- `totalScrollCount = sum(INPUT_ACTIVITY.scrollCount || metadata.scrollCount || 0)`
+
+Optionally expose:
+
+- `scrollEventsPerHour = totalScrollCount / (totalActiveSeconds / 3600)` when active seconds > 0.
+
+Do not break old rows where `scrollCount` is missing.
+
+## 2) Screenshot cadence semantics updated
+
+Desktop screenshot cadence now runs as:
+
+- `6m`, `10m`, `16m`, `20m`, `26m`, `30m`, ...
+
+Interpretation:
+- One capture in the `+6` slot (superadmin-only visibility)
+- One capture in the `+10` slot (admin+employee visibility)
+- Repeat every 10-minute block from session start
+
+If web code assumes independent `every 6` and `every 10` schedules, update UI/help text to reflect this paired cadence.
+
+## 3) Backward compatibility requirements
+
+- Old events may not have `scrollCount`; handle null/undefined.
+- Keep existing `mouseMovePercent` aggregation for old/new events.
+- Do not require DB migration if event JSON is schemaless.
+
+## 4) Validation checklist
+
+1. Session with typing only: low mouse % and low/zero scroll.
+2. Session with wheel scrolling: non-zero `totalScrollCount`.
+3. Old historical data still loads without exceptions.
+4. Screenshot-related labels/docs reflect 6/10 paired cadence sequence.
+
+## Deliverable
+
+1. List changed backend and frontend files.
+2. Show final API response fields for activity summary.
+3. Mention any legacy fallback handling you added.
+
+---

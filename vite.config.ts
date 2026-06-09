@@ -3,6 +3,12 @@ import path from 'node:path'
 import electron from 'vite-plugin-electron/simple'
 import react from '@vitejs/plugin-react'
 
+const packagedEnv = {
+  VITE_API_BASE_URL: process.env.VITE_API_BASE_URL ?? 'https://landev.vercel.app',
+  VITE_APP_ENV: process.env.VITE_APP_ENV ?? 'prod',
+  AUTO_UPDATE_ENABLED: process.env.AUTO_UPDATE_ENABLED ?? 'false',
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
@@ -11,6 +17,9 @@ export default defineConfig({
       main: {
         entry: 'electron/main.ts',
         vite: {
+          define: {
+            __LANDEV_PACKAGED_ENV__: JSON.stringify(packagedEnv),
+          },
           build: {
             rollupOptions: {
               external: ['better-sqlite3'],

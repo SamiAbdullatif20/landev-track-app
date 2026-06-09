@@ -1,0 +1,124 @@
+Copy everything below this line into your Landev web/backend Cursor chat.
+
+---
+
+You are my senior full-stack engineer on the Landev web/backend project.
+
+The **desktop LANDEV Tracker** now shows a **notification bell** in the header. It polls your API for an unread count and opens the web notifications page when clicked. Implement (or align) the backend + page so this works end-to-end.
+
+**Do NOT change the desktop app in this task — web/backend only.**
+
+---
+
+## Desktop behavior (already shipped)
+
+1. **Poll** (every 60s while logged in): `GET` unread count using Bearer token and/or session cookie (same auth as other tracking APIs).
+2. **Badge:** Shows red count when unread > 0.
+3. **Click:** Opens `{webAppBaseUrl}/notifications` in the default browser, clears badge immediately, calls mark-seen API.
+
+### URL resolution
+
+- Default page: **`/notifications`** on the same origin as `VITE_API_BASE_URL` (without trailing `/api`).
+- Example: API `https://landev.vercel.app` → opens `https://landev.vercel.app/notifications`
+- Optional env overrides on desktop: `VITE_WEB_APP_URL`, `VITE_WEB_NOTIFICATIONS_PATH`
+
+---
+
+## Required API endpoints
+
+Desktop tries these paths **in order** (404 → next). Implement **at least one** unread endpoint and **at least one** mark-seen endpoint.
+
+### Unread count (GET)
+
+Preferred:
+
+```
+GET /api/notifications/unread-count
+```
+
+Alternates tried:
+
+- `GET /api/notifications/unread`
+- `GET /api/notifications/count`
+
+**Response (any of these shapes work):**
+
+```json
+{ "unreadCount": 3 }
+```
+
+```json
+{ "count": 3 }
+```
+
+```json
+{ "unread": 3 }
+```
+
+```json
+{ "data": { "unreadCount": 3 } }
+```
+
+Auth: same session as `/api/auth/me` — cookie and/or Bearer.
+
+### Mark seen (POST)
+
+When user clicks the bell, desktop calls:
+
+```
+POST /api/notifications/mark-all-read
+```
+
+Body:
+
+```json
+{ "source": "desktop-tracker" }
+```
+
+Alternates tried:
+
+- `POST /api/notifications/read-all`
+- `POST /api/notifications/mark-seen`
+
+**Expected:** 200/204; subsequent unread count = 0 (until new notifications arrive).
+
+---
+
+## Web page
+
+Ensure **`/notifications`** exists and is the same page employees use in the web dashboard (assignments, alerts, etc.).
+
+- User may need to log in on web if browser session differs from desktop — document if SSO is required.
+- Page should reflect read state after mark-all-read API runs.
+
+---
+
+## Optional: push new counts faster
+
+Desktop polls every 60s. Optional future improvement (not required now):
+
+- WebSocket/SSE for instant badge updates
+- Or shorten poll interval if you add rate-limit-safe endpoint
+
+---
+
+## Acceptance tests
+
+1. Create 3 unread notifications for test user → desktop bell shows **3**.
+2. Click bell → browser opens `/notifications`, badge clears to **0**.
+3. Refresh desktop after 60s → count stays **0** (mark-seen persisted).
+4. New notification arrives → count increases again.
+5. Unauthenticated → count **0**, click still opens page (login on web).
+
+---
+
+## Deliverables
+
+1. Implement or document existing endpoints matching shapes above.
+2. Confirm notifications page route.
+3. List files changed.
+4. If your routes differ, document exact paths + JSON so desktop env can be updated.
+
+---
+
+EOF

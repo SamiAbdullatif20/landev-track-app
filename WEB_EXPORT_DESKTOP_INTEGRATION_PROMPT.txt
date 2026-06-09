@@ -1,0 +1,269 @@
+Copy everything below this line into your Landev web/backend Cursor chat.
+
+---
+
+You are my senior full-stack engineer on the Landev web/backend project.
+
+The **LANDEV desktop tracker** (Electron) integrates with this web system for auth, sessions, events, screenshots, notifications, and admin reports. I need you to **audit the live codebase** and produce **one integration file** I can paste into the desktop repo so engineers can configure the app without guessing URLs or API shapes.
+
+**Do NOT change production behavior in this task unless you find a clear bug while auditing.** Primary deliverable = the integration file.
+
+---
+
+## Your deliverable
+
+Create a file in the web repo (and show its full contents in chat):
+
+**`DESKTOP_TRACKER_INTEGRATION.md`**
+
+Use the exact template below. Fill every section from **actual code** (routes, env vars, handlers, UI routes) — not assumptions. If something is missing or broken, mark it `NOT IMPLEMENTED` and note what desktop expects.
+
+Also export a machine-readable companion (same facts):
+
+**`desktop-tracker-integration.env.example`**
+
+— flat `KEY=value` lines the desktop `.env.prod` can copy (comment lines start with `#`).
+
+---
+
+## Template for `DESKTOP_TRACKER_INTEGRATION.md`
+
+```markdown
+# LANDEV Desktop Tracker — Web Integration Reference
+
+> Generated: YYYY-MM-DD
+> Web app version / commit: <hash or tag>
+> Maintainer: <team contact optional>
+
+## 1) Environment URLs (desktop `.env` values)
+
+| Desktop env var | Value | Notes |
+|-----------------|-------|-------|
+| `VITE_API_BASE_URL` | | Full API origin desktop axios uses (e.g. `https://landev.co.nz` or `https://landev.vercel.app`) |
+| `VITE_WEB_APP_URL` | | Public web app origin if different from API (optional override) |
+| `VITE_WEB_NOTIFICATIONS_PATH` | | Path only, e.g. `/notifications` or `/dashboard/notifications` |
+| `VITE_APP_ENV` | `prod` / `staging` / `dev` | Which profile desktop should use |
+
+### Resolved URLs (computed)
+
+| Purpose | Full URL |
+|---------|----------|
+| Notifications page (browser opens on bell click) | |
+| Employee login page | |
+| Admin session report (example) | |
+| API health / ping (if any) | |
+
+---
+
+## 2) Authentication
+
+| Item | Detail |
+|------|--------|
+| Login endpoint(s) | Method + path(s) |
+| Logout endpoint(s) | |
+| Session probe / me | |
+| Auth mechanism | Bearer token / cookie / both |
+| Cookie name(s) | |
+| Token response field names | `token`, `accessToken`, etc. |
+| Roles field location | |
+| Session duration / refresh | |
+
+---
+
+## 3) Tracking session (Start / Stop)
+
+### Start
+
+| Item | Detail |
+|------|--------|
+| Primary endpoint | `POST ...` |
+| Fallback endpoint(s) | |
+| Request body fields | `projectId`, `startedAt`, `workDateKey`, `clientTimeZone`, … |
+| Response session id fields | `sessionId`, `workSessionId`, `workSession.id`, … |
+| Multiple segments same day | New WorkSession per stop/start? Same id? Document behavior. |
+| Server uses client `startedAt`? | yes/no — if no, note risk of under-counted hours |
+
+### Stop
+
+| Item | Detail |
+|------|--------|
+| Primary endpoint | `POST ...` |
+| Fallback endpoint(s) | |
+| Request body fields | `stoppedAt`, `startedAt`, `durationMs`, `workDateKey`, `sessionId`, … |
+| Duration calculation on server | `stop - start` from which fields? |
+| Stop deletes prior day data? | must be **no** |
+
+### Active session lookup
+
+| Endpoint | Purpose |
+|----------|---------|
+| | Desktop fallback when start omits session id |
+
+---
+
+## 4) Event batch ingest
+
+| Item | Detail |
+|------|--------|
+| Endpoint | `POST /api/tracking/events/batch` (confirm exact path) |
+| Request shape | `{ events: [...] }` |
+| Idempotency key | `eventUuid` |
+| Fields persisted | `workDateKey`, `workSessionId`, `sessionSegmentStartedAt`, `clientTimeZone`, `metadata` |
+| Event kinds | `APP_FOCUS`, `INPUT_ACTIVITY`, `HEARTBEAT` |
+| Strips unknown metadata? | yes/no |
+| Multi-segment same day | All events kept? |
+
+### APP_FOCUS (apps used)
+
+| Field | Location | Used for |
+|-------|----------|----------|
+| `activeSeconds` | top / metadata | App breakdown (NOT total hours) |
+| `applicationDisplayName` | | |
+| `processName` | | |
+
+### INPUT_ACTIVITY (mouse/keyboard)
+
+| Field | Location | Used for |
+|-------|----------|----------|
+| `mouseActiveSeconds` | top / metadata | Session mouse % aggregate |
+| `mouseMovePercent` | per 15s window | |
+| `trackerElapsedMs` | | Usually 15000 |
+
+**Mouse % day aggregate formula (document what web implements):**
+```
+sum(mouseActiveSeconds) / sum(trackerElapsedMs/1000) * 100
+```
+NOT average of percents.
+
+---
+
+## 5) Screenshots
+
+| Item | Detail |
+|------|--------|
+| Ingest endpoint | `POST ...` multipart |
+| List/query key | `userId + workDateKey` or other |
+| Metadata persisted | Full JSON? |
+| Per-screenshot mouse fields | `metadata.mouseMovePercent`, `activityPeriodStartAt`, `intervalMinutes`, … |
+| Screenshot UI uses | per-screenshot `metadata.mouseMovePercent` OR session total? (must be per-screenshot) |
+| Visibility roles | `visibleToRoles`, `intervalMinutes` (2 superadmin / 10 designer) |
+
+---
+
+## 6) Notifications (desktop bell)
+
+| Item | Detail |
+|------|--------|
+| Unread count endpoint | `GET ...` (exact path implemented) |
+| Response JSON shape | `{ "unreadCount": N }` or actual shape |
+| Mark seen endpoint | `POST ...` |
+| Mark seen body | |
+| Notifications page route | Full path in Next/React router |
+| Full browser URL | |
+
+---
+
+## 7) Session report / timesheet (admin UI)
+
+| Item | Detail |
+|------|--------|
+| Report API endpoint(s) | |
+| Query keys | `userId + workDateKey` (required) vs `workSessionId` only (wrong) |
+| Total tracked time source | WorkSession wall clock sum OR APP_FOCUS sum (must be WorkSession) |
+| Multi-segment aggregation | Sum all sessions that day? |
+| Cross-midnight split | By `clientTimeZone`? |
+| Apps used aggregation | Sum `APP_FOCUS.activeSeconds` by app |
+| Screenshots in report | All segments that day? |
+
+---
+
+## 8) Projects list
+
+| Item | Detail |
+|------|--------|
+| Endpoint(s) | |
+| Pagination | cursor field names |
+| Role filtering | Which roles see which projects |
+| Non-chargeable / catalog projects | |
+
+---
+
+## 9) Known gaps / desktop impact
+
+List anything **not implemented** or **differs** from what desktop sends:
+
+| Area | Status | Desktop impact |
+|------|--------|----------------|
+| Notifications API | | Badge always 0 |
+| Per-screenshot mouse % | | Same % on every tile |
+| Multi-segment hours | | Under-reported time |
+| … | | |
+
+---
+
+## 10) Quick verification checklist
+
+- [ ] Start → Stop 2h → report shows ~2h
+- [ ] Stop → Start same day → hours **add** (e.g. 3h + 5h = 8h)
+- [ ] Notifications bell count matches web
+- [ ] Bell click opens correct URL
+- [ ] Screenshot badges differ per 10-min block
+- [ ] Mouse % matches real usage (not ~100% typing-only)
+
+---
+
+## 11) Copy-paste block for desktop engineer
+
+Provide this exact block at the end (filled in):
+
+\`\`\`env
+# Paste into landev-track-app .env.prod
+VITE_API_BASE_URL=
+VITE_WEB_APP_URL=
+VITE_WEB_NOTIFICATIONS_PATH=
+VITE_APP_ENV=prod
+\`\`\`
+
+\`\`\`json
+{
+  "notifications": {
+    "unreadCountPath": "/api/...",
+    "markSeenPath": "/api/...",
+    "pageUrl": "https://..."
+  },
+  "tracking": {
+    "sessionStartPath": "/api/...",
+    "sessionStopPath": "/api/...",
+    "eventsBatchPath": "/api/...",
+    "screenshotsIngestPath": "/api/..."
+  },
+  "reportScope": "userId+workDateKey",
+  "trackedTimeSource": "workSessionWallClock",
+  "mousePercentFormula": "sumMouseActiveSecondsOverSumWindowSeconds"
+}
+\`\`\`
+```
+
+---
+
+## How to produce this (audit steps)
+
+1. Grep web repo for: `tracking/session`, `events/batch`, `screenshots`, `notifications`, `workDateKey`, `mouseMovePercent`, `workSessionId`, `attendance/today`.
+2. Read route handlers + Zod schemas + report UI queries.
+3. Confirm env: `NEXT_PUBLIC_*`, `API_URL`, production domain.
+4. Confirm notifications page file path in `app/` or `pages/` router.
+5. Write `DESKTOP_TRACKER_INTEGRATION.md` + `desktop-tracker-integration.env.example`.
+6. Paste **full file contents** in your reply so I can copy them into the desktop repo.
+
+---
+
+## Important rules for the integration file
+
+- Use **real production URLs** (or staging if prod not deployed yet) — label which environment.
+- If API base and web UI differ (e.g. `api.landev.co.nz` vs `landev.co.nz`), document both explicitly.
+- Do not omit “obvious” paths — desktop defaults to `/notifications` and may be wrong.
+- Flag if browser login is required separately from desktop cookie (SSO gap).
+
+---
+
+EOF

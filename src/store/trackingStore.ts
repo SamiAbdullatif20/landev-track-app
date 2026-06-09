@@ -3,7 +3,10 @@ import { create } from "zustand";
 export type Project = {
   id: string;
   name: string;
+  displayLabel: string;
+  searchLabel: string;
   projectNumber: string | null;
+  projectAddress: string | null;
   clientName: string | null;
   isNonChargeable?: boolean;
   isCatalogDefault?: boolean;

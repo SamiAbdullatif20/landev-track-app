@@ -1,18 +1,24 @@
+@import "./landev-theme.css";
+
 :root {
-  color: #e2e8f0;
-  background: radial-gradient(circle at top, #1e293b 0%, #0f172a 40%, #020617 100%);
-  font-family: Inter, "Segoe UI", Roboto, sans-serif;
+  font-family: "Open Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: var(--text);
+  background: var(--surface);
+  -webkit-font-smoothing: antialiased;
 }
 
 * {
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }

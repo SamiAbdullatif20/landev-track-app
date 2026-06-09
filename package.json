@@ -11,12 +11,15 @@
     "build:dev": "dotenv -e .env.dev -- npm run build",
     "build:staging": "dotenv -e .env.staging -- npm run build",
     "build:prod": "dotenv -e .env.prod -- npm run build",
+    "dist:win": "npm run build:prod",
     "build": "npm run typecheck && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config.win.signAndEditExecutable=false",
     "build:dir": "npm run typecheck && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir --config.win.signAndEditExecutable=false",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "reset:tracking": "node scripts/reset-local-tracking.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
     "package": "npm run build",
+    "release:win": "dotenv -e .env.prod -- npm run typecheck && dotenv -e .env.prod -- vite build && dotenv -e .env.prod -- cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --publish always",
     "preview": "vite preview"
   },
   "dependencies": {

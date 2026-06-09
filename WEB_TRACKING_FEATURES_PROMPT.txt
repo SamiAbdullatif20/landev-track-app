@@ -1,0 +1,185 @@
+You are my senior full-stack engineer on the Landev web/backend project.
+
+The Electron desktop tracker already sends the data described below. Implement ingest, storage, role-based visibility, and admin/employee session report UI/API. Do NOT change the desktop app — web/backend only.
+
+================================================================================
+PROBLEM
+================================================================================
+
+Employees Stop and Start tracking multiple times per day.
+
+- First Start: session report shows apps, mouse %, screenshots — OK.
+- After Stop then Start again: report looks empty or old data disappears; new segment shows nothing.
+
+Fix: reports must use userId + workDateKey (full work day), not only the latest workSessionId.
+
+================================================================================
+ENDPOINTS (desktop already calls these)
+================================================================================
+
+POST /api/tracking/session/start
+POST /api/tracking/session/stop
+POST /api/attendance/today          (fallback start/stop with action start|end)
+POST /api/tracking/events/batch     body: { "events": [ ... ] }
+POST /api/tracking/screenshots/ingest   multipart form-data
+GET  /api/tracking/session/active   (optional — desktop fallback for session id)
+GET  /api/tracking/session/status   (optional)
+
+Auth: same as web login (Bearer token and/or session Cookie).
+
+================================================================================
+1. SCREENSHOTS — 6 min (super admin only) + 10 min (admin + employees) + JPEG
+================================================================================
+
+POST /api/tracking/screenshots/ingest
+
+Multipart fields:
+- image          → JPEG bytes (NOT PNG). mimeType field = image/jpeg
+- capturedAt
+- projectId, sessionId, workSessionId (when available)
+- metadata       → JSON string, example:
+
+{
+  "intervalMinutes": 6,
+  "visibility": "superadmin_only",
+  "visibleToRoles": ["SUPER_ADMIN"],
+  "jpegQuality": 72,
+  "originalPngBytes": 1200000,
+  "compressedBytes": 380000,
+  "width": 1920,
+  "height": 1080,
+  "clientTimeZone": "Pacific/Auckland",
+  "source": "desktop-agent"
+}
+
+OR for 10-minute tier:
+
+{
+  "intervalMinutes": 10,
+  "visibility": "admin_and_employee",
+  "visibleToRoles": ["SUPER_ADMIN", "DESIGNER", "MODERATOR"],
+  ...
+}
+
+WEB MUST:
+- Accept image/jpeg in ingest (store as JPEG).
+- Persist metadata.visibility and metadata.visibleToRoles on each screenshot row.
+- Enforce visibility when listing:
+  - SUPER_ADMIN → sees 6-min AND 10-min screenshots.
+  - DESIGNER, MODERATOR (employees) → see ONLY 10-min tier (admin_and_employee), never 6-min.
+- Never delete screenshots when a session stops.
+
+================================================================================
+2. APPS USED — real application names + exact minutes (not PowerShell)
+================================================================================
+
+POST /api/tracking/events/batch
+
+Each APP_FOCUS event includes (top-level and/or metadata):
+
+- eventUuid, eventKind: "APP_FOCUS", type: "APP_FOCUS"
+- occurredAt, occurredAtIso
+- workDateKey              → "YYYY-MM-DD" (employee local work date)
+- workSessionId, sessionId → same value when present
+- sessionSegmentStartedAt  → ISO UTC; changes on each desktop Stop/Start
+- clientTimeZone
+- projectId
+
+Apps panel fields (USE THESE FOR UI):
+- applicationDisplayName   → SHOW THIS in report (e.g. "Chrome", "AutoCAD")
+- application              → normalized slug (chrome, autodesk)
+- processName              → e.g. chrome.exe, acad.exe
+- windowTitle
+- activeSeconds            → seconds user spent on this app IN THIS EVENT — SUM for total minutes
+- idleSeconds
+
+Desktop filters out PowerShell/cmd/conhost client-side. Web should also denylist:
+powershell, pwsh, cmd, conhost, wt, openconsole
+
+WEB MUST:
+- Apps used report: group by applicationDisplayName (fallback: strip .exe from processName).
+- Minutes per app = SUM(activeSeconds) / 60 for ALL events where workDateKey = selected day AND userId = employee.
+- Round to integer or 1 decimal minute.
+- Aggregate ALL workSessionIds for that work date — NOT only the currently active session.
+- Stop/start same day: APPEND usage; do not clear or replace previous app rows.
+- Never show "powershell" in the apps list.
+
+Example UI:
+  AutoCAD        47 min
+  Google Chrome  22 min
+
+================================================================================
+3. MOUSE MOVEMENT — percentage in report
+================================================================================
+
+INPUT_ACTIVITY events every ~15 seconds in batch:
+
+- eventKind: "INPUT_ACTIVITY"
+- mouseMoveCount, keyPressCount
+- mouseMovePercent           (top-level number 0–100)
+- metadata.mouseMovePercent  (same, inside metadata JSON)
+- metadata.mouseMoveSamples, metadata.totalSamples (optional)
+- activeSeconds, idleSeconds, trackerElapsedMs
+- workDateKey, workSessionId, sessionSegmentStartedAt, clientTimeZone
+
+WEB MUST:
+- Show one headline on session report: "Mouse activity: XX%"
+- Compute for the whole work day (all INPUT_ACTIVITY for userId + workDateKey):
+  - Weighted average: sum(mouseMovePercent * activeSeconds) / sum(activeSeconds)
+  - OR: sum(metadata.mouseMoveSamples) / sum(metadata.totalSamples) * 100
+- Read percent with fallback:
+
+  const pct = event.mouseMovePercent ?? event.metadata?.mouseMovePercent ?? null;
+
+- If no data: show "N/A", not 0%.
+
+================================================================================
+4. MULTI STOP/START SAME DAY
+================================================================================
+
+- Session report query key = authenticated employee userId + workDateKey.
+- Do NOT scope report to only the latest workSessionId.
+- Stopping session must NOT delete tracking events or screenshots.
+- Second Start same day: report shows cumulative apps + mouse % + screenshots from segment 1 AND segment 2.
+
+================================================================================
+5. BATCH INGEST — POST /api/tracking/events/batch
+================================================================================
+
+- Body MUST accept: { "events": [ ... ] }  (array required)
+- eventKind values: APP_FOCUS, INPUT_ACTIVITY, HEARTBEAT
+- Idempotent on eventUuid (safe for retries)
+- Persist full metadata JSON (do not strip unknown keys)
+- If workSessionId missing: resolve active WorkSession server-side from user + workDateKey — do not drop events
+- Fix Redis expire errors if batch returns 500 (ERR wrong number of arguments for 'expire')
+- Return 200 with per-event results
+
+================================================================================
+6. SESSION START RESPONSE (help desktop link events)
+================================================================================
+
+POST /api/tracking/session/start (and attendance start fallback) should return:
+
+{
+  "sessionId": "<uuid>",
+  "workSessionId": "<uuid>",
+  "workSession": { "id": "<uuid>" }
+}
+
+Desktop reads: workSessionId, sessionId, workSession.id, session.id, id
+
+================================================================================
+DELIVERABLES
+================================================================================
+
+1. Short root-cause note (why 2nd start showed empty / wiped data).
+2. Code changes: screenshot ingest + list filter, batch ingest, session report API, admin UI.
+3. Manual test checklist — all must pass:
+   [ ] 6-min screenshot visible ONLY when logged in as SUPER_ADMIN
+   [ ] 10-min screenshot visible to SUPER_ADMIN, DESIGNER, MODERATOR
+   [ ] 15+ min tracking in Chrome then AutoCAD: apps show "Chrome" and "AutoCAD", NOT PowerShell; minutes plausible
+   [ ] Mouse activity % shows a number > 0 when user moved mouse
+   [ ] Stop → Start again same day: Chrome data still visible; AutoCAD adds to report (not blank)
+4. List which desktop fields you implemented against (workDateKey, applicationDisplayName, activeSeconds, mouseMovePercent, visibleToRoles).
+
+Do not modify the Electron desktop tracker repository.

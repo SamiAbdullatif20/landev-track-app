@@ -1,6 +1,8 @@
 import axios, { AxiosError, type AxiosResponse } from "axios";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { readEnv } from "../config/env";
+import { getWorkDateKey } from "../utils/work-date-key";
 import { API_ENDPOINTS } from "./endpoints";
 import { logger } from "../config/logger";
 import { getSetting, setSetting } from "../db/queue-repo";
@@ -20,7 +22,12 @@ export type MeResponse = {
 export type Project = {
   id: string;
   name: string;
+  /** Primary UI line (e.g. project number). */
+  displayLabel: string;
+  /** Search/filter text (e.g. site address). */
+  searchLabel: string;
   projectNumber: string | null;
+  projectAddress: string | null;
   clientName: string | null;
   isNonChargeable?: boolean;
 };
@@ -46,17 +53,40 @@ export type TrackingEventInput = {
   metadata?: Record<string, unknown>;
 };
 
+export type SessionStopTrailingEvent = {
+  eventUuid: string;
+  eventKind: "SESSION_STOP";
+  occurredAtIso: string;
+  workDateKey: string;
+  source: "DESKTOP_AGENT";
+};
+
 export type SessionStopInput = {
   sessionId?: string | null;
   stoppedAt: string;
-  /** IANA zone at stop time (desktop); optional for older backends */
+  /** ISO start of this segment; server should prefer this + stoppedAt for duration. */
+  startedAt?: string;
+  /** Wall-clock tracked ms (stoppedAt - startedAt) from desktop. */
+  durationMs?: number;
+  /** Employee local work date at stop (YYYY-MM-DD). */
+  workDateKey?: string;
+  /** Same as startedAt — segment boundary for multi start/stop days. */
+  sessionSegmentStartedAt?: string;
+  projectId?: string | null;
+  /** IANA zone at stop time (desktop). */
   clientTimeZone?: string;
+  /** Alias used by web stop API (`timezone`). */
+  timezone?: string;
+  /** Stable per-install device id. */
+  deviceUuid?: string;
+  /** Immediate SESSION_STOP signal for web live-timer cutoff. */
+  trailingEvents?: SessionStopTrailingEvent[];
 };
 
 export type ScreenshotIngestInput = {
   capturedAt: string;
   imageBase64: string;
-  mimeType: "image/png";
+  mimeType: "image/png" | "image/jpeg";
   projectId: string | null;
   sessionId?: string;
   metadata?: Record<string, unknown>;
@@ -88,6 +118,18 @@ type RequestOptions = {
   onSessionCookie?: (cookie: string) => void;
 };
 
+export type AuthAwareRequestOptions = RequestOptions & {
+  /** Called once on 401/403 to refresh session before retrying the same request. */
+  onAuthRefresh?: () => Promise<RequestOptions | null>;
+};
+
+export const BATCH_TRACKING_EVENT_KINDS = ["INPUT_ACTIVITY", "APP_FOCUS", "HEARTBEAT"] as const;
+
+export type TrackingBatchEventInput = TrackingEventInput & {
+  eventUuid: string;
+  eventKind: string;
+};
+
 let client: ReturnType<typeof axios.create> | null = null;
 
 function getClient() {
@@ -112,12 +154,116 @@ const projectSchema = z.object({
   name: z
     .union([z.string(), z.number()])
     .transform((value) => String(value)),
+  displayLabel: z.string().optional(),
+  searchLabel: z.string().optional(),
   projectNumber: z.string().nullable(),
+  projectAddress: z.string().nullable().optional(),
   clientName: z.string().nullable(),
   isNonChargeable: z.boolean().nullish()
 });
 const projectsResponseSchema = z.array(projectSchema);
 const startResponseSchema = z.object({ sessionId: z.string().min(1).nullable().optional() });
+
+export function parseProjectsNextCursor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+
+  const rootCursor = asStringOrNull(record.nextCursor ?? record.next_cursor);
+  if (rootCursor) {
+    return rootCursor;
+  }
+
+  const pagination = record.pagination ?? record.meta;
+  if (pagination && typeof pagination === "object") {
+    const page = pagination as Record<string, unknown>;
+    const hasMore = page.hasMore ?? page.has_more;
+    if (hasMore === false) {
+      return null;
+    }
+    const next = asStringOrNull(page.nextCursor ?? page.next_cursor ?? page.next);
+    if (next) {
+      return next;
+    }
+  }
+
+  return null;
+}
+
+/** Safety cap: 200 projects/page × 100 pages */
+export const PROJECTS_MAX_PAGES = 100;
+
+function mapRawProjectRecord(source: Record<string, unknown>): Omit<Project, "isNonChargeable"> | null {
+  const id = asStringOrNull(source.id ?? source.projectId ?? source.project_id ?? source._id);
+  const name = asStringOrNull(source.name ?? source.title ?? source.projectName ?? source.project_name);
+  if (id == null || name == null) {
+    return null;
+  }
+  const displayLabelRaw = source.displayLabel ?? source.display_label ?? null;
+  const searchLabelRaw = source.searchLabel ?? source.search_label ?? null;
+  const projectAddressRaw =
+    source.projectAddress ?? source.project_address ?? source.address ?? null;
+  const projectNumberRaw = source.projectNumber ?? source.project_number ?? source.code ?? null;
+  const clientRaw = source.clientName ?? source.client_name ?? source.client ?? null;
+  const clientName =
+    clientRaw && typeof clientRaw === "object"
+      ? (clientRaw as Record<string, unknown>).name
+        ?? (clientRaw as Record<string, unknown>).title
+        ?? (clientRaw as Record<string, unknown>).companyName
+        ?? null
+      : clientRaw;
+  const projectNumber = asStringOrNull(projectNumberRaw);
+  const projectAddress = asStringOrNull(projectAddressRaw);
+  const clientNameStr = asStringOrNull(clientName);
+  const displayLabel =
+    asStringOrNull(displayLabelRaw)?.trim()
+    || projectNumber?.trim()
+    || name.trim();
+  const searchLabel =
+    asStringOrNull(searchLabelRaw)?.trim()
+    || projectAddress?.trim()
+    || [name, clientNameStr, projectNumber].filter((part): part is string => Boolean(part?.trim())).join(" ").trim()
+    || name.trim();
+
+  return {
+    id,
+    name,
+    displayLabel,
+    searchLabel,
+    projectNumber,
+    projectAddress,
+    clientName: clientNameStr
+  };
+}
+
+function finalizeProjectRows(items: Array<Omit<Project, "isNonChargeable"> & { isNonChargeable?: boolean }>): Project[] {
+  const parsed = items
+    .map((item) => {
+      const result = projectSchema.safeParse(item);
+      return result.success ? result.data : null;
+    })
+    .filter((item): item is z.infer<typeof projectSchema> => item !== null)
+    .map((item) => {
+      const displayLabel = item.displayLabel?.trim() || item.projectNumber?.trim() || item.name.trim();
+      const searchLabel =
+        item.searchLabel?.trim()
+        || item.projectAddress?.trim()
+        || [item.name, item.clientName, item.projectNumber]
+          .filter((part): part is string => Boolean(part?.trim()))
+          .join(" ")
+          .trim()
+        || item.name.trim();
+      return {
+        ...item,
+        displayLabel,
+        searchLabel,
+        projectAddress: item.projectAddress ?? null,
+        isNonChargeable: item.isNonChargeable ?? isNonChargeableProjectName(item.name)
+      };
+    });
+  return parsed;
+}
 
 function normalizeProjectsPayload(payload: unknown): unknown[] {
   if (Array.isArray(payload)) {
@@ -199,6 +345,26 @@ function mapAxiosError(error: unknown): ApiError {
   return new ApiError("validation", details);
 }
 
+export async function withAuthRetry<T>(
+  fn: (options: RequestOptions) => Promise<T>,
+  options: AuthAwareRequestOptions
+): Promise<T> {
+  try {
+    return await fn(options);
+  } catch (error) {
+    const mapped = mapAxiosError(error);
+    if (mapped.kind !== "auth" || !options.onAuthRefresh) {
+      throw mapped;
+    }
+    const refreshed = await options.onAuthRefresh();
+    if (!refreshed) {
+      throw mapped;
+    }
+    logger.info("auth-retry-request");
+    return await fn(refreshed);
+  }
+}
+
 async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < retries; attempt += 1) {
@@ -255,6 +421,24 @@ function persistCookieIfPresent(response: AxiosResponse, options: RequestOptions
   }
 }
 
+function responseErrorText(error: AxiosError): string {
+  const data = error.response?.data;
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data && typeof data === "object") {
+    const record = data as Record<string, unknown>;
+    const message = record.message ?? record.error ?? record.errors;
+    if (typeof message === "string") {
+      return message;
+    }
+    if (Array.isArray(message) && typeof message[0] === "string") {
+      return message[0];
+    }
+  }
+  return JSON.stringify(data ?? {});
+}
+
 function isAlreadyStoppedError(error: unknown): boolean {
   if (!axios.isAxiosError(error) || !error.response) {
     return false;
@@ -262,10 +446,7 @@ function isAlreadyStoppedError(error: unknown): boolean {
   if (error.response.status !== 409 && error.response.status !== 400) {
     return false;
   }
-  const message =
-    typeof error.response.data === "string"
-      ? error.response.data
-      : JSON.stringify(error.response.data ?? {});
+  const message = responseErrorText(error);
   return /already\s+(ended|stopped)|already\s+clocked\s*out|no\s+active\s+session/i.test(message);
 }
 
@@ -283,14 +464,21 @@ function extractIds(data: unknown): { sessionId: string | null; timesheetId: str
   const sessionObj = record.session && typeof record.session === "object"
     ? (record.session as Record<string, unknown>)
     : null;
+  const workSessionObj = record.workSession && typeof record.workSession === "object"
+    ? (record.workSession as Record<string, unknown>)
+    : null;
   const timesheetObj = record.timesheet && typeof record.timesheet === "object"
     ? (record.timesheet as Record<string, unknown>)
     : null;
   const sessionId = asStringOrNull(
-    record.sessionId
+    record.workSessionId
+    ?? record.sessionId
     ?? record.session_id
     ?? record.id
     ?? record.trackingSessionId
+    ?? workSessionObj?.id
+    ?? workSessionObj?.sessionId
+    ?? workSessionObj?.session_id
     ?? sessionObj?.sessionId
     ?? sessionObj?.session_id
     ?? sessionObj?.id
@@ -317,6 +505,44 @@ function shouldSendSessionId(sessionId: string | null | undefined): boolean {
     return false;
   }
   return true;
+}
+
+export function extractWorkSessionId(data: unknown): string | null {
+  const { sessionId } = extractIds(data);
+  return shouldSendSessionId(sessionId) ? sessionId : null;
+}
+
+/** Resolve today's active work session when start response omits sessionId (common on 2nd start). */
+export async function fetchActiveWorkSessionId(options: RequestOptions): Promise<string | null> {
+  const client = getClient();
+  const headers = authHeader(options);
+  const paths = [
+    "/api/tracking/session/active",
+    "/api/tracking/session/status",
+    ...API_ENDPOINTS.attendance.today
+  ];
+
+  for (const path of paths) {
+    try {
+      const response = await client.get(path, { headers });
+      persistCookieIfPresent(response, options);
+      const sessionId = extractWorkSessionId(response.data);
+      if (sessionId) {
+        logger.info("active-work-session-resolved", { path, hasSessionId: true });
+        return sessionId;
+      }
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        continue;
+      }
+      logger.warn("active-work-session-fetch-failed", {
+        path,
+        error: error instanceof Error ? error.message : "unknown"
+      });
+    }
+  }
+
+  return null;
 }
 
 async function firstSuccess<T>(paths: readonly string[], call: (path: string) => Promise<T>): Promise<T> {
@@ -519,85 +745,87 @@ export async function testConnection(): Promise<{ reachable: boolean; message: s
   }
 }
 
-export async function getProjects(options: RequestOptions): Promise<Project[]> {
-  return withRetry(async () => {
-    const client = getClient();
-    const response = await firstSuccess(API_ENDPOINTS.tracking.projects, async (path) => {
-      const requestUrl = `${client.defaults.baseURL}${path}`;
-      logger.info("projects-fetch-request", { url: requestUrl, hasCookie: Boolean(options.sessionCookie) });
-      const result = await client.get(path, { headers: authHeader(options) });
-      logger.info("projects-fetch-response", {
-        path,
-        status: result.status
+export async function getAllProjectsPaginated(options: AuthAwareRequestOptions): Promise<Project[]> {
+  return withAuthRetry(async (requestOptions) => {
+    const http = getClient();
+    const path = "/api/projects";
+    const merged = new Map<string, Project>();
+    let cursor: string | null = null;
+    let page = 0;
+
+    do {
+      if (page >= PROJECTS_MAX_PAGES) {
+        logger.warn("projects-fetch-page-cap", { maxPages: PROJECTS_MAX_PAGES });
+        break;
+      }
+      page += 1;
+      const requestUrl = `${http.defaults.baseURL}${path}`;
+      logger.info("projects-fetch-request", {
+        url: requestUrl,
+        page,
+        cursor: cursor ?? null,
+        hasCookie: Boolean(requestOptions.sessionCookie)
       });
-      persistCookieIfPresent(result, options);
-      return result;
-    });
+      const response = await http.get(path, {
+        headers: authHeader(requestOptions),
+        params: {
+          limit: 200,
+          ...(cursor ? { cursor } : {})
+        }
+      });
+      persistCookieIfPresent(response, requestOptions);
+      const normalized = normalizeProjectsPayload(response.data);
+      const nextCursor = parseProjectsNextCursor(response.data);
+      logger.info("projects-fetch-page", {
+        page,
+        rawCount: normalized.length,
+        accumulated: merged.size,
+        nextCursor: nextCursor ?? null
+      });
 
-    const normalized = normalizeProjectsPayload(response.data);
-    logger.info("projects-fetch-raw-count", { count: normalized.length });
-
-    const items = normalized.map((item) => {
-      if (!item || typeof item !== "object") {
-        return null;
+      for (const item of normalized) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const source = item as Record<string, unknown>;
+        const mapped = mapRawProjectRecord(source);
+        if (!mapped) {
+          continue;
+        }
+        const isNonChargeable =
+          typeof source.isNonChargeable === "boolean"
+            ? source.isNonChargeable
+            : typeof source.nonChargeable === "boolean"
+              ? source.nonChargeable
+              : typeof source.chargeable === "boolean"
+                ? !source.chargeable
+                : isNonChargeableProjectName(mapped.name);
+        merged.set(mapped.id, { ...mapped, isNonChargeable });
       }
-      const source = item as Record<string, unknown>;
-      const id = asStringOrNull(source.id ?? source.projectId ?? source.project_id ?? source._id);
-      const name = asStringOrNull(source.name ?? source.title ?? source.projectName ?? source.project_name);
-      if (id == null || name == null) {
-        return null;
-      }
-      const projectNumberRaw = source.projectNumber ?? source.project_number ?? source.code ?? null;
-      const clientRaw = source.clientName ?? source.client_name ?? source.client ?? null;
-      const clientName =
-        clientRaw && typeof clientRaw === "object"
-          ? (clientRaw as Record<string, unknown>).name
-            ?? (clientRaw as Record<string, unknown>).title
-            ?? (clientRaw as Record<string, unknown>).companyName
-            ?? null
-          : clientRaw;
-      const isNonChargeable =
-        typeof source.isNonChargeable === "boolean"
-          ? source.isNonChargeable
-          : typeof source.nonChargeable === "boolean"
-            ? source.nonChargeable
-            : typeof source.chargeable === "boolean"
-              ? !source.chargeable
-              : isNonChargeableProjectName(name);
 
-      return {
-        id,
-        name,
-        projectNumber: asStringOrNull(projectNumberRaw),
-        clientName: asStringOrNull(clientName),
-        isNonChargeable
-      };
-    }).filter((item): item is NonNullable<typeof item> => item !== null);
+      cursor = nextCursor;
+    } while (cursor);
 
-    const parsed = items
-      .map((item) => {
-        const result = projectSchema.safeParse(item);
-        return result.success ? result.data : null;
-      })
-      .filter((item): item is z.infer<typeof projectSchema> => item !== null)
-      .map((item) => ({
-        ...item,
-        isNonChargeable: item.isNonChargeable ?? isNonChargeableProjectName(item.name)
-      }));
-
-    logger.info("projects-fetch-count", { count: parsed.length });
+    const parsed = finalizeProjectRows(Array.from(merged.values()));
+    logger.info("projects-fetch-count", { count: parsed.length, pages: page });
     return parsed;
-  });
+  }, options);
+}
+
+export async function getProjects(options: AuthAwareRequestOptions): Promise<Project[]> {
+  return getAllProjectsPaginated(options);
 }
 
 function buildSessionStartBody(payload: SessionStartInput, clockStartUtc: string): Record<string, unknown> {
   const trimmedDescription = payload.description.trim();
+  const workDateKey = getWorkDateKey(new Date(clockStartUtc));
   const base: Record<string, unknown> = {
     description: trimmedDescription,
     workDetails: trimmedDescription,
     work_details: trimmedDescription,
     details: trimmedDescription,
     clientTimeZone: payload.clientTimeZone,
+    workDateKey,
     startTime: clockStartUtc,
     startedAt: clockStartUtc,
     occurredAt: clockStartUtc
@@ -646,16 +874,18 @@ export async function startSession(payload: SessionStartInput, options: RequestO
       const response = await client.post(sessionStartPath, sharedDescriptionFields, { headers });
       persistCookieIfPresent(response, options);
       const responsePreview = toPreview(response.data);
-      const parsed = startResponseSchema.safeParse(response.data);
       const ids = extractIds(response.data);
-      const sessionId = parsed.success ? parsed.data.sessionId ?? ids.sessionId : ids.sessionId;
+      let sessionId = extractWorkSessionId(response.data) ?? ids.sessionId;
+      if (!shouldSendSessionId(sessionId)) {
+        sessionId = await fetchActiveWorkSessionId(options);
+      }
       logger.info("tracking-session-start-response", {
         path: sessionStartPath,
         status: response.status,
         hasSessionId: Boolean(sessionId),
         responsePreview
       });
-      return { sessionId };
+      return { sessionId: shouldSendSessionId(sessionId) ? sessionId : null };
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         logger.info("tracking-session-start-fallback", {
@@ -689,110 +919,445 @@ export async function startSession(payload: SessionStartInput, options: RequestO
     });
     persistCookieIfPresent(response, options);
     const responsePreview = toPreview(response.data);
-    const parsed = startResponseSchema.safeParse(response.data);
     const ids = extractIds(response.data);
-    const sessionId = parsed.success ? parsed.data.sessionId ?? ids.sessionId : ids.sessionId;
+    let sessionId = extractWorkSessionId(response.data) ?? ids.sessionId;
+    if (!shouldSendSessionId(sessionId)) {
+      sessionId = await fetchActiveWorkSessionId(options);
+    }
     logger.info("tracking-start-response", {
       path: API_ENDPOINTS.attendance.today[0],
       status: response.status,
       hasSessionId: Boolean(sessionId),
       responsePreview
     });
-    return { sessionId };
+    return { sessionId: shouldSendSessionId(sessionId) ? sessionId : null };
   });
 }
 
-export async function ingestEvent(payload: TrackingEventInput, options: RequestOptions): Promise<void> {
-  await withRetry(async () => {
+export async function ingestEvent(payload: TrackingEventInput, options: AuthAwareRequestOptions): Promise<void> {
+  await withAuthRetry(async (requestOptions) => {
     const client = getClient();
     const response = await firstSuccess(API_ENDPOINTS.tracking.eventsIngest, (path) =>
-      client.post(path, payload, { headers: authHeader(options) })
+      client.post(path, payload, { headers: authHeader(requestOptions) })
     );
-    persistCookieIfPresent(response, options);
-  });
+    persistCookieIfPresent(response, requestOptions);
+  }, options);
 }
 
-export async function ingestScreenshot(payload: ScreenshotIngestInput, options: RequestOptions): Promise<void> {
-  await withRetry(async () => {
+export async function ingestEventsBatch(
+  events: TrackingBatchEventInput[],
+  options: AuthAwareRequestOptions
+): Promise<void> {
+  if (events.length === 0) {
+    return;
+  }
+  await withAuthRetry(async (requestOptions) => {
     const client = getClient();
-    const response = await firstSuccess(API_ENDPOINTS.tracking.screenshotsIngest, (path) =>
-      client.post(path, payload, { headers: authHeader(options) })
+    const response = await client.post(
+      API_ENDPOINTS.tracking.eventsBatch,
+      { events },
+      { headers: authHeader(requestOptions) }
     );
-    persistCookieIfPresent(response, options);
-  });
+    persistCookieIfPresent(response, requestOptions);
+    logger.info("events-batch-ingested", { count: events.length });
+  }, options);
 }
 
-export async function stopSession(payload: SessionStopInput, options: RequestOptions): Promise<SessionStopResult> {
-  return withRetry(async () => {
-    const client = getClient();
-    const headers = authHeader(options);
-    const endpointPath = API_ENDPOINTS.attendance.today[0];
-    const requestUrl = `${client.defaults.baseURL}${endpointPath}`;
-    const body: Record<string, unknown> = {
-      action: "end",
-      stoppedAt: payload.stoppedAt
-    };
-    if (payload.clientTimeZone) {
-      body.clientTimeZone = payload.clientTimeZone;
-    }
-    logger.info("tracking-stop-request", {
-      url: requestUrl,
-      hasCookie: Boolean(options.sessionCookie),
-      hasSessionId: false,
-      payloadKeys: Object.keys(body),
-      hasClientTimeZone: Boolean(payload.clientTimeZone)
-    });
+function buildScreenshotMultipartBody(payload: ScreenshotIngestInput): {
+  body: Buffer;
+  contentType: string;
+} {
+  const boundary = `----landev${randomUUID()}`;
+  const imageBuffer = Buffer.from(payload.imageBase64, "base64");
+  const parts: Buffer[] = [];
+  const writeField = (name: string, value: string) => {
+    parts.push(
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`)
+    );
+  };
+
+  writeField("capturedAt", payload.capturedAt);
+  writeField("mimeType", payload.mimeType);
+  if (payload.projectId) {
+    writeField("projectId", payload.projectId);
+  }
+  if (payload.sessionId) {
+    writeField("sessionId", payload.sessionId);
+    writeField("workSessionId", payload.sessionId);
+  }
+  if (payload.metadata) {
+    writeField("metadata", JSON.stringify(payload.metadata));
+  }
+
+  const ext = payload.mimeType === "image/jpeg" ? "jpg" : "png";
+  parts.push(
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="screenshot.${ext}"\r\nContent-Type: ${payload.mimeType}\r\n\r\n`
+    )
+  );
+  parts.push(imageBuffer);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  return {
+    body: Buffer.concat(parts),
+    contentType: `multipart/form-data; boundary=${boundary}`
+  };
+}
+
+async function ingestScreenshotMultipart(
+  payload: ScreenshotIngestInput,
+  options: RequestOptions
+): Promise<void> {
+  const client = getClient();
+  const { body, contentType } = buildScreenshotMultipartBody(payload);
+  const response = await firstSuccess(API_ENDPOINTS.tracking.screenshotsIngest, (path) =>
+    client.post(path, body, {
+      headers: {
+        ...authHeader(options),
+        "Content-Type": contentType,
+        "Content-Length": String(body.length)
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    })
+  );
+  persistCookieIfPresent(response, options);
+}
+
+function screenshotRetryDelayMs(attempt: number, error: unknown): number | null {
+  if (error instanceof ApiError && error.kind === "auth") {
+    return attempt === 0 ? 500 : null;
+  }
+  const status = axios.isAxiosError(error) ? error.response?.status : null;
+  if (status && status >= 400 && status < 500 && status !== 401) {
+    return null;
+  }
+  if (!status || status >= 500 || status === 401 || status === 429) {
+    return Math.min(60_000, 1000 * 2 ** attempt);
+  }
+  return null;
+}
+
+export async function ingestScreenshot(
+  payload: ScreenshotIngestInput,
+  options: AuthAwareRequestOptions
+): Promise<void> {
+  const maxAttempts = 4;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      const response = await client.post(endpointPath, body, { headers });
+      await withAuthRetry((requestOptions) => ingestScreenshotMultipart(payload, requestOptions), options);
+      return;
+    } catch (error) {
+      lastError = error;
+      const delayMs = screenshotRetryDelayMs(attempt, error);
+      logger.warn("screenshot-upload-failed", {
+        attempt: attempt + 1,
+        maxAttempts,
+        delayMs,
+        error: error instanceof Error ? error.message : "unknown",
+        status: axios.isAxiosError(error) ? error.response?.status : null
+      });
+      if (delayMs == null || attempt === maxAttempts - 1) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw mapAxiosError(lastError);
+}
+
+function buildSessionStopBody(payload: SessionStopInput): Record<string, unknown> {
+  const timeZone = payload.timezone ?? payload.clientTimeZone;
+  const body: Record<string, unknown> = {
+    stoppedAt: payload.stoppedAt,
+    stopTimeUtc: payload.stoppedAt,
+    endTime: payload.stoppedAt,
+    occurredAt: payload.stoppedAt
+  };
+  if (timeZone) {
+    body.clientTimeZone = timeZone;
+    body.timezone = timeZone;
+  }
+  if (payload.deviceUuid) {
+    body.deviceUuid = payload.deviceUuid;
+  }
+  if (payload.workDateKey) {
+    body.workDateKey = payload.workDateKey;
+  }
+  if (payload.trailingEvents && payload.trailingEvents.length > 0) {
+    body.trailingEvents = payload.trailingEvents;
+  }
+  if (payload.startedAt) {
+    body.startedAt = payload.startedAt;
+    body.startTimeUtc = payload.startedAt;
+    body.startTime = payload.startedAt;
+  }
+  if (typeof payload.durationMs === "number" && payload.durationMs > 0) {
+    body.durationMs = payload.durationMs;
+    body.trackedDurationMs = payload.durationMs;
+    body.durationSeconds = Math.round(payload.durationMs / 1000);
+  }
+  if (payload.sessionSegmentStartedAt) {
+    body.sessionSegmentStartedAt = payload.sessionSegmentStartedAt;
+  }
+  if (payload.projectId) {
+    body.projectId = payload.projectId;
+  }
+  if (shouldSendSessionId(payload.sessionId)) {
+    body.sessionId = payload.sessionId;
+    body.workSessionId = payload.sessionId;
+  }
+  return body;
+}
+
+function idempotentStopResult(
+  endpointPath: string,
+  payload: SessionStopInput,
+  responsePreview: string | null,
+  status: number | null
+): SessionStopResult {
+  return {
+    ok: true,
+    queued: false,
+    endpointPath,
+    status,
+    confirmedBy: "idempotent",
+    sessionId: shouldSendSessionId(payload.sessionId) ? payload.sessionId ?? null : null,
+    timesheetId: null,
+    responsePreview
+  };
+}
+
+async function postAttendanceStop(
+  payload: SessionStopInput,
+  options: RequestOptions
+): Promise<SessionStopResult> {
+  const client = getClient();
+  const headers = authHeader(options);
+  const endpointPath = API_ENDPOINTS.attendance.today[0];
+  const requestUrl = `${client.defaults.baseURL}${endpointPath}`;
+  const body: Record<string, unknown> = {
+    action: "end",
+    ...buildSessionStopBody(payload)
+  };
+  logger.info("tracking-stop-request", {
+    url: requestUrl,
+    hasCookie: Boolean(options.sessionCookie),
+    hasSessionId: shouldSendSessionId(payload.sessionId),
+    payloadKeys: Object.keys(body),
+    hasClientTimeZone: Boolean(payload.clientTimeZone)
+  });
+  const response = await client.post(endpointPath, body, { headers });
+  const responsePreview = toPreview(response.data);
+  logger.info("tracking-stop-response", {
+    path: endpointPath,
+    status: response.status,
+    ok: true,
+    responsePreview
+  });
+  persistCookieIfPresent(response, options);
+  const ids = extractIds(response.data);
+  return {
+    ok: true,
+    queued: false,
+    endpointPath,
+    status: response.status,
+    confirmedBy: "attendance",
+    sessionId: ids.sessionId,
+    timesheetId: ids.timesheetId,
+    responsePreview
+  };
+}
+
+export async function stopSession(
+  payload: SessionStopInput,
+  options: AuthAwareRequestOptions
+): Promise<SessionStopResult> {
+  return withAuthRetry(async (requestOptions) => {
+    const client = getClient();
+    const headers = authHeader(requestOptions);
+    const stopBody = buildSessionStopBody(payload);
+    const sessionStopPath = API_ENDPOINTS.tracking.sessionStop;
+    const sessionStopUrl = `${client.defaults.baseURL}${sessionStopPath}`;
+
+    try {
+      logger.info("tracking-session-stop-request", {
+        url: sessionStopUrl,
+        hasCookie: Boolean(requestOptions.sessionCookie),
+        hasSessionId: shouldSendSessionId(payload.sessionId),
+        clientTimeZone: payload.clientTimeZone ?? payload.timezone,
+        hasTrailingEvents: Boolean(payload.trailingEvents?.length),
+        deviceUuid: payload.deviceUuid ?? null
+      });
+      const response = await client.post(sessionStopPath, stopBody, { headers });
+      persistCookieIfPresent(response, requestOptions);
       const responsePreview = toPreview(response.data);
-      logger.info("tracking-stop-response", {
-        path: endpointPath,
+      const ids = extractIds(response.data);
+      logger.info("tracking-session-stop-response", {
+        path: sessionStopPath,
         status: response.status,
-        ok: true,
+        hasSessionId: Boolean(ids.sessionId),
         responsePreview
       });
-      persistCookieIfPresent(response, options);
-      const ids = extractIds(response.data);
       return {
         ok: true,
         queued: false,
-        endpointPath,
+        endpointPath: sessionStopPath,
         status: response.status,
-        confirmedBy: "attendance",
-        sessionId: ids.sessionId,
+        confirmedBy: "tracking",
+        sessionId: ids.sessionId ?? (shouldSendSessionId(payload.sessionId) ? payload.sessionId ?? null : null),
         timesheetId: ids.timesheetId,
         responsePreview
       };
     } catch (error) {
       if (isAlreadyStoppedError(error)) {
         const response = axios.isAxiosError(error) ? error.response : undefined;
-        const responsePreview = toPreview(response?.data);
-        logger.info("tracking-stop-response", {
-          path: endpointPath,
-          status: response?.status ?? null,
-          ok: true,
-          idempotent: true,
-          responsePreview
-        });
-        return {
-          ok: true,
-          queued: false,
-          endpointPath,
-          status: response?.status ?? null,
-          confirmedBy: "idempotent",
-          sessionId: shouldSendSessionId(payload.sessionId) ? payload.sessionId ?? null : null,
-          timesheetId: null,
-          responsePreview
-        };
+        return idempotentStopResult(
+          sessionStopPath,
+          payload,
+          toPreview(response?.data),
+          response?.status ?? null
+        );
       }
-      const response = axios.isAxiosError(error) ? error.response : undefined;
-      logger.warn("tracking-stop-response", {
-        path: endpointPath,
-        status: response?.status ?? null,
-        ok: false,
-        responsePreview: toPreview(response?.data)
+
+      if (!(axios.isAxiosError(error) && error.response?.status === 404)) {
+        const response = axios.isAxiosError(error) ? error.response : undefined;
+        logger.warn("tracking-session-stop-response", {
+          path: sessionStopPath,
+          status: response?.status ?? null,
+          ok: false,
+          responsePreview: toPreview(response?.data)
+        });
+        throw error;
+      }
+
+      logger.info("tracking-session-stop-fallback", {
+        reason: "route_not_found_404",
+        fallbackPath: API_ENDPOINTS.attendance.today[0]
       });
+    }
+
+    try {
+      return await postAttendanceStop(payload, requestOptions);
+    } catch (error) {
+      if (isAlreadyStoppedError(error)) {
+        const response = axios.isAxiosError(error) ? error.response : undefined;
+        return idempotentStopResult(
+          API_ENDPOINTS.attendance.today[0],
+          payload,
+          toPreview(response?.data),
+          response?.status ?? null
+        );
+      }
       throw error;
     }
-  });
+  }, options);
+}
+
+export type WebNotificationsStatus = {
+  unreadCount: number;
+};
+
+function parseUnreadNotificationCount(payload: unknown): number {
+  if (typeof payload === "number" && Number.isFinite(payload)) {
+    return Math.max(0, Math.floor(payload));
+  }
+  if (typeof payload === "string") {
+    const parsed = Number(payload.trim());
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, Math.floor(parsed));
+    }
+    return 0;
+  }
+  if (!payload || typeof payload !== "object") {
+    return 0;
+  }
+  const record = payload as Record<string, unknown>;
+  for (const key of [
+    "unreadCount",
+    "unread",
+    "count",
+    "total",
+    "unreadTotal",
+    "unread_count",
+    "unreadNotifications"
+  ]) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.max(0, Math.floor(value));
+    }
+    if (typeof value === "string") {
+      const parsed = Number(value.trim());
+      if (Number.isFinite(parsed)) {
+        return Math.max(0, Math.floor(parsed));
+      }
+    }
+  }
+  for (const key of ["data", "result", "payload"]) {
+    const nested = record[key];
+    if (nested && typeof nested === "object") {
+      const nestedCount = parseUnreadNotificationCount(nested);
+      if (nestedCount > 0) {
+        return nestedCount;
+      }
+    }
+  }
+  if (Array.isArray(record.notifications)) {
+    return record.notifications.filter((item) => {
+      if (!item || typeof item !== "object") {
+        return false;
+      }
+      const row = item as Record<string, unknown>;
+      return row.read !== true && row.isRead !== true && row.seen !== true && row.readAt == null;
+    }).length;
+  }
+  if (Array.isArray(record.items)) {
+    return parseUnreadNotificationCount({ notifications: record.items });
+  }
+  return 0;
+}
+
+function isHtmlResponse(data: unknown): boolean {
+  return typeof data === "string" && data.trimStart().startsWith("<!DOCTYPE html");
+}
+
+/** Remote web inbox unread count only (desktop local alerts merged in main process). */
+export async function fetchWebNotificationRemoteCount(
+  options: AuthAwareRequestOptions
+): Promise<number> {
+  if (!options.token && !options.sessionCookie) {
+    return 0;
+  }
+
+  try {
+    return await withAuthRetry(async (requestOptions) => {
+      const client = getClient();
+      const response = await firstSuccess(API_ENDPOINTS.notifications.unreadCount, (path) =>
+        client.get(path, { headers: authHeader(requestOptions) })
+      );
+      persistCookieIfPresent(response, requestOptions);
+      if (isHtmlResponse(response.data)) {
+        throw new ApiError("validation", "notifications_endpoint_returned_html");
+      }
+      const count = parseUnreadNotificationCount(response.data);
+      logger.info("web-notifications-remote-count", { count, path: response.config.url ?? null });
+      return count;
+    }, options);
+  } catch (error) {
+    logger.warn("web-notifications-unread-fetch-failed", {
+      error: error instanceof Error ? error.message : "unknown"
+    });
+    return 0;
+  }
+}
+
+/** @deprecated Use fetchWebNotificationRemoteCount + notification-badge merge. */
+export async function fetchWebNotificationsStatus(
+  options: AuthAwareRequestOptions
+): Promise<WebNotificationsStatus> {
+  const unreadCount = await fetchWebNotificationRemoteCount(options);
+  return { unreadCount };
 }

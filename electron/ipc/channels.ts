@@ -13,5 +13,14 @@ export const IPC_CHANNELS = {
   TRACKING_DEBUG_LAST_EVENTS: "tracking:debug:last-events",
   TRACKING_CONSENT_STATUS: "tracking:consent-status",
   TRACKING_CONSENT_ACCEPT: "tracking:consent-accept",
-  SYNC_NOW: "tracking:sync"
+  TRACKING_RECENT_TASKS: "tracking:recent-tasks",
+  TRACKING_WORK_SUMMARY: "tracking:work-summary",
+  SYNC_NOW: "tracking:sync",
+  NOTIFICATION_SOUND_ENABLED_GET: "app:notification-sound-enabled",
+  NOTIFICATION_SOUND_ENABLED_SET: "app:notification-sound-enabled-set",
+  WEB_NOTIFICATIONS_STATUS: "app:web-notifications-status",
+  APP_UPDATE_STATUS: "app:update-status",
+  APP_UPDATE_CHECK: "app:update-check",
+  APP_UPDATE_DOWNLOAD: "app:update-download",
+  APP_UPDATE_INSTALL: "app:update-install"
 } as const;

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildTrackingMetadata, normalizeAppName } from "./tracking-event-utils";
+import {
+  buildTrackingMetadata,
+  isAutodeskProcessName,
+  normalizeAppName,
+  resolveApplicationDisplayName
+} from "./tracking-event-utils";
 
 describe("normalizeAppName", () => {
   it("maps known executables", () => {
@@ -9,6 +14,17 @@ describe("normalizeAppName", () => {
     expect(normalizeAppName("code.exe")).toBe("vscode");
     expect(normalizeAppName("acad.exe")).toBe("autodesk");
     expect(normalizeAppName("AutodeskDesktopApp.exe")).toBe("autodesk");
+    expect(normalizeAppName("Inventor.exe")).toBe("autodesk");
+    expect(normalizeAppName("3dsmax.exe")).toBe("autodesk");
+    expect(isAutodeskProcessName("Revit.exe")).toBe(true);
+  });
+
+  it("resolves autodesk display names from title or process", () => {
+    expect(
+      resolveApplicationDisplayName("acad", "Drawing1.dwg - AutoCAD 2024", "autodesk")
+    ).toBe("AutoCAD");
+    expect(resolveApplicationDisplayName("revit", "Project1 - Revit 2024", "autodesk")).toBe("Revit");
+    expect(resolveApplicationDisplayName("inventor", "", "autodesk")).toBe("Inventor");
   });
 });
 
@@ -23,12 +39,14 @@ describe("buildTrackingMetadata", () => {
       processName: "chrome.exe"
     });
     expect(result.metadata.application).toBe("chrome");
+    expect(result.metadata.applicationDisplayName).toBe("Chrome");
     expect(result.metadata.windowTitle).toBe("Docs");
     expect(result.metadata.rawApplication).toBe("chrome.exe");
     expect(result.metadata.rawWindowTitle).toBe("Docs");
     expect(result.metadata.mouseMovePercent).toBe(0);
     expect(result.metadata.totalSamples).toBe(0);
     expect(result.metadata.mouseMoveSamples).toBe(0);
+    expect(result.metadata.mouseActiveSeconds).toBe(0);
     expect(result.metadata.trackerElapsedMs).toBe(0);
   });
 

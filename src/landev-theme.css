@@ -1,0 +1,41 @@
+/**
+ * LANDEV UI palette: blue, gray, white
+ */
+:root {
+  --white: #ffffff;
+  --gray-50: #f4f6f8;
+  --gray-100: #e2e6eb;
+  --gray-200: #c5ccd6;
+  --gray-400: #9aa3b0;
+  --gray-500: #6d6e71;
+  --gray-600: #5a5f66;
+  --gray-700: #3e3e3e;
+  --blue: #007ec4;
+  --blue-dark: #005f94;
+  --blue-light: #e8f3fa;
+  --blue-mid: #5ca1e1;
+
+  --surface: var(--gray-50);
+  --surface-card: var(--white);
+  --border: var(--gray-100);
+  --text: var(--gray-700);
+  --text-muted: var(--gray-500);
+
+  --brand-blue: var(--blue);
+  --brand-blue-deep: var(--blue-dark);
+  --brand-navy: var(--gray-700);
+  --brand-grey: var(--gray-500);
+
+  --landev-blue-soft: var(--blue-light);
+  --landev-slate: var(--gray-600);
+
+  --focus-ring: rgba(0, 126, 196, 0.25);
+  --shadow-soft: rgba(90, 95, 102, 0.1);
+  --shadow-blue: rgba(0, 126, 196, 0.25);
+
+  /* Status (still readable; blue = active, gray = idle) */
+  --status-active: var(--blue);
+  --status-idle: var(--gray-400);
+  --status-active-soft: var(--blue-light);
+  --status-idle-soft: var(--gray-100);
+}

@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "./store/authStore";
 import { useTrackingStore } from "./store/trackingStore";
-import { useActivityTracker } from "./hooks/useActivityTracker";
 import { useToasts } from "./hooks/useToasts";
 import { toFriendlyMessage } from "./utils/errors";
+import { ProjectSearchSelect } from "./components/ProjectSearchSelect";
+import { RecentTasksPanel } from "./components/RecentTasksPanel";
+import { LandevLogo } from "./components/LandevLogo";
+import { TodayWorkList } from "./components/TodayWorkList";
+import { NotificationBell } from "./components/NotificationBell";
+import { SoftwareUpdatePrompt } from "./components/SoftwareUpdatePrompt";
 import { designerCatalogFallbackProjects } from "./config/designer-project-fallback";
+import { useSessionTimer } from "./hooks/useSessionTimer";
+import type { RecentWorkTask } from "./types/recent-task";
+import type { ProjectDayTotal, WorkSummary } from "./types/work-summary";
+import type { Project } from "./store/trackingStore";
+import { formatClockDuration } from "./utils/formatElapsed";
 import { sanitizeDisplayText } from "./utils/sanitize";
 import "./App.css";
 
@@ -13,30 +23,16 @@ const DESCRIPTION_MAX_LENGTH = 2000;
 
 function App() {
   const [password, setPassword] = useState("");
-  const [showAbout, setShowAbout] = useState(false);
   const [consentAccepted, setConsentAccepted] = useState<boolean | null>(null);
   const [consentSubmitting, setConsentSubmitting] = useState(false);
-  const [connectionTesting, setConnectionTesting] = useState(false);
-  const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [projectsError, setProjectsError] = useState<string | null>(null);
-  const [stopInfo, setStopInfo] = useState<{
-    confirmedBy: "tracking" | "attendance" | "idempotent";
-    endpointPath: string;
-    status: number | null;
-    sessionId: string | null;
-    timesheetId: string | null;
-    queued: boolean;
-  } | null>(null);
-  const [appInfo, setAppInfo] = useState<{
-    appName: string;
-    appVersion: string;
-    electronVersion: string;
-    nodeVersion: string;
-    platform: string;
-    arch: string;
-    env: string;
-    apiBaseUrl: string;
-  } | null>(null);
+  const [workSummary, setWorkSummary] = useState<WorkSummary>({
+    todayTotalMs: 0,
+    todayByProject: [],
+    recentTasks: []
+  });
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(true);
   const [syncStatus, setSyncStatus] = useState({
     online: true,
     syncing: false,
@@ -51,7 +47,6 @@ function App() {
 
   const authStatus = useAuthStore((s) => s.status);
   const username = useAuthStore((s) => s.username);
-  const roles = useAuthStore((s) => s.roles);
   const authLoading = useAuthStore((s) => s.loading);
   const authError = useAuthStore((s) => s.error);
   const setAuthStatus = useAuthStore((s) => s.setStatus);
@@ -73,12 +68,89 @@ function App() {
   const setTrackingError = useTrackingStore((s) => s.setError);
   const resetTracking = useTrackingStore((s) => s.reset);
 
-  useActivityTracker(authStatus === "authenticated" && session.active);
+  const sessionTimerLabel = useSessionTimer(session.active, session.startedAt);
+
+  const loadWorkSummary = useCallback(async (options?: { showLoading?: boolean }) => {
+    if (authStatus !== "authenticated") {
+      setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
+      return;
+    }
+    const showLoading = options?.showLoading ?? false;
+    if (showLoading) {
+      setSummaryLoading(true);
+    }
+    try {
+      const summary = await window.desktopAPI.getWorkSummary();
+      setWorkSummary((previous) => {
+        if (
+          previous.todayTotalMs === summary.todayTotalMs
+          && previous.todayByProject.length === summary.todayByProject.length
+          && previous.recentTasks.length === summary.recentTasks.length
+          && previous.todayByProject.every((item, index) => {
+            const next = summary.todayByProject[index];
+            return (
+              next
+              && item.projectId === next.projectId
+              && item.totalMs === next.totalMs
+              && item.projectName === next.projectName
+              && item.lastDescription === next.lastDescription
+            );
+          })
+          && previous.recentTasks.every((item, index) => {
+            const next = summary.recentTasks[index];
+            return (
+              next
+              && item.projectId === next.projectId
+              && item.description === next.description
+              && item.projectName === next.projectName
+              && item.lastUsedAt === next.lastUsedAt
+            );
+          })
+        ) {
+          return previous;
+        }
+        return summary;
+      });
+    } catch {
+      setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
+    } finally {
+      if (showLoading) {
+        setSummaryLoading(false);
+      }
+    }
+  }, [authStatus]);
 
   useEffect(() => {
-    window.desktopAPI.getAppInfo().then(setAppInfo).catch(() => undefined);
     window.desktopAPI.getTrackingConsentStatus().then((r) => setConsentAccepted(r.accepted)).catch(() => setConsentAccepted(false));
   }, []);
+
+  useEffect(() => {
+    window.desktopAPI
+      .getNotificationSoundEnabled()
+      .then((result) => setNotificationSoundEnabled(result.enabled))
+      .catch(() => undefined);
+  }, []);
+
+  const applyProjectsPayload = useCallback(
+    (projectResult: { projects: Array<Project & { isCatalogDefault?: boolean }>; roles?: string[] }) => {
+      if (projectResult.roles?.length) {
+        setRoles(projectResult.roles);
+      }
+      const mapped = (projectResult.projects ?? []).map((project) => ({
+        id: project.id,
+        name: sanitizeDisplayText(project.name),
+        displayLabel: sanitizeDisplayText(project.displayLabel ?? project.name),
+        searchLabel: sanitizeDisplayText(project.searchLabel ?? project.name),
+        projectNumber: project.projectNumber,
+        projectAddress: project.projectAddress ? sanitizeDisplayText(project.projectAddress) : null,
+        clientName: project.clientName ? sanitizeDisplayText(project.clientName) : null,
+        isNonChargeable: Boolean(project.isNonChargeable),
+        isCatalogDefault: Boolean(project.isCatalogDefault)
+      }));
+      setProjects(mapped.length > 0 ? mapped : designerCatalogFallbackProjects());
+    },
+    [setProjects, setRoles]
+  );
 
   const fetchProjectsWithRetry = useCallback(async (attempts = 3): Promise<void> => {
     setProjectsLoading(true);
@@ -87,18 +159,7 @@ function App() {
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
           const projectResult = await window.desktopAPI.getProjects();
-          if (projectResult.roles?.length) {
-            setRoles(projectResult.roles);
-          }
-          const mapped = (projectResult.projects ?? []).map((project) => ({
-            id: project.id,
-            name: sanitizeDisplayText(project.name),
-            projectNumber: project.projectNumber,
-            clientName: project.clientName ? sanitizeDisplayText(project.clientName) : null,
-            isNonChargeable: Boolean(project.isNonChargeable),
-            isCatalogDefault: Boolean(project.isCatalogDefault)
-          }));
-          setProjects(mapped.length > 0 ? mapped : designerCatalogFallbackProjects());
+          applyProjectsPayload(projectResult);
           return;
         } catch (error) {
           if (attempt === attempts) {
@@ -112,7 +173,7 @@ function App() {
     } finally {
       setProjectsLoading(false);
     }
-  }, [setProjects, setProjectsLoading, setRoles]);
+  }, [applyProjectsPayload, setProjectsLoading]);
 
   useEffect(() => {
     const initialize = async () => {
@@ -137,6 +198,7 @@ function App() {
           startedAt: statusResult.startedAt
         });
         await fetchProjectsWithRetry();
+        await loadWorkSummary({ showLoading: true });
       } catch (error) {
         setAuthStatus("anonymous");
         setAuthError(toFriendlyMessage(error));
@@ -148,17 +210,33 @@ function App() {
     initialize().catch(() => undefined);
 
     const unsubscribe = window.desktopAPI.onStatusPush((status) => {
-      setSession({
+      const current = useTrackingStore.getState().session;
+      const next = {
         active: status.active,
         sessionId: status.sessionId,
-        projectId: status.projectId ?? "",
-        description: status.description ?? "",
+        projectId: status.projectId ?? current.projectId,
+        description: status.description ?? current.description,
         startedAt: status.startedAt
-      });
+      };
+      if (
+        current.active === next.active
+        && current.sessionId === next.sessionId
+        && current.projectId === next.projectId
+        && current.description === next.description
+        && current.startedAt === next.startedAt
+      ) {
+        return;
+      }
+      setSession(next);
     });
 
     const unsubscribeSync = window.desktopAPI.onSyncStatusPush((status) => {
       setSyncStatus(status);
+    });
+
+    const unsubscribeProjects = window.desktopAPI.onProjectsPush((payload) => {
+      applyProjectsPayload(payload);
+      setProjectsError(null);
     });
 
     window.desktopAPI.getSyncStatus().then((status) => setSyncStatus(status)).catch(() => undefined);
@@ -166,8 +244,20 @@ function App() {
     return () => {
       unsubscribe();
       unsubscribeSync();
+      unsubscribeProjects();
     };
-  }, [fetchProjectsWithRetry, setAuthError, setAuthLoading, setAuthStatus, setRoles, setSession]);
+  }, [applyProjectsPayload, fetchProjectsWithRetry, loadWorkSummary, setAuthError, setAuthLoading, setAuthStatus, setRoles, setSession]);
+
+  useEffect(() => {
+    if (authStatus !== "authenticated") {
+      return;
+    }
+    void loadWorkSummary();
+    const intervalId = window.setInterval(() => {
+      void loadWorkSummary();
+    }, session.active ? 1000 : 5000);
+    return () => window.clearInterval(intervalId);
+  }, [authStatus, loadWorkSummary, session.active]);
 
   const canStart = useMemo(() => {
     const trimmedDescription = session.description.trim();
@@ -188,22 +278,6 @@ function App() {
       : trimmedDescriptionLength > DESCRIPTION_MAX_LENGTH
         ? `Description is too long (max ${DESCRIPTION_MAX_LENGTH} characters).`
         : null;
-
-  const onTestConnection = async () => {
-    setConnectionTesting(true);
-    setConnectionMessage(null);
-    try {
-      const result = await window.desktopAPI.testConnection();
-      setConnectionMessage(result.message);
-      pushToast(result.reachable ? "success" : "error", result.message);
-    } catch (error) {
-      const message = toFriendlyMessage(error);
-      setConnectionMessage(message);
-      pushToast("error", message);
-    } finally {
-      setConnectionTesting(false);
-    }
-  };
 
   const onAcceptConsent = async () => {
     if (consentSubmitting) return;
@@ -240,6 +314,7 @@ function App() {
       });
 
       await fetchProjectsWithRetry();
+      await loadWorkSummary();
       await window.desktopAPI.syncNow();
       pushToast("success", "Logged in successfully.");
     } catch (error) {
@@ -259,6 +334,7 @@ function App() {
       resetTracking();
       resetAuth();
       setProjectsError(null);
+      setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
       pushToast("info", "Logged out.");
     } catch (error) {
       setAuthError(toFriendlyMessage(error));
@@ -281,23 +357,43 @@ function App() {
     }
     setSessionLoading(true);
     setTrackingError(null);
-    setStopInfo(null);
     try {
       const selectedProject = projects.find((project) => project.id === session.projectId);
       const result = await window.desktopAPI.startSession({
         projectId: session.projectId,
-        projectName: selectedProject?.name,
+        projectName: selectedProject
+          ? (selectedProject.displayLabel || selectedProject.name)
+          : undefined,
         isNonChargeable: selectedProject?.isNonChargeable,
         description: trimmedDescription
       });
       setSession({ active: true, sessionId: result.sessionId, startedAt: new Date().toISOString() });
-      pushToast("success", "Tracking session started.");
+      await loadWorkSummary();
+      pushToast("success", "Tracking started.");
     } catch (error) {
       setTrackingError(toFriendlyMessage(error));
       pushToast("error", "Failed to start session.");
     } finally {
       setSessionLoading(false);
     }
+  };
+
+  const applyRecentTask = (task: RecentWorkTask) => {
+    if (session.active || sessionLoading) return;
+    setSession({
+      projectId: task.projectId,
+      description: task.description
+    });
+    setTrackingError(null);
+  };
+
+  const applyProjectDayTotal = (item: ProjectDayTotal) => {
+    if (session.active || sessionLoading) return;
+    setSession({
+      projectId: item.projectId,
+      description: item.lastDescription || session.description
+    });
+    setTrackingError(null);
   };
 
   const onStop = async () => {
@@ -308,14 +404,7 @@ function App() {
     try {
       const result = await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
       setSession({ active: false, sessionId: null, startedAt: null });
-      setStopInfo({
-        confirmedBy: result.confirmedBy,
-        endpointPath: result.endpointPath,
-        status: result.status,
-        sessionId: result.sessionId,
-        timesheetId: result.timesheetId,
-        queued: result.queued
-      });
+      await loadWorkSummary();
       if (result.queued) {
         pushToast("info", "Queued for sync.");
       } else {
@@ -330,12 +419,20 @@ function App() {
     }
   };
 
+  const onToggleTracking = () => {
+    if (session.active) {
+      void onStop();
+      return;
+    }
+    void onStart();
+  };
+
   if (authStatus === "unknown" || authLoading) {
     return <main className="screen"><div className="card">Loading...</div></main>;
   }
 
   return (
-    <main className="screen">
+    <main className={`screen${authStatus === "anonymous" ? " screen-auth" : ""}`}>
       <div className="toasts">
         {toasts.map((toast) => (
           <div className={`toast toast-${toast.type}`} key={toast.id}>{toast.message}</div>
@@ -347,168 +444,183 @@ function App() {
           <section className="about-overlay">
             <article className="about-card terms-card">
               <h3>Terms and Consent</h3>
-              <p>To use this app, you must agree to activity tracking and periodic screenshots.</p>
-              <p>A screen shot will be taken every few mins.</p>
+              <p>To use this app, you must agree to activity tracking.</p>
               <button disabled={consentSubmitting} onClick={onAcceptConsent}>
                 {consentSubmitting ? "Saving..." : "I Agree"}
               </button>
             </article>
           </section>
         )}
-        <header className="header">
-          <h1>LANDev Employee Tracker</h1>
-          <div className="sync-indicator">
-            {syncStatus.online ? "Online synced" : "Offline queueing"} ? Pending {syncStatus.pendingCount}
-            {syncStatus.nextRetryAt ? ` ? Retry ${new Date(syncStatus.nextRetryAt).toLocaleTimeString()}` : ""}
-            {syncStatus.lastSyncAt ? ` ? Last sync ${new Date(syncStatus.lastSyncAt).toLocaleTimeString()}` : ""}
-            {syncStatus.syncing ? " ? Syncing..." : ""}
-          </div>
-          <div className="header-actions">
-            <button className="ghost" onClick={() => setShowAbout(true)}>About</button>
-            {authStatus === "authenticated" && (
-              <button className="ghost" disabled={authLoading} onClick={onLogout}>Logout</button>
-            )}
-          </div>
-        </header>
-
-        <section className="card">
-          <h2>Connection Settings</h2>
-          <p className="meta">API Base URL: {appInfo?.apiBaseUrl ?? "Unavailable"}</p>
-          <div className="actions">
-            <button className="ghost" disabled={connectionTesting} onClick={onTestConnection}>
-              {connectionTesting ? "Testing..." : "Test connection"}
-            </button>
-          </div>
-          {connectionMessage && <p className="meta">{connectionMessage}</p>}
-        </section>
 
         {authStatus === "anonymous" ? (
-          <section className="card">
-            <h2>Sign In</h2>
-            {authError && <p className="error">{authError}</p>}
-            <label>
-              Username
-              <input
-                type="text"
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                autoComplete="username"
-              />
-            </label>
-            <label>
-              Password
-              <input
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete="current-password"
-              />
-            </label>
-            <button
-              disabled={authLoading || username.trim().length < 3 || password.trim().length < 6}
-              onClick={onLogin}
+          <section className="sign-in-card" aria-labelledby="sign-in-title">
+            <header className="sign-in-brand">
+              <LandevLogo className="sign-in-logo-img" />
+              <h1 id="sign-in-title" className="sign-in-title">
+                Tracker
+              </h1>
+              <p className="sign-in-subtitle">Sign in to track your work day</p>
+            </header>
+
+            {authError && (
+              <p className="sign-in-alert" role="alert">
+                {authError}
+              </p>
+            )}
+
+            <form
+              className="sign-in-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void onLogin();
+              }}
             >
-              {authLoading ? "Signing in..." : "Login"}
-            </button>
+              <label className="sign-in-field">
+                <span className="sign-in-label">Username</span>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="username"
+                  placeholder="your.name"
+                  disabled={authLoading}
+                />
+              </label>
+              <label className="sign-in-field">
+                <span className="sign-in-label">Password</span>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                  disabled={authLoading}
+                />
+              </label>
+              <button
+                type="submit"
+                className="sign-in-submit"
+                disabled={authLoading || username.trim().length < 3 || password.trim().length < 6}
+              >
+                {authLoading ? "Signing in…" : "Sign in"}
+              </button>
+            </form>
+
+            <p className="sign-in-hint">Activity tracking starts after you sign in.</p>
           </section>
         ) : (
           <>
-          <section className="card">
-            <h2>Tracking Session</h2>
-            <p className="meta">Role guard: {roles.length > 0 ? roles.join(", ") : "No roles returned"}</p>
-            <p className="meta">
-              A screen shot will be taken every few mins
-            </p>
-            {trackingError && <p className="error">{trackingError}</p>}
-            <p className="status-chip">Status: {session.active ? "Running" : "Stopped"}</p>
-            {stopInfo && (
-              <p className="meta">
-                Stop sync: {stopInfo.queued ? "Queued" : "Confirmed"} via {stopInfo.endpointPath}
-                {stopInfo.status ? ` (HTTP ${stopInfo.status})` : ""}
-                {stopInfo.sessionId ? ` ? sessionId ${stopInfo.sessionId}` : ""}
-                {stopInfo.timesheetId ? ` ? timesheetId ${stopInfo.timesheetId}` : ""}
-              </p>
-            )}
-            {!session.active && syncStatus.pendingCount > 0 && (
-              <p className="warning">
-                Pending sync items: {syncStatus.pendingCount}. Last sync {syncStatus.lastSyncAt ? new Date(syncStatus.lastSyncAt).toLocaleTimeString() : "not yet"}.
-              </p>
-            )}
-
-            <label>
-              Project
-              <select
-                value={session.projectId}
-                onChange={(event) => setSession({ projectId: event.target.value })}
-                disabled={projectsLoading || session.active || sessionLoading}
-              >
-                <option value="">Select project</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-              <span className="hint">
-                &quot;Admin -&quot; tasks are non-chargeable admin work.
-              </span>
-            </label>
-            {projectsLoading && <p className="meta">Loading projects...</p>}
-            {!projectsLoading && projects.length === 0 && !projectsError && (
-              <p className="warning">No assigned/active projects for this account.</p>
-            )}
-            {projectsError && (
-              <div className="projects-error-row">
-                <p className="error">{projectsError}</p>
-                <button className="ghost" onClick={() => fetchProjectsWithRetry()}>Retry project fetch</button>
+            <header className="compact-header">
+              <div className="compact-header-left">
+                <LandevLogo className="header-logo-img" />
+                <div className="compact-header-main">
+                <p className="compact-kicker">Worked today</p>
+                <p className="daily-total">{formatClockDuration(workSummary.todayTotalMs)}</p>
+                <div className="status-row">
+                  <span
+                    className={`status-dot ${session.active ? "is-tracking" : "is-paused"}`}
+                    aria-hidden
+                  />
+                  <p className="status-label">
+                    {session.active ? `Tracking · ${sessionTimerLabel}` : "Paused"}
+                  </p>
+                </div>
+                </div>
               </div>
-            )}
+              <div className="compact-header-actions">
+                <NotificationBell />
+                <label className="sound-toggle" title="Desktop notification sounds (not web dashboard)">
+                  <input
+                    type="checkbox"
+                    checked={notificationSoundEnabled}
+                    onChange={(event) => {
+                      const enabled = event.target.checked;
+                      setNotificationSoundEnabled(enabled);
+                      void window.desktopAPI.setNotificationSoundEnabled(enabled);
+                    }}
+                  />
+                  <span>Sounds</span>
+                </label>
+                <button
+                  type="button"
+                  className="header-action-btn header-logout-btn"
+                  disabled={authLoading}
+                  aria-label="Log out of LANDEV Tracker"
+                  onClick={onLogout}
+                >
+                  Log out
+                </button>
+              </div>
+            </header>
 
-            <label>
-              Description
-              <textarea
-                value={session.description}
-                onChange={(event) => setSession({ description: event.target.value })}
+            <section className="tracker-card">
+              {trackingError && <p className="error">{trackingError}</p>}
+              {descriptionValidationError && <p className="error">{descriptionValidationError}</p>}
+              <div className="compose-row">
+                <textarea
+                  className="compose-input"
+                  value={session.description}
+                  onChange={(event) => setSession({ description: event.target.value })}
+                  disabled={session.active || sessionLoading}
+                  placeholder="What are you working on?"
+                  maxLength={DESCRIPTION_MAX_LENGTH}
+                  rows={2}
+                />
+                <button
+                  type="button"
+                  className={`tracker-toggle ${session.active ? "is-tracking" : "is-paused"}`}
+                  disabled={sessionLoading || (!session.active && !canStart)}
+                  title={session.active ? "Stop tracking" : "Start tracking"}
+                  onClick={onToggleTracking}
+                >
+                  {sessionLoading ? "…" : session.active ? "■" : "▶"}
+                </button>
+              </div>
+              <ProjectSearchSelect
+                projects={projects}
+                value={session.projectId}
                 disabled={session.active || sessionLoading}
-                placeholder="Describe what you are working on..."
-                maxLength={DESCRIPTION_MAX_LENGTH}
+                loading={projectsLoading}
+                onOpen={() => {
+                  void fetchProjectsWithRetry(1);
+                }}
+                onChange={(projectId) => {
+                  setSession({ projectId });
+                  void fetchProjectsWithRetry(1);
+                }}
               />
-              <span className="hint">Enter work details ({DESCRIPTION_MIN_LENGTH}-{DESCRIPTION_MAX_LENGTH} characters)</span>
-              {descriptionValidationError && <span className="error-inline">{descriptionValidationError}</span>}
-              <span className="char-counter">{session.description.length}/{DESCRIPTION_MAX_LENGTH}</span>
-            </label>
+              {projectsLoading && <p className="meta compact-meta">Loading projects...</p>}
+              {projectsError && (
+                <p className="error">
+                  {projectsError}{" "}
+                  <button type="button" className="ghost" onClick={() => fetchProjectsWithRetry()}>
+                    Retry
+                  </button>
+                </p>
+              )}
+              {!syncStatus.online && (
+                <p className="warning compact-meta">Offline — {syncStatus.pendingCount} items queued</p>
+              )}
+            </section>
 
-            <div className="actions">
-              <button disabled={!canStart} onClick={onStart}>
-                {sessionLoading && !session.active ? "Starting..." : "Start"}
-              </button>
-              <button className="danger" disabled={sessionLoading || !session.active} onClick={onStop}>
-                {sessionLoading && session.active ? "Stopping..." : "Stop"}
-              </button>
-            </div>
+            <TodayWorkList
+              items={workSummary.todayByProject}
+              totalMs={workSummary.todayTotalMs}
+              disabled={session.active || sessionLoading}
+              onResume={applyProjectDayTotal}
+            />
 
-            <p className="meta">
-              Session ID: {session.sessionId ?? "-"} {session.startedAt ? `| Started: ${new Date(session.startedAt).toLocaleString()}` : ""}
-            </p>
-          </section>
+            <RecentTasksPanel
+              tasks={workSummary.recentTasks}
+              loading={summaryLoading}
+              disabled={session.active || sessionLoading}
+              onSelect={applyRecentTask}
+            />
           </>
         )}
 
-        {showAbout && (
-          <section className="about-overlay" onClick={() => setShowAbout(false)}>
-            <article className="about-card" onClick={(event) => event.stopPropagation()}>
-              <h3>About LANDev Track</h3>
-              <p>Version: {appInfo?.appVersion ?? "-"}</p>
-              <p>Environment: {appInfo?.env ?? "-"}</p>
-              <p>API: {appInfo?.apiBaseUrl ?? "-"}</p>
-              <p>Electron: {appInfo?.electronVersion ?? "-"}</p>
-              <p>Node: {appInfo?.nodeVersion ?? "-"}</p>
-              <p>Platform: {appInfo?.platform ?? "-"} ({appInfo?.arch ?? "-"})</p>
-              <button onClick={() => setShowAbout(false)}>Close</button>
-            </article>
-          </section>
-        )}
       </section>
+      <SoftwareUpdatePrompt />
     </main>
   );
 }

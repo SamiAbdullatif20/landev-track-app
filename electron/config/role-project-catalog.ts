@@ -109,10 +109,15 @@ function toRoleProject(
       ? Boolean((apiMatch as Project & { isNonChargeable?: boolean }).isNonChargeable)
       : isNonChargeableProjectName(name);
 
+  const displayLabel = apiMatch?.displayLabel ?? name;
+  const searchLabel = apiMatch?.searchLabel ?? name;
   return {
     id: apiMatch?.id ?? catalogIdForName(name),
-    name,
+    name: apiMatch?.name ?? name,
+    displayLabel,
+    searchLabel,
     projectNumber: apiMatch?.projectNumber ?? null,
+    projectAddress: apiMatch?.projectAddress ?? null,
     clientName: apiMatch?.clientName ?? null,
     isNonChargeable,
     isCatalogDefault

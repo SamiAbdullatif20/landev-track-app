@@ -1,0 +1,166 @@
+You are my senior full-stack engineer on the Landev web/backend project.
+
+## Problem
+
+Employees use the **Landev desktop tracker** (Electron) and often **Stop then Start** tracking multiple times in one work day.
+
+**Current broken behavior:**
+- **First Start of the day:** Admin session report shows apps used, mouse/keyboard activity, and screenshots correctly.
+- **After Stop → Start again:** The web UI looks like prior data vanished, and the new segment shows **no apps / no activity / no screenshots**.
+
+The desktop app is already sending data. The bug is in **how the web backend stores, links, and queries tracking data across multiple work-session segments per day**.
+
+**Do NOT change the desktop app in this task — web/backend + admin UI only.**
+
+---
+
+## Desktop integration (what you receive today)
+
+### Endpoints the desktop calls
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/tracking/session/start` | Start work session (fallback: `POST /api/attendance/today` with `action: "start"`) |
+| POST | `/api/tracking/session/stop` | Stop work session (fallback: `POST /api/attendance/today` with `action: "end"`) |
+| POST | `/api/tracking/events/batch` | Batch ingest `{ events: [...] }` |
+| POST | `/api/tracking/screenshots/ingest` | Multipart screenshot upload |
+| GET | `/api/tracking/session/active` | Desktop fallback when start omits session id |
+| GET | `/api/tracking/session/status` | Desktop fallback when start omits session id |
+| GET | `/api/attendance/today` | Desktop fallback when start omits session id |
+
+Auth: Bearer token and/or session **Cookie** (same as web login).
+
+### Batch event shape (POST /api/tracking/events/batch)
+
+Each event in `events[]` includes:
+
+**Common (all event kinds):**
+```json
+{
+  "eventUuid": "uuid",
+  "eventKind": "APP_FOCUS | INPUT_ACTIVITY | HEARTBEAT",
+  "type": "APP_FOCUS",
+  "occurredAt": "2026-05-19T10:15:00.000Z",
+  "occurredAtIso": "2026-05-19T10:15:00.000Z",
+  "workDateKey": "2026-05-19",
+  "workSessionId": "real-backend-session-id",
+  "sessionId": "same-as-workSessionId",
+  "projectId": "project-uuid",
+  "sessionSegmentStartedAt": "2026-05-19T09:00:00.000Z",
+  "clientTimeZone": "Pacific/Auckland",
+  "metadata": { ... }
+}
+```
+
+**APP_FOCUS** (apps used):
+- Top-level: `application`, `processName`, `windowTitle`, `applicationDisplayName`, `appName`, `activeSeconds`, `idleSeconds`
+- `metadata`: `application`, `processName`, `windowTitle`, `executablePath`, `activeSeconds`, `triggerType`
+
+**INPUT_ACTIVITY** (mouse/keyboard):
+- Top-level: `mouseMoveCount`, `keyPressCount`, `mouseMovePercent`, `activeSeconds`, `idleSeconds`, `trackerElapsedMs`
+- `metadata`: `mouseMovePercent`, `mouseMoveSamples`, `totalSamples`, `mouseMoveCount`, `keyPressCount`
+
+**Note:** `workSessionId` may be absent if start API did not return an id; `workDateKey` + authenticated user should still link events. `sessionSegmentStartedAt` changes on **each** desktop Stop/Start — use it to group segments within a day.
+
+### Start API response (desktop parses these fields)
+Desktop resolves session id from (first match):
+`workSessionId`, `sessionId`, `workSession.id`, `session.id`, `id`
+
+**Required fix:** Start responses must return a stable real id, e.g.:
+```json
+{
+  "sessionId": "clx...",
+  "workSessionId": "clx...",
+  "workSession": { "id": "clx...", "startTime": "..." }
+}
+```
+
+On **second Start same day**, return either a **new** WorkSession id (preferred) or document if the same id is reused — desktop will attach `sessionSegmentStartedAt` to distinguish segments.
+
+---
+
+## Root cause to investigate
+
+Audit and fix ALL of the following (likely one or more apply):
+
+1. **Report query scoped to “active session only”** — UI/API loads `WHERE workSessionId = currentActiveId` instead of all sessions/events for `workDateKey`.
+2. **New Start replaces/overwrites** prior WorkSession row or clears related tracking events instead of appending a new segment.
+3. **Batch ingest rejects or drops** events on 2nd session (strict Zod/schema, missing workSessionId, Redis `expire` errors, 400/500 on batch).
+4. **Report aggregation keyed only on workSessionId** — when 2nd start gets a new id, old events exist in DB but UI shows empty because it only queries the latest id with no rows yet.
+5. **Screenshots filtered** to latest `sessionId` only.
+
+---
+
+## Requirements
+
+### 1. Work-day scope (not “current session only”)
+- Admin/employee **session report for a work date** must aggregate **ALL** tracking data for `userId + workDateKey`.
+- **Stop must never delete** ingested events, apps, activity, or screenshots for that day.
+- Starting a new session must **append**, not replace, the day’s report data.
+
+### 2. Multiple segments per day
+Each desktop Stop/Start = new segment. Implement ONE consistent model:
+
+**Option A (preferred):** Multiple `WorkSession` rows per user per `workDateKey`, each with `startTime` / `stopTime`.
+
+**Option B:** Single daily WorkSession + segment boundaries from `sessionSegmentStartedAt` on events + stop timestamps.
+
+Use the same model in ingest, report API, and UI.
+
+### 3. POST /api/tracking/events/batch
+- Accept `{ events: TrackingEvent[] }` (array required).
+- Persist `workDateKey`, `workSessionId`, `sessionSegmentStartedAt`, `clientTimeZone` (top-level and/or inside `metadata` JSON — do not strip unknown fields).
+- If `workSessionId` missing: resolve from auth user + `workDateKey` + active WorkSession server-side; **never silently drop** valid events.
+- Return 200 with per-event success/failure; fix any Redis `expire` arity bugs causing 500s.
+- Idempotent on `eventUuid` (safe for desktop retries).
+
+### 4. Session report API + admin UI
+Fix queries/rendering for the selected employee + work date:
+
+| Panel | Fix |
+|-------|-----|
+| **Apps used** | Sum `APP_FOCUS.activeSeconds` grouped by `processName` / `applicationDisplayName` across **all segments** that day |
+| **Activity** | Sum `INPUT_ACTIVITY.mouseMoveCount`, `keyPressCount`; avg `metadata.mouseMovePercent` (fallback top-level `mouseMovePercent`) across all segments |
+| **Screenshots** | All screenshots where `userId + workDateKey` (or all `workSessionId`s that day) — not latest session only |
+| **Optional** | Segment timeline: “9:00–10:30 Chrome”, “11:00–12:00 AutoCAD” using `sessionSegmentStartedAt` + stop times |
+
+Example aggregation fallback in mapping layer:
+```ts
+const mouseMovePercent =
+  event.metadata?.mouseMovePercent ??
+  event.mouseMovePercent ??
+  null;
+```
+
+### 5. Start / stop APIs
+- `POST /api/tracking/session/start` — create/link WorkSession; **always return** `sessionId` + `workSessionId` in JSON.
+- `POST /api/tracking/session/stop` — set stop time; **do not delete** tracking events or screenshots.
+- `GET /api/tracking/session/active` (and/or status) — return current active session id for desktop fallback on 2nd start.
+- Attendance fallback (`POST /api/attendance/today`) — same id fields on start/stop responses.
+
+### 6. Screenshots ingest
+- `POST /api/tracking/screenshots/ingest` — link to `workSessionId` + `workDateKey`; list by day in report, not only active session.
+
+---
+
+## Deliverables
+
+1. **Root cause write-up** — which of the above caused wipe/empty on 2nd start.
+2. **Code changes** — ingest schema, DB queries, report API, admin UI components.
+3. **Manual test checklist** (must pass):
+   - [ ] Start → 5 min Chrome → Stop → report shows Chrome apps/activity.
+   - [ ] Start again → 5 min AutoCAD → Stop → report shows **Chrome + AutoCAD** (cumulative), not blank.
+   - [ ] Screenshots from both segments visible for the work date.
+   - [ ] Batch ingest returns 200 on 2nd session (no Redis/schema 500).
+4. **Document** which desktop fields the report relies on: `workDateKey`, `workSessionId`, `sessionSegmentStartedAt`, `eventKind`, `metadata.mouseMovePercent`.
+
+---
+
+## Suggested audit order
+
+1. Find `POST /api/tracking/events/batch` handler + validation schema + DB write.
+2. Find admin session report API + React/UI query (grep `workSessionId`, `active`, `APP_FOCUS`, `mouseMovePercent`).
+3. Reproduce: ingest events for session A, then session B same `workDateKey` — confirm both in DB.
+4. Fix report to query by `workDateKey` (+ user), aggregate across sessions.
+5. Fix start API to always return ids; add GET active session if missing.
+
+EOF

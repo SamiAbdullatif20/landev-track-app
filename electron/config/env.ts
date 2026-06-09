@@ -4,7 +4,7 @@ import { logger } from "./logger";
 const envSchema = z.object({
   VITE_API_BASE_URL: z.string().url(),
   VITE_APP_ENV: z.enum(["dev", "staging", "prod"]).default("dev"),
-  APP_NAME: z.string().default("LANDev Track"),
+  APP_NAME: z.string().default("LANDEV Tracker"),
   AUTO_UPDATE_ENABLED: z.enum(["true", "false"]).default("false")
 });
 
@@ -26,7 +26,7 @@ export function readEnv(): AppEnv {
   const parsed = envSchema.parse({
     VITE_API_BASE_URL: configuredApiBaseUrl ?? fallbackApiBaseUrl,
     VITE_APP_ENV: process.env.VITE_APP_ENV ?? "dev",
-    APP_NAME: process.env.APP_NAME ?? "LANDev Track",
+    APP_NAME: process.env.APP_NAME ?? "LANDEV Tracker",
     AUTO_UPDATE_ENABLED: process.env.AUTO_UPDATE_ENABLED ?? "false"
   });
 

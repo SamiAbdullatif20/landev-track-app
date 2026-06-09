@@ -14,6 +14,27 @@ type Project = {
   name: string;
 };
 
+type RecentWorkTask = {
+  projectId: string;
+  projectName: string;
+  description: string;
+  isNonChargeable: boolean;
+  lastUsedAt: string;
+};
+
+type ProjectDayTotal = {
+  projectId: string;
+  projectName: string;
+  totalMs: number;
+  lastDescription: string;
+};
+
+type WorkSummary = {
+  todayTotalMs: number;
+  todayByProject: ProjectDayTotal[];
+  recentTasks: RecentWorkTask[];
+};
+
 type SyncStatus = {
   online: boolean;
   syncing: boolean;
@@ -44,6 +65,14 @@ type StopSessionResult = {
   timesheetId: string | null;
   responsePreview: string | null;
 };
+
+type AppUpdateStatus =
+  | { phase: "idle" }
+  | { phase: "checking" }
+  | { phase: "available"; version: string; currentVersion: string }
+  | { phase: "downloading"; percent: number }
+  | { phase: "ready"; version: string }
+  | { phase: "error"; message: string };
 
 type TrackingDebugSnapshot = {
   counters: {
@@ -82,6 +111,8 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   testConnection: () => ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{ reachable: boolean; message: string }>,
   getProjects: () =>
     ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[]; roles: string[] }>,
+  getRecentTasks: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_RECENT_TASKS) as Promise<RecentWorkTask[]>,
+  getWorkSummary: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_WORK_SUMMARY) as Promise<WorkSummary>,
   startSession: (payload: {
     projectId: string;
     projectName?: string;
@@ -96,6 +127,26 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   getTrackingConsentStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_STATUS) as Promise<{ accepted: boolean }>,
   acceptTrackingConsent: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_ACCEPT) as Promise<{ accepted: true }>,
   syncNow: () => ipcRenderer.invoke(IPC_CHANNELS.SYNC_NOW),
+  getNotificationSoundEnabled: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_GET) as Promise<{ enabled: boolean }>,
+  setNotificationSoundEnabled: (enabled: boolean) =>
+    ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_SET, enabled) as Promise<{ enabled: boolean }>,
+  getWebNotificationsStatus: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.WEB_NOTIFICATIONS_STATUS) as Promise<{ unreadCount: number }>,
+  onNotificationCountPush: (cb: (status: { unreadCount: number }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: { unreadCount: number }) => cb(payload);
+    ipcRenderer.on("app:notification-count-push", listener);
+    return () => ipcRenderer.removeListener("app:notification-count-push", listener);
+  },
+  getAppUpdateStatus: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_STATUS) as Promise<AppUpdateStatus>,
+  checkForAppUpdates: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_CHECK) as Promise<AppUpdateStatus>,
+  downloadAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_DOWNLOAD) as Promise<AppUpdateStatus>,
+  installAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_INSTALL) as Promise<{ ok: true }>,
+  onAppUpdateStatusPush: (cb: (status: AppUpdateStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: AppUpdateStatus) => cb(payload);
+    ipcRenderer.on("app:update-status-push", listener);
+    return () => ipcRenderer.removeListener("app:update-status-push", listener);
+  },
   onStatusPush: (cb: (status: TrackingStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: TrackingStatus) => cb(payload);
     ipcRenderer.on("tracking:status-push", listener);
@@ -105,5 +156,11 @@ contextBridge.exposeInMainWorld("desktopAPI", {
     const listener = (_event: Electron.IpcRendererEvent, payload: SyncStatus) => cb(payload);
     ipcRenderer.on("tracking:sync-status-push", listener);
     return () => ipcRenderer.removeListener("tracking:sync-status-push", listener);
+  },
+  onProjectsPush: (cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: { projects: Project[]; roles: string[]; fetchedAt: string }) =>
+      cb(payload);
+    ipcRenderer.on("tracking:projects-push", listener);
+    return () => ipcRenderer.removeListener("tracking:projects-push", listener);
   }
 });

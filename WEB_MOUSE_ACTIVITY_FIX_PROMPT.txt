@@ -1,0 +1,134 @@
+Copy everything below into your web/backend Cursor chat (landev web repo).
+
+---
+
+## Task: Fix session report “mouse activity %” so it matches real usage (desktop already fixed)
+
+The Electron desktop app was overstating mouse %. Update the web report aggregation to use the same semantics and stop double-counting or using the wrong fallback fields.
+
+### What the desktop sends now (every 15s `INPUT_ACTIVITY` event)
+
+Top-level and inside `metadata` JSON:
+
+- `mouseMovePercent` — 0–100 for that 15s window only (not session-wide by itself)
+- `mouseActiveSeconds` — seconds of real mouse use in that window (top-level + metadata)
+- `mouseMoveCount` — movement ticks in the window
+- `keyPressCount`, `clickCount`, `scrollCount`
+- `activeSeconds`, `idleSeconds`, `trackerElapsedMs` (usually 15)
+- `metadata.mouseMoveSamples`, `metadata.totalSamples`, `metadata.mouseActiveSeconds`
+
+### Correct meaning (do NOT reinterpret)
+
+**Per event:** `mouseMovePercent = mouseActiveSeconds / (trackerElapsedMs/1000) × 100`
+
+- **mouseActiveSeconds** ≈ count of 1-second polls where cursor moved ≥12px OR wheel scrolled.
+- Denominator is the **full 15s window**, not “engaged/typing” time — idle time lowers the %.
+- Example: ~1 min mouse in 18 min session → report should be ~5–6%, not 37%.
+
+### How to aggregate for a session / day report (REQUIRED)
+
+**Prefer summing seconds, not averaging percents:**
+
+```ts
+let mouseSeconds = 0;
+let windowSeconds = 0;
+
+for (const event of inputActivityEvents) {
+  const mouseSec =
+    event.mouseActiveSeconds ??
+    event.metadata?.mouseActiveSeconds ??
+    0;
+  const winSec =
+    (event.trackerElapsedMs ?? 15_000) / 1000;
+
+  mouseSeconds += Math.max(0, mouseSec);
+  windowSeconds += Math.max(0, winSec);
+}
+
+const dayMousePercent =
+  windowSeconds > 0
+    ? Math.round((mouseSeconds / windowSeconds) * 1000) / 10
+    : null;
+```
+
+Fallback if `mouseActiveSeconds` missing on old rows:
+
+```ts
+const pct = event.mouseMovePercent ?? event.metadata?.mouseMovePercent ?? 0;
+mouseSeconds += (pct / 100) * winSec;
+```
+
+Do NOT use simple average of `mouseMovePercent` values — that overstates mixed idle/active sessions.
+
+### Legacy / bad rows in DB
+
+Older desktop builds may have inflated `mouseMovePercent` (keyboard-only sessions near 100%). Options:
+
+1. Recompute from `metadata.mouseMoveSamples` and `metadata.totalSamples` when both exist and `totalSamples > 0`, **only if** you also store or can infer engaged denominator — otherwise trust new events after deploy.
+2. Cap display at 100 and ignore events where `mouseMovePercent > 100`.
+3. After desktop deploy, filter report queries to `occurredAt >= deployDate` for QA, or run a one-off backfill script.
+
+### UI copy (suggested)
+
+Label: **Mouse activity**  
+Tooltip: *Share of active time with deliberate mouse movement (ignores tiny cursor drift).*
+
+### Acceptance tests
+
+1. User **only types** in Chrome for 5 minutes → report mouse % should be **low** (often 0–25%), not ~100%.
+2. User **actively uses mouse** (scroll, click, draw) → mouse % **higher** (often 40–90%+ depending on mix).
+3. User **reads / idle** (no input) for 5 minutes → mouse % **0 or very low**.
+4. Stop → Start same day → mouse % **aggregates** all `INPUT_ACTIVITY` for that user + `workDateKey`, not only latest segment.
+
+### Files to search in web repo
+
+`mouseMovePercent`, `INPUT_ACTIVITY`, `input_activity`, session report, timesheet, tracking events aggregate.
+
+### Deliverable
+
+1. Implement aggregation as above.
+2. List which API/UI files changed.
+3. Note any legacy event handling.
+
+---
+
+## Task: Fix mouse % shown ON each screenshot (per 10-minute period)
+
+Session report overall % may already be correct, but **each screenshot tile** still shows one fixed value (e.g. 75%) for every capture in the block. That happens when the UI uses **session/day aggregate** instead of **that screenshot's interval**.
+
+### What desktop sends on each screenshot upload
+
+`metadata` on the screenshot record now includes **period-local** stats (last N minutes before capture, where N = `intervalMinutes`, typically 10 for designers / 2 for superadmin):
+
+- `mouseMovePercent` — mouse % for **this interval only**
+- `mouseActiveSeconds`
+- `activityPeriodSeconds` — usually `intervalMinutes * 60`
+- `activityPeriodStartAt`, `activityPeriodEndAt` — ISO bounds of the window
+- `activitySampleCount` — number of 15s INPUT_ACTIVITY samples in the window
+- `intervalMinutes`, `visibility`, `cadenceTargetMs` (unchanged)
+
+### Required web/UI fix
+
+When rendering mouse % on a screenshot thumbnail or detail view:
+
+```ts
+// CORRECT — per-screenshot interval
+const labelPercent =
+  screenshot.metadata?.mouseMovePercent ??
+  null;
+
+// WRONG — do not use session aggregate here
+// const labelPercent = sessionReport.dayMousePercent;
+```
+
+Fallback for old screenshots without period metadata: optionally compute from `INPUT_ACTIVITY` events where `occurredAt` is in `[activityPeriodStartAt, activityPeriodEndAt]` (if those fields exist), else show "—" or hide the badge.
+
+Tooltip copy: *Mouse activity during the {intervalMinutes}-minute period before this capture.*
+
+### Acceptance
+
+1. Two 10-minute blocks with different usage → two screenshots show **different** % values.
+2. Overall session report % unchanged (still sum of all INPUT_ACTIVITY for the day).
+3. Old screenshots without new metadata do not crash the UI.
+
+---

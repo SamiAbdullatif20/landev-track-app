@@ -80,6 +80,16 @@ function runMigration(database: Database.Database): void {
       value TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS project_cache (
+      id TEXT PRIMARY KEY,
+      displayLabel TEXT NOT NULL DEFAULT '',
+      payloadJson TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_project_cache_display_label
+      ON project_cache(displayLabel COLLATE NOCASE);
   `);
 
   const hasLegacyQueueTable = database

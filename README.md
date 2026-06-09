@@ -75,6 +75,76 @@ If a user will be in the **orange** or **red** late-start band for their role, t
 - `.env.staging`
 - `.env.prod`
 
+## Employee feedback fix pass (desktop)
+
+Single integration surface for picker, live sync, activity, apps used, screenshots, and notification sounds. **Web dashboard sounds are separate** (browser app).
+
+### 1. Project picker
+
+`GET {BASE_URL}/api/projects?limit=200&cursor=…` until `pagination.nextCursor` is null.
+
+| API field | Desktop use |
+|-----------|-------------|
+| `displayLabel` | **Title** (list row + selected value) |
+| `searchLabel` | **Search** (address; also `clientName`, `projectNumber`) |
+| `name`, `projectNumber`, `projectAddress`, `clientName`, `id`, `isNonChargeable` | Stored / fallbacks |
+
+Refresh on picker open and after project change; background sync every **60s**.
+
+### 2. Live sync (no restart)
+
+| What | Interval | Endpoint |
+|------|----------|----------|
+| Projects | **60s** (60–120s) | Full paginated `GET /api/projects` → replace local cache when ids change → `tracking:projects-push` |
+| Events | **45s** (30–60s) | `POST /api/tracking/events/batch` — `INPUT_ACTIVITY`, `APP_FOCUS`, `HEARTBEAT` |
+| Auth | On 401 | Re-login with saved credentials, retry once |
+
+### 3. INPUT_ACTIVITY (mouse / keyboard)
+
+While session is active, main process samples every **15s** (polls input every 1s on Windows):
+
+- `eventKind`: `INPUT_ACTIVITY`
+- `projectId`, `workSessionId`, `workDateKey`, `occurredAtIso`
+- `mouseMoveCount`, `keyPressCount`, `metadata.mouseMovePercent` (+ `totalSamples`, `mouseMoveSamples`, `trackerElapsedMs`)
+- Foreground `application`, `processName`, `windowTitle` in metadata
+
+Log: `input-activity-sample`
+
+### 4. APP_FOCUS (apps used)
+
+- **3s** foreground change detection + **15s** tick for same app
+- `application`, `processName`, `windowTitle`, `applicationDisplayName`, `executablePath`
+- When **Landev** is foreground, keeps reporting last real app (CAD, Chrome) via sticky context
+
+Log: `app-focus-sample`
+
+### 5. Screenshots
+
+- **6 min** (super admin only) + **10 min** (super admin + employees) while session active
+- Main-process `desktopCapturer` (PNG) — **not** local video
+- `POST /api/tracking/screenshots/ingest` **multipart** `image` field
+- Continues while tracker window is open (`backgroundThrottling: false`, power save blocker)
+
+Log: `screenshot-uploaded`
+
+### 6. Desktop notification sounds
+
+| Event | When |
+|-------|------|
+| `assignment_alert` | New project id from sync |
+| `session_reminder` | Every 2h while tracking |
+| `sync_failure` | Batch failed with queued items (max 1 / 5 min) |
+
+Bundled `.wav` via `System.Media.SoundPlayer`; toast via `electron.Notification` (AUMID `com.landev.track`). Header **Sounds** toggle.
+
+## Manual test checklist
+
+1. **New project on web** — Super admin assigns project, finalizes from draft. Desktop logged in: open picker or wait **&lt; 2 min** → new row shows `displayLabel`; search by address via `searchLabel`.
+2. **5 min in AutoCAD** — Start session, use AutoCAD ~5 min (tracker can stay open). Web session report: **Apps used** shows AutoCAD (`acad.exe`, drawing title).
+3. **Activity** — Move mouse / type; web report shows mouse/keyboard stats from `INPUT_ACTIVITY` batch.
+4. **Screenshots** — Keep tracker window open **15+ min**; web admin shows screenshots at 6/10 min intervals without app restart.
+5. **Sync** — Disconnect network briefly → `sync_failure` sound (if enabled); reconnect → `sync-batch-delivered`.
+
 ## Quality Commands
 
 - `npm run typecheck`

@@ -26,8 +26,24 @@ describe("isCatalogProjectId", () => {
 
 describe("resolveProjectsForRoles", () => {
   const api: Project[] = [
-    { id: "p1", name: "Admin - Phone Call", projectNumber: null, clientName: null },
-    { id: "p2", name: "Client Meeting", projectNumber: "C1", clientName: "Acme" }
+    {
+      id: "p1",
+      name: "Admin - Phone Call",
+      displayLabel: "Admin - Phone Call",
+      searchLabel: "Admin - Phone Call",
+      projectNumber: null,
+      projectAddress: null,
+      clientName: null
+    },
+    {
+      id: "p2",
+      name: "Client Meeting",
+      displayLabel: "C1",
+      searchLabel: "123 Main St, Auckland",
+      projectNumber: "C1",
+      projectAddress: "123 Main St, Auckland",
+      clientName: "Acme"
+    }
   ];
 
   it("designer sees admin catalog and assigned api projects", () => {

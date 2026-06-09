@@ -1,4 +1,8 @@
-import { BrowserWindow, ipcMain, app } from "electron";
+import { BrowserWindow, dialog, ipcMain, app } from "electron";
+import { startSessionPowerBlocker, stopSessionPowerBlocker } from "../services/session-power";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { IPC_CHANNELS } from "./channels";
 import { eventSchema, loginSchema, startSchema, stopSchema } from "./schemas";
 import * as api from "../api/client";
@@ -10,16 +14,63 @@ import {
   saveSessionCookie,
   saveToken
 } from "../security/token-store";
-import { clearSyntheticSessionPendingEvents, enqueueEvent, getSessionState, getSetting, saveSessionState, setSetting } from "../db/queue-repo";
+import {
+  clearSyntheticSessionPendingEvents,
+  clearUndeliveredQueuedEvents,
+  getSessionState,
+  getSetting,
+  resetActiveSessionState,
+  saveSessionState,
+  setSetting
+} from "../db/queue-repo";
 import { logger } from "../config/logger";
 import { SyncWorker } from "../services/sync-worker";
-import { collectActivityContext } from "../services/activity-metadata";
+import { ProjectSyncService } from "../services/project-sync-service";
+import { readAuthContext, refreshAuthSession, isAuthenticated } from "../services/auth-session";
+import { saveCredentials, clearCredentials, readCredentials } from "../security/credential-store";
+import {
+  clearActiveSessionOwner,
+  clearCurrentAppUser,
+  getCurrentAppUserKey,
+  isActiveSessionOwnedByCurrentUser,
+  setActiveSessionOwnerKey,
+  setCurrentAppUser
+} from "../db/user-scope";
+import { releaseActiveSessionIfForeignUser, sessionStateForCurrentUser } from "../services/session-ownership";
+import { clearProjectsCache } from "../db/projects-cache";
+import type { Project } from "../api/client";
+import type { RoleProject } from "../config/role-project-catalog";
 import { readEnv } from "../config/env";
 import { getClientIanaTimeZone } from "../config/client-timezone";
-import { buildTrackingMetadata } from "../services/tracking-event-utils";
 import { trackingDiagnostics } from "../services/tracking-diagnostics";
 import { ScreenshotWorker } from "../services/screenshot-worker";
-import { detectMeetingOrCallPresence } from "../services/meeting-detection";
+import { AppFocusPoller } from "../services/app-focus-poller";
+import { InputActivitySampler } from "../services/input-activity-sampler";
+import {
+  resetAndWarmUpWindowsProbes,
+  stopAllWindowsProbeSessions
+} from "../services/probe-session-lifecycle";
+import { SessionReminderService } from "../services/session-reminder";
+import {
+  isNotificationSoundEnabled,
+  setNotificationSoundEnabled
+} from "../services/notification-settings";
+import { recordInputActivityEvent } from "../services/tracking-input-activity";
+import { clearAppFocusDedupeState } from "../services/tracking-app-focus";
+import { clearInputActivityRollup } from "../services/input-activity-rollup";
+import {
+  clearLocalNotificationUnreadCount,
+  getLocalNotificationUnreadCount,
+  getMergedNotificationUnreadCount,
+  mergeNotificationUnreadCount,
+  publishNotificationCount,
+  registerNotificationBadgeWindow,
+  clearNotificationBadgeWindow,
+  setLastRemoteNotificationUnreadCount
+} from "../services/notification-badge";
+import { hasUsableWorkSessionId } from "../services/session-event-fields";
+import { buildSessionStopInput } from "../services/session-stop-payload";
+import { registerSessionPowerLifecycle } from "../services/session-power-lifecycle";
 import {
   DESIGNER_PROJECT_NAMES,
   isCatalogProjectId,
@@ -29,6 +80,29 @@ import {
   resolveProjectsForRoles
 } from "../config/role-project-catalog";
 import { clearCachedUserRoles, fetchUserRoles, readCachedUserRoles } from "../api/client";
+import { getRecentWorkTasks } from "../db/recent-tasks";
+import {
+  clearActiveSessionProjectName,
+  getWorkSummary,
+  recordCompletedWorkSession,
+  setActiveSessionProjectName
+} from "../db/work-log";
+import { TrackingOverlayManager } from "../services/tracking-overlay";
+
+let stopActiveTrackingSession: ((stoppedAt: string) => Promise<api.SessionStopResult>) | null = null;
+
+export async function stopActiveSessionIfRunning(): Promise<boolean> {
+  if (!getSessionState().active || !stopActiveTrackingSession) {
+    return false;
+  }
+  try {
+    await stopActiveTrackingSession(new Date().toISOString());
+    return true;
+  } catch (error) {
+    logger.warn("stop-active-session-on-quit-failed", { error });
+    return false;
+  }
+}
 
 function asUserError(error: unknown): Error {
   if (error instanceof api.ApiError) {
@@ -43,7 +117,7 @@ function asUserError(error: unknown): Error {
 }
 
 function normalizeSessionState() {
-  const state = getSessionState();
+  const state = sessionStateForCurrentUser();
   const normalizedSessionId =
     typeof state.sessionId === "string" && /^\d{13,}$/.test(state.sessionId)
       ? null
@@ -57,31 +131,30 @@ function normalizeSessionState() {
   };
 }
 
-function sendSessionStatus(mainWindow: BrowserWindow): void {
+function sendSessionStatus(mainWindow: BrowserWindow, overlay?: TrackingOverlayManager): void {
   mainWindow.webContents.send("tracking:status-push", normalizeSessionState());
-}
-
-function hasUsableSessionId(sessionId: string | null | undefined): boolean {
-  if (!sessionId) return false;
-  return !/^\d{13,}$/.test(sessionId.trim());
+  overlay?.syncVisibility();
 }
 
 function authContext() {
   return {
-    token: readToken() ?? undefined,
-    sessionCookie: readSessionCookie() ?? undefined,
-    onSessionCookie: saveSessionCookie
+    ...readAuthContext(),
+    onAuthRefresh: refreshAuthSession
   };
+}
+
+function resolveVisibleProjects(apiProjects: Project[], roles: string[]): RoleProject[] {
+  let projects = resolveProjectsForRoles(apiProjects, roles);
+  if (projects.length === 0) {
+    projects = isModeratorRole(roles)
+      ? mergeCatalogWithApi(apiProjects, MODERATOR_PROJECT_NAMES)
+      : mergeCatalogWithApi(apiProjects, DESIGNER_PROJECT_NAMES);
+  }
+  return projects;
 }
 
 const MAX_PER_EVENT_SECONDS = 300;
 const MAX_LOCAL_VERIFY_EVENTS = 300;
-
-type FocusVerifierEvent = {
-  occurredAtMs: number;
-  application: string;
-  activeSeconds: number;
-};
 
 function toFiniteNumber(value: unknown): number | null {
   if (typeof value !== "number") return null;
@@ -93,43 +166,226 @@ function clampSeconds(value: number | null): number {
   return Math.min(MAX_PER_EVENT_SECONDS, Math.max(0, value));
 }
 
-function clampElapsedMs(value: number | null): number {
-  if (value == null) return 0;
-  return Math.min(MAX_PER_EVENT_SECONDS * 1000, Math.max(0, value));
-}
-
 export function registerIpc(mainWindow: BrowserWindow): void {
+  registerNotificationBadgeWindow(mainWindow);
   const env = readEnv();
+  const electronDir = path.dirname(fileURLToPath(import.meta.url));
+  const preloadPath = path.join(electronDir, "preload.mjs");
+  const rendererIndex = path.join(process.env.APP_ROOT ?? app.getAppPath(), "dist", "index.html");
+  const overlayUrl = process.env.VITE_DEV_SERVER_URL
+    ? `${process.env.VITE_DEV_SERVER_URL}?view=overlay`
+    : `${pathToFileURL(rendererIndex).href}?view=overlay`;
+  const trackingOverlay = new TrackingOverlayManager({
+    preloadPath,
+    overlayUrl
+  });
   const worker = new SyncWorker({
-    readToken,
-    readSessionCookie,
     window: mainWindow,
     onSyncResult: (result) => trackingDiagnostics.recordSync(result.ok, result.statusCode, result.message)
   });
+  const projectSync = new ProjectSyncService({
+    window: mainWindow,
+    resolveVisibleProjects,
+    fetchRoles: async (ctx) => {
+      const roles = readCachedUserRoles();
+      if (roles.length > 0) {
+        return roles;
+      }
+      return fetchUserRoles(ctx);
+    }
+  });
+
+  const startLiveSync = (): void => {
+    projectSync.start();
+    worker.start();
+  };
+
+  const stopLiveSync = (): void => {
+    projectSync.stop();
+    worker.stop();
+  };
+
+  if (isAuthenticated()) {
+    startLiveSync();
+    void projectSync.syncNow();
+  }
   const clearedOnBoot = clearSyntheticSessionPendingEvents();
   if (clearedOnBoot > 0) {
     logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedOnBoot });
-  }
-  if (getSessionState().active) {
-    worker.start();
   }
   const screenshotWorker = new ScreenshotWorker({
     uploadScreenshot: async (payload) => {
       await api.ingestScreenshot(payload, authContext());
     }
   });
-  if (getSessionState().active) {
-    screenshotWorker.start({
-      projectId: getSessionState().projectId,
-      sessionId: getSessionState().sessionId
-    }).catch(() => undefined);
-  }
-  const recentAppFocusSignatures = new Map<string, number>();
-  const localVerifierEvents: FocusVerifierEvent[] = [];
+  const appFocusPoller = new AppFocusPoller();
+  const inputActivitySampler = new InputActivitySampler();
+  const sessionReminder = new SessionReminderService();
 
-  mainWindow.on("closed", () => {
-    worker.stop();
+  const stopTrackingCapture = (): void => {
+    appFocusPoller.stop();
+    inputActivitySampler.stop();
     screenshotWorker.stop();
+    sessionReminder.stop();
+    stopAllWindowsProbeSessions();
+    clearAppFocusDedupeState();
+    clearInputActivityRollup();
+  };
+
+  const notifySessionStatus = (): void => {
+    sendSessionStatus(mainWindow, trackingOverlay);
+  };
+
+  const applyAccountContext = (username: string): void => {
+    setCurrentAppUser(username);
+    const released = releaseActiveSessionIfForeignUser({
+      stopCapture: stopTrackingCapture,
+      notifyStatus: notifySessionStatus
+    });
+    if (released) {
+      logger.info("active-session-released-foreign-user", { username });
+    }
+  };
+
+  const finalizeAccountLogout = (): void => {
+    clearUndeliveredQueuedEvents();
+    resetActiveSessionState();
+    clearActiveSessionOwner();
+    clearCurrentAppUser();
+    clearActiveSessionProjectName();
+    clearLocalNotificationUnreadCount();
+    setSetting("activeSessionIsNonChargeable", "false");
+  };
+
+  if (isAuthenticated()) {
+    const savedCredentials = readCredentials();
+    if (savedCredentials) {
+      applyAccountContext(savedCredentials.username);
+    }
+  } else if (getSessionState().active) {
+    stopTrackingCapture();
+    resetActiveSessionState();
+    clearActiveSessionOwner();
+  }
+
+  const recoverOrphanedActiveSessionOnBoot = async (): Promise<void> => {
+    const state = getSessionState();
+    if (!state.active) {
+      return;
+    }
+
+    if (!isAuthenticated()) {
+      stopTrackingCapture();
+      resetActiveSessionState();
+      clearActiveSessionOwner();
+      return;
+    }
+
+    if (!isActiveSessionOwnedByCurrentUser()) {
+      releaseActiveSessionIfForeignUser({
+        stopCapture: stopTrackingCapture,
+        notifyStatus: notifySessionStatus
+      });
+      return;
+    }
+
+    const stoppedAt = new Date().toISOString();
+    logger.info("session-orphan-recovery-stop", {
+      sessionId: state.sessionId,
+      startedAt: state.startedAt,
+      stoppedAt
+    });
+
+    try {
+      await performSessionStop(stoppedAt);
+    } catch (error) {
+      logger.warn("session-orphan-recovery-stop-failed", { error });
+      if (getSessionState().active) {
+        finalizeLocalSessionStop(state, stoppedAt);
+      }
+    }
+  };
+  mainWindow.on("closed", () => {
+    stopLiveSync();
+    screenshotWorker.stop();
+    stopSessionPowerBlocker();
+    appFocusPoller.stop();
+    inputActivitySampler.stop();
+    stopAllWindowsProbeSessions();
+    sessionReminder.stop();
+    trackingOverlay.destroy();
+    clearNotificationBadgeWindow();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_GET, () => ({
+    enabled: isNotificationSoundEnabled()
+  }));
+
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_SET, (_event, enabled: unknown) => {
+    setNotificationSoundEnabled(Boolean(enabled));
+    return { enabled: isNotificationSoundEnabled() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WEB_NOTIFICATIONS_STATUS, async () => {
+    try {
+      const remote = await api.fetchWebNotificationRemoteCount({
+        ...authContext(),
+        onAuthRefresh: refreshAuthSession
+      });
+      setLastRemoteNotificationUnreadCount(remote);
+      const unreadCount = mergeNotificationUnreadCount(remote);
+      publishNotificationCount(unreadCount);
+      return { unreadCount };
+    } catch (error) {
+      logger.warn("web-notifications-status-failed", { error });
+      const unreadCount = getMergedNotificationUnreadCount();
+      return { unreadCount };
+    }
+  });
+
+  let closingAfterStop = false;
+
+  const isTrackingSessionActiveForClose = (): boolean =>
+    getSessionState().active === 1 && isActiveSessionOwnedByCurrentUser();
+
+  mainWindow.on("close", (event) => {
+    if (closingAfterStop || !isTrackingSessionActiveForClose() || !stopActiveTrackingSession) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const stopSession = stopActiveTrackingSession;
+    void dialog
+      .showMessageBox(mainWindow, {
+        type: "question",
+        title: "LANDEV Tracker",
+        message: "Are you sure you want to stop tracking?",
+        detail: "A work session is still running. Choose Yes to stop tracking and close the app, or No to keep tracking.",
+        buttons: ["Yes", "No"],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true
+      })
+      .then(({ response }) => {
+        if (response !== 0) {
+          return;
+        }
+
+        closingAfterStop = true;
+        return stopSession(new Date().toISOString())
+          .catch((error) => {
+            logger.warn("stop-on-window-close-failed", { error });
+          })
+          .finally(() => {
+            if (!mainWindow.isDestroyed()) {
+              mainWindow.destroy();
+            }
+          });
+      })
+      .catch((error) => {
+        logger.warn("stop-tracking-close-dialog-failed", { error });
+      });
   });
 
   ipcMain.handle(IPC_CHANNELS.APP_INFO, () => ({
@@ -159,6 +415,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGIN, async (_event, payload) => {
     try {
       const parsed = loginSchema.parse(payload);
+      saveCredentials(parsed.username, parsed.password);
+      applyAccountContext(parsed.username);
       const result = await api.login(parsed, authContext());
       if (result.token) {
         saveToken(result.token);
@@ -166,7 +424,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       if (result.sessionCookie) {
         saveSessionCookie(result.sessionCookie);
       }
-      await worker.flush();
+      startLiveSync();
+      await Promise.all([worker.flush(), projectSync.syncNow()]);
       const roles = result.roles.length > 0 ? result.roles : await fetchUserRoles(authContext());
       return { ok: true, roles };
     } catch (error) {
@@ -179,18 +438,52 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       const ctx = authContext();
       const probe = await api.probeSession(ctx);
       const roles = await fetchUserRoles(ctx);
+      if (probe.authenticated) {
+        const savedCredentials = readCredentials();
+        if (savedCredentials) {
+          applyAccountContext(savedCredentials.username);
+        }
+        startLiveSync();
+      } else {
+        stopLiveSync();
+        finalizeAccountLogout();
+      }
       return { authenticated: probe.authenticated, roles };
     } catch {
       clearToken();
       clearSessionCookie();
       clearCachedUserRoles();
+      clearCredentials();
+      stopLiveSync();
+      finalizeAccountLogout();
       return { authenticated: false, roles: [] };
     }
   });
 
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGOUT, async () => {
-    worker.stop();
-    screenshotWorker.stop();
+    const stoppedAt = new Date().toISOString();
+    const savedCredentials = readCredentials();
+    if (savedCredentials) {
+      setCurrentAppUser(savedCredentials.username);
+    }
+    if (getSessionState().active) {
+      try {
+        await performSessionStop(stoppedAt);
+      } catch (error) {
+        logger.warn("stop-on-logout-failed", { error });
+        if (getSessionState().active) {
+          finalizeLocalSessionStop(getSessionState(), stoppedAt);
+        }
+      }
+    } else {
+      stopLiveSync();
+      screenshotWorker.stop();
+      stopSessionPowerBlocker();
+      appFocusPoller.stop();
+      inputActivitySampler.stop();
+      sessionReminder.stop();
+      trackingOverlay.syncVisibility();
+    }
     try {
       await api.logout(authContext());
     } catch (error) {
@@ -199,45 +492,42 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       clearToken();
       clearSessionCookie();
       clearCachedUserRoles();
+      clearCredentials();
+      finalizeAccountLogout();
+      clearProjectsCache();
+      stopLiveSync();
+      notifySessionStatus();
     }
     return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.TRACKING_PROJECTS, async () => {
     try {
-      const ctx = authContext();
-      let apiProjects: api.Project[] = [];
-      try {
-        apiProjects = await api.getProjects(ctx);
-      } catch (error) {
-        logger.warn("projects-api-fetch-failed", {
-          error: error instanceof Error ? error.message : "unknown"
-        });
-      }
-
-      let roles = readCachedUserRoles();
-      if (roles.length === 0) {
-        roles = await api.fetchUserRoles(ctx);
-      }
-
-      let projects = resolveProjectsForRoles(apiProjects, roles);
-      if (projects.length === 0) {
-        projects = isModeratorRole(roles)
-          ? mergeCatalogWithApi(apiProjects, MODERATOR_PROJECT_NAMES)
-          : mergeCatalogWithApi(apiProjects, DESIGNER_PROJECT_NAMES);
-      }
+      const result = await projectSync.syncNow();
       logger.info("projects-role-filter", {
-        roles,
-        apiCount: apiProjects.length,
-        visibleCount: projects.length
+        roles: result.roles,
+        serverCount: result.serverCount,
+        localCount: result.localCount,
+        visibleCount: result.projects.length
       });
-      return { projects, roles };
+      return { projects: result.projects, roles: result.roles };
     } catch (error) {
       throw asUserError(error);
     }
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_STATUS, () => normalizeSessionState());
+
+  ipcMain.handle(IPC_CHANNELS.TRACKING_RECENT_TASKS, () => getRecentWorkTasks());
+
+  ipcMain.handle(IPC_CHANNELS.TRACKING_WORK_SUMMARY, () => {
+    const state = sessionStateForCurrentUser();
+    return getWorkSummary({
+      projectId: state.active ? state.projectId : null,
+      projectName: state.active ? getSetting("activeSessionProjectName") || null : null,
+      startedAt: state.active ? state.startedAt : null
+    });
+  });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_START, async (_event, payload) => {
     try {
@@ -248,7 +538,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         throw new Error("AUTH: Not authenticated");
       }
       if (getSetting("trackingConsentAccepted") !== "true") {
-        throw new Error("VALIDATION: Accept tracking and screenshot terms before starting.");
+        throw new Error("VALIDATION: Accept tracking terms before starting.");
       }
       if (currentState.active) throw new Error("VALIDATION: Session already running.");
 
@@ -271,21 +561,44 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         },
         authContext()
       );
+      let sessionId = result.sessionId;
+      if (!hasUsableWorkSessionId(sessionId)) {
+        sessionId = await api.fetchActiveWorkSessionId(authContext());
+      }
       saveSessionState({
         active: 1,
-        sessionId: result.sessionId ?? null,
+        sessionId: sessionId ?? null,
         projectId: parsed.projectId,
         description: parsed.description,
-        startedAt: new Date().toISOString()
+        startedAt: startTimeUtc
       });
-      worker.start();
+      const userKey = getCurrentAppUserKey();
+      if (userKey) {
+        setActiveSessionOwnerKey(userKey);
+      }
+    clearAppFocusDedupeState();
+    clearInputActivityRollup();
+    startSessionPowerBlocker();
+      await resetAndWarmUpWindowsProbes();
       await screenshotWorker.start({
         projectId: catalogProject ? null : parsed.projectId,
-        sessionId: result.sessionId ?? null
+        sessionId: sessionId ?? null
       });
+      appFocusPoller.start();
+      inputActivitySampler.start();
+      sessionReminder.start();
 
-      sendSessionStatus(mainWindow);
-      return { sessionId: result.sessionId };
+      setActiveSessionProjectName((parsed.projectName ?? parsed.projectId).trim());
+      setSetting("activeSessionIsNonChargeable", parsed.isNonChargeable ? "true" : "false");
+
+      sendSessionStatus(mainWindow, trackingOverlay);
+      await worker.flush();
+      logger.info("tracking-session-started-local", {
+        sessionId: sessionId ?? null,
+        startedAt: startTimeUtc,
+        hasWorkSessionId: hasUsableWorkSessionId(sessionId)
+      });
+      return { sessionId: sessionId ?? null };
     } catch (error) {
       throw asUserError(error);
     }
@@ -294,241 +607,127 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.TRACKING_EVENT, async (_event, payload) => {
     try {
       const parsed = eventSchema.parse(payload);
-      const state = getSessionState();
-      if (!state.active) return { queued: false };
-
-      const context = await collectActivityContext();
-      const built = buildTrackingMetadata({
-        source: "ipc.handlers.tracking:event",
-        projectId: state.projectId,
-        workDescription: state.description,
-        mouseMovePercent: typeof parsed.metadata?.mouseMovePercent === "number" ? parsed.metadata.mouseMovePercent : undefined,
-        totalSamples: typeof parsed.metadata?.totalSamples === "number" ? parsed.metadata.totalSamples : undefined,
-        mouseMoveSamples: typeof parsed.metadata?.mouseMoveSamples === "number" ? parsed.metadata.mouseMoveSamples : undefined,
-        trackerElapsedMs: typeof parsed.metadata?.trackerElapsedMs === "number" ? parsed.metadata.trackerElapsedMs : undefined,
-        rawApplication: context.application ?? context.appName ?? context.processName,
-        rawWindowTitle: context.windowTitle ?? context.activeWindowTitle,
-        processName: context.processName ?? context.appName,
-        application: context.application ?? context.appName,
-        windowTitle: context.windowTitle ?? context.activeWindowTitle
-      });
+      if (!getSessionState().active) {
+        return { queued: false };
+      }
       const metadataInput = parsed.metadata ?? {};
-      const metadataRest = { ...metadataInput };
-      delete metadataRest.activeSeconds;
-      delete metadataRest.idleSeconds;
-      delete metadataRest.trackerElapsedMs;
-      let activeSeconds = clampSeconds(toFiniteNumber(metadataInput.activeSeconds));
-      let idleSeconds = clampSeconds(toFiniteNumber(metadataInput.idleSeconds));
-      const trackerElapsedMs = clampElapsedMs(toFiniteNumber(metadataInput.trackerElapsedMs));
-      const meetingPresence =
-        parsed.type === "APP_FOCUS"
-          ? detectMeetingOrCallPresence(context)
-          : { treatIntervalAsFullActiveWork: false as const, reason: null as string | null };
-      if (parsed.type === "APP_FOCUS" && meetingPresence.treatIntervalAsFullActiveWork) {
-        activeSeconds = clampSeconds(trackerElapsedMs / 1000);
-        idleSeconds = 0;
-        logger.info("app-focus-meeting-override", {
-          reason: meetingPresence.reason,
-          processName: context.processName ?? context.application,
-          windowTitlePreview: (context.windowTitle ?? context.activeWindowTitle ?? "").slice(0, 80)
-        });
-      }
-      const intervalSource = metadataInput.telemetryDerivedFrom === "renderer-interval"
-        ? "incremental"
-        : "derived";
-      const timestampBucket = Math.floor(new Date(parsed.occurredAt).getTime() / 5000);
-      if (parsed.type === "APP_FOCUS") {
-        const dedupeSignature = [
-          built.metadata.application,
-          built.metadata.windowTitle,
-          timestampBucket,
-          activeSeconds.toFixed(3),
-          idleSeconds.toFixed(3)
-        ].join("|");
-        const lastSeenMs = recentAppFocusSignatures.get(dedupeSignature);
-        const nowMs = Date.now();
-        if (lastSeenMs && nowMs - lastSeenMs <= 5000) {
-          logger.info("app-focus-deduped", {
-            signature: dedupeSignature.slice(0, 120),
-            occurredAtIso: parsed.occurredAt
-          });
-          return { queued: false, deduped: true };
-        }
-        recentAppFocusSignatures.set(dedupeSignature, nowMs);
-        for (const [key, value] of Array.from(recentAppFocusSignatures.entries())) {
-          if (nowMs - value > 60_000) {
-            recentAppFocusSignatures.delete(key);
-          }
-        }
-      }
-      const eventPayload = {
-        ...(hasUsableSessionId(state.sessionId) ? { sessionId: state.sessionId } : {}),
-        type: parsed.type,
-        occurredAt: parsed.occurredAt,
-        metadata: {
-          ...metadataRest,
-          ...built.metadata,
-          activeSeconds,
-          idleSeconds,
-          trackerElapsedMs,
-          ...(meetingPresence.treatIntervalAsFullActiveWork
-            ? {
-                meetingPresenceOverride: true,
-                meetingPresenceReason: meetingPresence.reason
-              }
-            : {}),
-          hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
-          windowReasonCode: context.windowReasonCode ?? null,
-          ...context,
-          clientTimeZone: getClientIanaTimeZone()
-        }
-      };
-
-      const eventId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-      trackingDiagnostics.recordCaptured(
-        {
-          capturedAt: parsed.occurredAt,
-          eventId,
-          eventType: parsed.type,
-          rawApplication: built.metadata.rawApplication,
-          rawWindowTitle: built.metadata.rawWindowTitle,
-          processName: built.metadata.processName,
-          application: built.metadata.application,
-          hasWindowTitle: built.metadata.windowTitle.length > 0,
-          hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
-          source: "ipc.handlers.tracking:event",
-          windowReasonCode: context.windowReasonCode ?? null
-        },
-        {
-          missingWindowTitle: built.missingWindowTitle,
-          fallbackAppName: built.usedFallbackAppName,
-          normalizedAppName: built.usedNormalizedName
-        }
-      );
-      logger.info("tracking-event-diagnostics", {
-        eventId,
-        rawApp: built.metadata.rawApplication,
-        rawWindowTitle: built.metadata.rawWindowTitle,
-        application: built.metadata.application,
-        hasWindowTitle: built.metadata.windowTitle.length > 0,
-        hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
-        source: "ipc.handlers.tracking:event",
-        windowReasonCode: context.windowReasonCode ?? null
+      const mouseMoveCount = Math.max(0, Math.floor(toFiniteNumber(metadataInput.mouseMoveCount) ?? 0));
+      const keyPressCount = Math.max(0, Math.floor(toFiniteNumber(metadataInput.keyPressCount) ?? 0));
+      const activeSeconds = clampSeconds(toFiniteNumber(metadataInput.activeSeconds));
+      const idleSeconds = clampSeconds(toFiniteNumber(metadataInput.idleSeconds));
+      const queued = await recordInputActivityEvent({
+        mouseMoveCount,
+        keyPressCount,
+        clickCount: Math.max(0, Math.floor(toFiniteNumber(metadataInput.clickCount) ?? 0)),
+        activeSeconds,
+        idleSeconds,
+        trackerElapsedMs: Number(metadataInput.trackerElapsedMs ?? activeSeconds * 1000),
+        mouseMovePercent: typeof metadataInput.mouseMovePercent === "number" ? metadataInput.mouseMovePercent : undefined,
+        mouseMoveSamples: typeof metadataInput.mouseMoveSamples === "number" ? metadataInput.mouseMoveSamples : undefined,
+        totalSamples: typeof metadataInput.totalSamples === "number" ? metadataInput.totalSamples : undefined,
+        triggerType: typeof metadataInput.triggerType === "string" ? metadataInput.triggerType : "renderer"
       });
-      if (parsed.type === "APP_FOCUS") {
-        logger.info("app-focus-payload", {
-          eventUuid: eventId,
-          occurredAtIso: parsed.occurredAt,
-          appName: built.metadata.application,
-          windowTitle: built.metadata.windowTitle,
-          activeSeconds,
-          idleSeconds,
-          trackerElapsedMs,
-          intervalSource,
-          meetingPresenceOverride: meetingPresence.treatIntervalAsFullActiveWork,
-          meetingPresenceReason: meetingPresence.reason
-        });
-      }
 
-      enqueueEvent("activity", eventPayload);
-      logger.info("tracking-event-queued", {
-        type: parsed.type,
-        hasSessionId: hasUsableSessionId(state.sessionId),
-        hasAppName: Boolean((context.appName ?? context.application)),
-        hasWindowTitle: Boolean((context.activeWindowTitle ?? context.windowTitle))
-      });
-      await worker.flush();
-      if (parsed.type === "APP_FOCUS") {
-        const occurredAtMs = new Date(parsed.occurredAt).getTime();
-        if (Number.isFinite(occurredAtMs)) {
-          localVerifierEvents.push({
-            occurredAtMs,
-            application: built.metadata.application,
-            activeSeconds
-          });
-          if (localVerifierEvents.length > MAX_LOCAL_VERIFY_EVENTS) {
-            localVerifierEvents.splice(0, localVerifierEvents.length - MAX_LOCAL_VERIFY_EVENTS);
-          }
-          const first = localVerifierEvents[0];
-          const last = localVerifierEvents[localVerifierEvents.length - 1];
-          if (first && last && last.occurredAtMs > first.occurredAtMs) {
-            const wallClockSeconds = (last.occurredAtMs - first.occurredAtMs) / 1000;
-            const totalActiveSeconds = localVerifierEvents.reduce((sum, item) => sum + item.activeSeconds, 0);
-            if (wallClockSeconds >= 300) {
-              const ratio = totalActiveSeconds / wallClockSeconds;
-              const byApp: Record<string, number> = {};
-              for (const item of localVerifierEvents) {
-                byApp[item.application] = (byApp[item.application] ?? 0) + item.activeSeconds;
-              }
-              const topApps = Object.entries(byApp)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 5)
-                .map(([appName, seconds]) => ({
-                  appName,
-                  activeMinutes: Number((seconds / 60).toFixed(2))
-                }));
-              const pass = ratio >= 0.6 && ratio <= 1.15;
-              logger.info("app-focus-local-verifier", {
-                status: pass ? "PASS" : "FAIL",
-                wallClockMinutes: Number((wallClockSeconds / 60).toFixed(2)),
-                totalActiveMinutes: Number((totalActiveSeconds / 60).toFixed(2)),
-                ratio: Number(ratio.toFixed(3)),
-                likelyCause: pass ? "none" : "non-incremental or overlapping durations",
-                topApps
-              });
-            }
-          }
-        }
-      }
-      return { queued: true };
+      return { queued, deduped: !queued };
     } catch (error) {
       throw asUserError(error);
     }
   });
 
-  ipcMain.handle(IPC_CHANNELS.SESSION_STOP, async (_event, payload) => {
-    try {
-      const parsed = stopSchema.parse(payload);
-      const state = getSessionState();
-
-      if ((!readToken() && !readSessionCookie()) || !state.active) {
-        throw new Error("VALIDATION: No active session to stop.");
-      }
-
-      logger.info("tracking-stop-flow-start", {
-        localSessionId: state.sessionId,
-        stoppedAt: parsed.stoppedAt
+  const finalizeLocalSessionStop = (state: ReturnType<typeof getSessionState>, stoppedAt: string): void => {
+    if (state.projectId && state.startedAt) {
+      recordCompletedWorkSession({
+        projectId: state.projectId,
+        projectName: getSetting("activeSessionProjectName") ?? state.projectId,
+        description: state.description ?? "",
+        isNonChargeable: getSetting("activeSessionIsNonChargeable") === "true",
+        startedAt: state.startedAt,
+        stoppedAt
       });
-      logger.info("tracking-stop-followup", { step: "flush-before-stop" });
-      await worker.flush();
-      const stopResult = await api.stopSession(
-        {
-          sessionId: state.sessionId,
-          stoppedAt: parsed.stoppedAt,
-          clientTimeZone: getClientIanaTimeZone()
-        },
-        authContext()
-      );
+    }
+    clearActiveSessionProjectName();
+    clearActiveSessionOwner();
+    setSetting("activeSessionIsNonChargeable", "false");
+    saveSessionState({
+      active: 0,
+      sessionId: null,
+      projectId: null,
+      description: null,
+      startedAt: null
+    });
+    stopSessionPowerBlocker();
+    sendSessionStatus(mainWindow, trackingOverlay);
+  };
+
+  const performSessionStop = async (stoppedAt: string): Promise<api.SessionStopResult> => {
+    const state = getSessionState();
+
+    if ((!readToken() && !readSessionCookie()) || !state.active) {
+      throw new Error("VALIDATION: No active session to stop.");
+    }
+
+    const stopPayload = buildSessionStopInput(state, stoppedAt);
+
+    logger.info("tracking-stop-flow-start", {
+      localSessionId: state.sessionId,
+      stoppedAt: stopPayload.stoppedAt,
+      startedAt: stopPayload.startedAt ?? null,
+      durationMs: stopPayload.durationMs ?? null,
+      workDateKey: stopPayload.workDateKey ?? null,
+      hasTrailingEvents: Boolean(stopPayload.trailingEvents?.length),
+      deviceUuid: stopPayload.deviceUuid ?? null
+    });
+
+    let stopResult: api.SessionStopResult;
+    try {
+      logger.info("tracking-stop-followup", { step: "remote-stop-first" });
+      stopResult = await api.stopSession(stopPayload, {
+        ...authContext(),
+        onAuthRefresh: refreshAuthSession
+      });
       logger.info("tracking-stop-flow-result", stopResult);
-      logger.info("tracking-stop-followup", { step: "flush-after-stop" });
+    } catch (error) {
+      logger.warn("tracking-stop-remote-failed", { error });
+      stopResult = {
+        ok: true,
+        queued: false,
+        endpointPath: "/api/tracking/session/stop",
+        status: null,
+        confirmedBy: "idempotent",
+        sessionId: state.sessionId,
+        timesheetId: null,
+        responsePreview: error instanceof Error ? error.message : "Stop failed remotely; cleared locally."
+      };
+    }
+
+    try {
+      logger.info("tracking-stop-followup", { step: "flush-after-remote-stop" });
+      await appFocusPoller.flushPending();
+      stopTrackingCapture();
       const clearedAfterStop = clearSyntheticSessionPendingEvents();
       if (clearedAfterStop > 0) {
         logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "after-stop" });
       }
       await worker.flush();
+    } catch (error) {
+      logger.warn("tracking-stop-local-cleanup-failed", { error });
+    } finally {
+      if (getSessionState().active) {
+        finalizeLocalSessionStop(state, stoppedAt);
+      }
+    }
 
-      saveSessionState({
-        active: 0,
-        sessionId: null,
-        projectId: null,
-        description: null,
-        startedAt: null
-      });
-      worker.stop();
-      screenshotWorker.stop();
+    return stopResult;
+  };
 
-      sendSessionStatus(mainWindow);
-      return stopResult;
+  stopActiveTrackingSession = performSessionStop;
+  registerSessionPowerLifecycle(performSessionStop);
+  void recoverOrphanedActiveSessionOnBoot();
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_STOP, async (_event, payload) => {
+    try {
+      const parsed = stopSchema.parse(payload);
+      return await performSessionStop(parsed.stoppedAt);
     } catch (error) {
       throw asUserError(error);
     }
@@ -539,6 +738,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.SYNC_NOW, async () => {
     try {
+      await projectSync.syncNow();
       const status = await worker.flush();
       return { ok: true, status };
     } catch (error) {
