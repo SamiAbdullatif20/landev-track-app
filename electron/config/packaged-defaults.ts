@@ -3,6 +3,7 @@ declare const __LANDEV_PACKAGED_ENV__: {
   VITE_API_BASE_URL: string;
   VITE_APP_ENV: string;
   AUTO_UPDATE_ENABLED: string;
+  UPDATE_FEED_URL: string;
 };
 
 export function applyPackagedEnvDefaults(): void {
@@ -18,5 +19,8 @@ export function applyPackagedEnvDefaults(): void {
   }
   if (!process.env.AUTO_UPDATE_ENABLED?.trim()) {
     process.env.AUTO_UPDATE_ENABLED = defaults.AUTO_UPDATE_ENABLED as NodeJS.ProcessEnv["AUTO_UPDATE_ENABLED"];
+  }
+  if (!process.env.UPDATE_FEED_URL?.trim()) {
+    process.env.UPDATE_FEED_URL = defaults.UPDATE_FEED_URL;
   }
 }

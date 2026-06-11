@@ -1,9 +1,13 @@
 {
   "name": "landev-track-app",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Secure Electron desktop app for employee session tracking with offline sync.",
   "author": "LANDev Engineering",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SamiAbdullatif20/landev-track-app.git"
+  },
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {

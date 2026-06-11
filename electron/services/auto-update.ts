@@ -14,10 +14,14 @@ export type AppUpdateStatus =
   | { phase: "error"; message: string };
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const UPDATE_CHECK_MAX_ATTEMPTS = 3;
+const RETRYABLE_UPDATE_ERROR =
+  /ERR_NETWORK|ECONNRESET|ETIMEDOUT|ERR_NETWORK_IO_SUSPENDED|ENOTFOUND|Cannot parse releases feed|Unable to find latest version/i;
 
 let mainWindow: BrowserWindow | null = null;
 let checkTimer: NodeJS.Timeout | null = null;
 let ipcRegistered = false;
+let feedConfigured = false;
 let lastStatus: AppUpdateStatus = { phase: "idle" };
 
 function pushUpdateStatus(status: AppUpdateStatus): void {
@@ -26,6 +30,26 @@ function pushUpdateStatus(status: AppUpdateStatus): void {
     return;
   }
   mainWindow.webContents.send("app:update-status-push", status);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function configureUpdateFeed(): void {
+  if (feedConfigured) {
+    return;
+  }
+  const { updateFeedUrl } = readEnv();
+  autoUpdater.setFeedURL({
+    provider: "generic",
+    url: updateFeedUrl
+  });
+  autoUpdater.disableDifferentialDownload = true;
+  feedConfigured = true;
+  logger.info("auto-update-feed-configured", { updateFeedUrl });
 }
 
 export function getLastUpdateStatus(): AppUpdateStatus {
@@ -37,17 +61,29 @@ export async function checkForAppUpdates(): Promise<void> {
   if (!env.autoUpdateEnabled || !app.isPackaged) {
     return;
   }
+  configureUpdateFeed();
   pushUpdateStatus({ phase: "checking" });
-  try {
-    await autoUpdater.checkForUpdates();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Update check failed";
-    logger.warn("updater-check-failed", { error: message });
-    pushUpdateStatus({ phase: "error", message });
+
+  for (let attempt = 1; attempt <= UPDATE_CHECK_MAX_ATTEMPTS; attempt++) {
+    try {
+      await autoUpdater.checkForUpdates();
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Update check failed";
+      logger.warn("updater-check-failed", { attempt, error: message });
+      const shouldRetry = attempt < UPDATE_CHECK_MAX_ATTEMPTS && RETRYABLE_UPDATE_ERROR.test(message);
+      if (!shouldRetry) {
+        pushUpdateStatus({ phase: "idle" });
+        return;
+      }
+      await delay(2000 * attempt);
+      pushUpdateStatus({ phase: "checking" });
+    }
   }
 }
 
 export async function downloadAppUpdate(): Promise<void> {
+  configureUpdateFeed();
   await autoUpdater.downloadUpdate();
 }
 
@@ -86,6 +122,7 @@ export function setupAutoUpdate(window: BrowserWindow): void {
     return;
   }
 
+  configureUpdateFeed();
   autoUpdater.logger = logger;
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
@@ -124,7 +161,7 @@ export function setupAutoUpdate(window: BrowserWindow): void {
   autoUpdater.on("error", (error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn("updater-error", { error: message });
-    pushUpdateStatus({ phase: "error", message });
+    pushUpdateStatus({ phase: "idle" });
   });
 
   void checkForAppUpdates();

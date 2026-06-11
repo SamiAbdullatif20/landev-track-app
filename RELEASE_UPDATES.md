@@ -119,6 +119,7 @@ If you prefer Cloudflare R2 / S3 instead of GitHub Releases:
 
 | Problem | Fix |
 |---------|-----|
+| `Cannot parse releases feed` / `Unable to find latest version` | Fixed in app: updater fetches `latest.yml` from `UPDATE_FEED_URL` in `.env.prod` (GitHub `releases/latest/download`). Ship a new release after updating |
 | `Cannot create symbolic link` / `winCodeSign` on Windows | Already disabled via `signAndEditExecutable: false` in `electron-builder.json5`. Or enable **Windows Developer Mode** (Settings → System → For developers) if you enable signing later |
 | No update prompt | Confirm `AUTO_UPDATE_ENABLED=true` in built app; version in `package.json` must be **higher** than installed |
 | `GH_TOKEN` error | Token needs `repo` scope; set env var in same shell as `npm run release:win` |

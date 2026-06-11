@@ -7,6 +7,9 @@ const packagedEnv = {
   VITE_API_BASE_URL: process.env.VITE_API_BASE_URL ?? 'https://landev.vercel.app',
   VITE_APP_ENV: process.env.VITE_APP_ENV ?? 'prod',
   AUTO_UPDATE_ENABLED: process.env.AUTO_UPDATE_ENABLED ?? 'false',
+  UPDATE_FEED_URL:
+    process.env.UPDATE_FEED_URL ??
+    'https://github.com/SamiAbdullatif20/landev-track-app/releases/latest/download',
 }
 
 // https://vitejs.dev/config/
