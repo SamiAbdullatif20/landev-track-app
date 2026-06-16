@@ -85,7 +85,7 @@ export type SessionStopInput = {
 
 export type ScreenshotIngestInput = {
   capturedAt: string;
-  imageBase64: string;
+  imageBytes: Buffer;
   mimeType: "image/png" | "image/jpeg";
   projectId: string | null;
   sessionId?: string;
@@ -963,16 +963,16 @@ export async function ingestEventsBatch(
   }, options);
 }
 
-function buildScreenshotMultipartBody(payload: ScreenshotIngestInput): {
+export function buildScreenshotMultipartBody(payload: ScreenshotIngestInput): {
   body: Buffer;
   contentType: string;
 } {
   const boundary = `----landev${randomUUID()}`;
-  const imageBuffer = Buffer.from(payload.imageBase64, "base64");
-  const parts: Buffer[] = [];
+  const imageBuffer = payload.imageBytes;
+  const fieldLines: string[] = [];
   const writeField = (name: string, value: string) => {
-    parts.push(
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`)
+    fieldLines.push(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
     );
   };
 
@@ -990,16 +990,20 @@ function buildScreenshotMultipartBody(payload: ScreenshotIngestInput): {
   }
 
   const ext = payload.mimeType === "image/jpeg" ? "jpg" : "png";
-  parts.push(
-    Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="screenshot.${ext}"\r\nContent-Type: ${payload.mimeType}\r\n\r\n`
-    )
-  );
-  parts.push(imageBuffer);
-  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const headerText =
+    fieldLines.join("")
+    + `--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="screenshot.${ext}"\r\nContent-Type: ${payload.mimeType}\r\n\r\n`;
+  const footerText = `\r\n--${boundary}--\r\n`;
+
+  const headerBuffer = Buffer.from(headerText, "utf8");
+  const footerBuffer = Buffer.from(footerText, "utf8");
+  const body = Buffer.allocUnsafe(headerBuffer.length + imageBuffer.length + footerBuffer.length);
+  headerBuffer.copy(body, 0);
+  imageBuffer.copy(body, headerBuffer.length);
+  footerBuffer.copy(body, headerBuffer.length + imageBuffer.length);
 
   return {
-    body: Buffer.concat(parts),
+    body,
     contentType: `multipart/form-data; boundary=${boundary}`
   };
 }

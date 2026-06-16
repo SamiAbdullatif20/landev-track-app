@@ -4,6 +4,7 @@ import {
   designerIntervalMs,
   initialDesignerTargetMs,
   initialSuperadminTargetMs,
+  schedulesDueAtElapsed,
   SCREENSHOT_INTERVAL_MINUTES,
   SCREENSHOT_SCHEDULES,
   superadminIntervalMs
@@ -46,5 +47,19 @@ describe("screenshot schedules", () => {
     expect(
       delayMsUntilEarlierTarget(startedAt, 10 * minute, 10 * minute, startedAt + 8 * minute)
     ).toBe(2 * minute);
+  });
+
+  it("prioritizes employee-visible capture when 6m and 10m tiers overlap", () => {
+    const minute = 60 * 1000;
+    const due = schedulesDueAtElapsed(10 * minute, 6 * minute, 10 * minute);
+    expect(due).toHaveLength(1);
+    expect(due[0]?.visibility).toBe("admin_and_employee");
+  });
+
+  it("returns only superadmin tier when only 6m is due", () => {
+    const minute = 60 * 1000;
+    const due = schedulesDueAtElapsed(6 * minute, 6 * minute, 10 * minute);
+    expect(due).toHaveLength(1);
+    expect(due[0]?.visibility).toBe("superadmin_only");
   });
 });

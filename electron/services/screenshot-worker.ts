@@ -7,14 +7,15 @@ import {
   initialDesignerTargetMs,
   initialSuperadminTargetMs,
   scheduleForVisibility,
+  schedulesDueAtElapsed,
   superadminIntervalMs,
   type ScreenshotSchedule
 } from "./screenshot-schedules";
 import {
   CAPTURE_SIZES,
-  capturePrimaryScreenPng
+  capturePrimaryScreenJpeg
 } from "./screenshot-capture";
-import { compressPngToJpeg, TARGET_SCREENSHOT_BYTES } from "./screenshot-compress";
+import { TARGET_SCREENSHOT_BYTES } from "./screenshot-compress";
 import { shouldSkipScreenshotCapture } from "./capture-guard-windows";
 import { getMouseStatsForPeriod } from "./input-activity-rollup";
 
@@ -25,7 +26,7 @@ type SessionContext = {
 
 export type ScreenshotUploadInput = {
   capturedAt: string;
-  imageBase64: string;
+  imageBytes: Buffer;
   mimeType: "image/jpeg";
   projectId: string | null;
   sessionId?: string;
@@ -112,24 +113,11 @@ export class ScreenshotWorker {
   }
 
   private schedulesDueNow(elapsedMs: number): ScreenshotSchedule[] {
-    const due: ScreenshotSchedule[] = [];
-    const toleranceMs = 500;
-
-    if (elapsedMs + toleranceMs >= this.nextSuperadminTargetMs) {
-      const schedule = scheduleForVisibility("superadmin_only");
-      if (schedule) {
-        due.push(schedule);
-      }
-    }
-
-    if (elapsedMs + toleranceMs >= this.nextDesignerTargetMs) {
-      const schedule = scheduleForVisibility("admin_and_employee");
-      if (schedule) {
-        due.push(schedule);
-      }
-    }
-
-    return due;
+    return schedulesDueAtElapsed(
+      elapsedMs,
+      this.nextSuperadminTargetMs,
+      this.nextDesignerTargetMs
+    );
   }
 
   private advanceTargetsAfterCapture(schedule: ScreenshotSchedule): void {
@@ -176,6 +164,10 @@ export class ScreenshotWorker {
     }
 
     const elapsedMs = Date.now() - this.startedAtMs;
+    const toleranceMs = 500;
+    const superadminDue = elapsedMs + toleranceMs >= this.nextSuperadminTargetMs;
+    const designerDue = elapsedMs + toleranceMs >= this.nextDesignerTargetMs;
+    const overlapBothDue = superadminDue && designerDue;
     const due = this.schedulesDueNow(elapsedMs);
 
     if (due.length === 0) {
@@ -198,7 +190,18 @@ export class ScreenshotWorker {
           error: error instanceof Error ? error.message : "unknown"
         });
       } finally {
-        this.advanceTargetsAfterCapture(schedule);
+        if (overlapBothDue) {
+          const superadminSchedule = scheduleForVisibility("superadmin_only");
+          const employeeSchedule = scheduleForVisibility("admin_and_employee");
+          if (superadminSchedule) {
+            this.advanceTargetsAfterCapture(superadminSchedule);
+          }
+          if (employeeSchedule) {
+            this.advanceTargetsAfterCapture(employeeSchedule);
+          }
+        } else {
+          this.advanceTargetsAfterCapture(schedule);
+        }
       }
     }
 
@@ -237,18 +240,8 @@ export class ScreenshotWorker {
       let lastUploadError: unknown = null;
 
       for (const size of CAPTURE_SIZES) {
-        const capture = await capturePrimaryScreenPng(size);
+        const capture = await capturePrimaryScreenJpeg(size, TARGET_SCREENSHOT_BYTES);
         if (!capture) {
-          continue;
-        }
-
-        const compressed = compressPngToJpeg(capture.png, capture.width, capture.height, TARGET_SCREENSHOT_BYTES);
-        if (!compressed) {
-          logger.warn("screenshot-compress-failed", {
-            visibility: schedule.visibility,
-            cadenceTargetMs,
-            pngBytes: capture.png.length
-          });
           continue;
         }
 
@@ -259,13 +252,13 @@ export class ScreenshotWorker {
         try {
           await this.uploadScreenshot({
             capturedAt,
-            imageBase64: compressed.buffer.toString("base64"),
+            imageBytes: capture.buffer,
             mimeType: "image/jpeg",
             projectId: this.context.projectId,
             ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
             metadata: {
-              width: compressed.width,
-              height: compressed.height,
+              width: capture.width,
+              height: capture.height,
               source: "desktop-agent",
               clientTimeZone: getClientIanaTimeZone(),
               intervalMinutes: schedule.intervalMinutes,
@@ -278,9 +271,8 @@ export class ScreenshotWorker {
               activityPeriodStartAt: periodMouse.activityPeriodStartAt,
               activityPeriodEndAt: periodMouse.activityPeriodEndAt,
               activitySampleCount: periodMouse.sampleCount,
-              jpegQuality: compressed.quality,
-              originalPngBytes: compressed.originalBytes,
-              compressedBytes: compressed.compressedBytes,
+              jpegQuality: capture.quality,
+              compressedBytes: capture.compressedBytes,
               screenSourceId: capture.sourceId,
               screenSourceName: capture.sourceName
             }
@@ -294,9 +286,8 @@ export class ScreenshotWorker {
             periodMouseSeconds: periodMouse.mouseActiveSeconds,
             projectId: this.context.projectId,
             hasSessionId: Boolean(this.context.sessionId),
-            originalPngBytes: compressed.originalBytes,
-            compressedBytes: compressed.compressedBytes,
-            jpegQuality: compressed.quality,
+            compressedBytes: capture.compressedBytes,
+            jpegQuality: capture.quality,
             screenSourceId: capture.sourceId
           });
           return;
@@ -319,7 +310,7 @@ export class ScreenshotWorker {
       if (lastUploadError) {
         throw lastUploadError;
       }
-      logger.warn("screenshot-skipped-compress-failed", {
+      logger.warn("screenshot-skipped-capture-failed", {
         visibility: schedule.visibility,
         cadenceTargetMs
       });

@@ -1,4 +1,4 @@
-import { BrowserWindow, dialog, ipcMain, app } from "electron";
+import { BrowserWindow, dialog, ipcMain, app, shell } from "electron";
 import { startSessionPowerBlocker, stopSessionPowerBlocker } from "../services/session-power";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -399,6 +399,23 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     apiBaseUrl: env.VITE_API_BASE_URL
   }));
 
+  ipcMain.handle(IPC_CHANNELS.APP_OPEN_EXTERNAL, async (_event, url: unknown) => {
+    if (typeof url !== "string" || !url.trim()) {
+      throw new Error("Invalid URL");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error("Invalid URL");
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error("Only HTTPS links are allowed");
+    }
+    await shell.openExternal(parsed.toString());
+    return { ok: true as const };
+  });
+
   ipcMain.handle(IPC_CHANNELS.CONNECTION_TEST, async () => {
     return api.testConnection();
   });
@@ -550,6 +567,38 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         descriptionLength: parsed.description.length
       });
       const startTimeUtc = new Date().toISOString();
+      const userKey = getCurrentAppUserKey();
+      if (userKey) {
+        setActiveSessionOwnerKey(userKey);
+      }
+
+      // Start tracking locally immediately (do not wait for the remote session id),
+      // so the timer and "worked today" update feel instant.
+      saveSessionState({
+        active: 1,
+        sessionId: null,
+        projectId: parsed.projectId,
+        description: parsed.description,
+        startedAt: startTimeUtc
+      });
+    clearAppFocusDedupeState();
+    clearInputActivityRollup();
+    startSessionPowerBlocker();
+      await resetAndWarmUpWindowsProbes();
+      await screenshotWorker.start({
+        projectId: catalogProject ? null : parsed.projectId,
+        sessionId: null
+      });
+      appFocusPoller.start();
+      inputActivitySampler.start();
+      sessionReminder.start();
+
+      setActiveSessionProjectName((parsed.projectName ?? parsed.projectId).trim());
+      setSetting("activeSessionIsNonChargeable", parsed.isNonChargeable ? "true" : "false");
+
+      sendSessionStatus(mainWindow, trackingOverlay);
+
+      // Remote start can be slower; update the session id once it is known.
       const result = await api.startSession(
         {
           projectId: parsed.projectId,
@@ -565,6 +614,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       if (!hasUsableWorkSessionId(sessionId)) {
         sessionId = await api.fetchActiveWorkSessionId(authContext());
       }
+
       saveSessionState({
         active: 1,
         sessionId: sessionId ?? null,
@@ -572,27 +622,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         description: parsed.description,
         startedAt: startTimeUtc
       });
-      const userKey = getCurrentAppUserKey();
-      if (userKey) {
-        setActiveSessionOwnerKey(userKey);
-      }
-    clearAppFocusDedupeState();
-    clearInputActivityRollup();
-    startSessionPowerBlocker();
-      await resetAndWarmUpWindowsProbes();
-      await screenshotWorker.start({
-        projectId: catalogProject ? null : parsed.projectId,
-        sessionId: sessionId ?? null
-      });
-      appFocusPoller.start();
-      inputActivitySampler.start();
-      sessionReminder.start();
 
-      setActiveSessionProjectName((parsed.projectName ?? parsed.projectId).trim());
-      setSetting("activeSessionIsNonChargeable", parsed.isNonChargeable ? "true" : "false");
-
-      sendSessionStatus(mainWindow, trackingOverlay);
-      await worker.flush();
+      void worker.flush();
       logger.info("tracking-session-started-local", {
         sessionId: sessionId ?? null,
         startedAt: startTimeUtc,
@@ -600,6 +631,18 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       });
       return { sessionId: sessionId ?? null };
     } catch (error) {
+      // If remote start fails after we already started local tracking, immediately stop everything.
+      try {
+        stopTrackingCapture();
+        resetActiveSessionState();
+        clearActiveSessionProjectName();
+        clearActiveSessionOwner();
+        setSetting("activeSessionIsNonChargeable", "false");
+        stopSessionPowerBlocker();
+        sendSessionStatus(mainWindow, trackingOverlay);
+      } catch {
+        // Best-effort cleanup only.
+      }
       throw asUserError(error);
     }
   });
@@ -678,37 +721,15 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       deviceUuid: stopPayload.deviceUuid ?? null
     });
 
-    let stopResult: api.SessionStopResult;
+    // Stop locally first, then sync to the server in the background.
     try {
-      logger.info("tracking-stop-followup", { step: "remote-stop-first" });
-      stopResult = await api.stopSession(stopPayload, {
-        ...authContext(),
-        onAuthRefresh: refreshAuthSession
-      });
-      logger.info("tracking-stop-flow-result", stopResult);
-    } catch (error) {
-      logger.warn("tracking-stop-remote-failed", { error });
-      stopResult = {
-        ok: true,
-        queued: false,
-        endpointPath: "/api/tracking/session/stop",
-        status: null,
-        confirmedBy: "idempotent",
-        sessionId: state.sessionId,
-        timesheetId: null,
-        responsePreview: error instanceof Error ? error.message : "Stop failed remotely; cleared locally."
-      };
-    }
-
-    try {
-      logger.info("tracking-stop-followup", { step: "flush-after-remote-stop" });
+      logger.info("tracking-stop-followup", { step: "flush-and-finalize-immediately" });
       await appFocusPoller.flushPending();
       stopTrackingCapture();
       const clearedAfterStop = clearSyntheticSessionPendingEvents();
       if (clearedAfterStop > 0) {
         logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "after-stop" });
       }
-      await worker.flush();
     } catch (error) {
       logger.warn("tracking-stop-local-cleanup-failed", { error });
     } finally {
@@ -717,7 +738,34 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       }
     }
 
-    return stopResult;
+    void (async () => {
+      try {
+        logger.info("tracking-stop-followup", { step: "remote-stop-background" });
+        const stopResult = await api.stopSession(stopPayload, {
+          ...authContext(),
+          onAuthRefresh: refreshAuthSession
+        });
+        logger.info("tracking-stop-flow-result", stopResult);
+      } catch (error) {
+        logger.warn("tracking-stop-remote-failed", { error });
+      }
+      try {
+        await worker.flush();
+      } catch (error) {
+        logger.warn("tracking-stop-background-sync-failed", { error });
+      }
+    })();
+
+    return {
+      ok: true as const,
+      queued: true,
+      endpointPath: "/api/tracking/session/stop",
+      status: null,
+      confirmedBy: "idempotent" as const,
+      sessionId: state.sessionId,
+      timesheetId: null,
+      responsePreview: null
+    };
   };
 
   stopActiveTrackingSession = performSessionStop;

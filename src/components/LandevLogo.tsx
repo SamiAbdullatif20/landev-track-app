@@ -1,3 +1,5 @@
+import logoSrc from "../../public/logo.png";
+
 type LandevLogoProps = {
   className?: string;
   alt?: string;
@@ -5,5 +7,5 @@ type LandevLogoProps = {
 
 export function LandevLogo({ className, alt = "LANDEV" }: LandevLogoProps) {
   const classes = className ? `landev-logo ${className}` : "landev-logo";
-  return <img src="/logo.png" alt={alt} className={classes} decoding="async" />;
+  return <img src={logoSrc} alt={alt} className={classes} decoding="async" />;
 }

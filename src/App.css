@@ -41,14 +41,14 @@
 }
 
 .sign-in-logo-img {
-  width: min(100%, 240px);
+  width: min(100%, 300px);
   height: auto;
   margin: 0 auto;
 }
 
 .header-logo-img {
-  height: 28px;
-  max-width: 168px;
+  height: 40px;
+  max-width: 220px;
   object-position: left center;
 }
 
@@ -82,8 +82,23 @@
   justify-content: center;
   width: 32px;
   height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
   color: var(--text-muted);
   flex-shrink: 0;
+  cursor: pointer;
+}
+
+.notification-bell-indicator:hover {
+  color: var(--blue-dark);
+  background: var(--blue-light);
+}
+
+.notification-bell-indicator:focus-visible {
+  outline: 2px solid var(--brand-blue);
+  outline-offset: 2px;
 }
 
 .notification-bell-indicator.has-unread {
@@ -135,24 +150,55 @@
 }
 
 .sound-toggle {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  height: 30px;
-  padding: 0 8px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--white);
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
+  opacity: 0.45;
   cursor: pointer;
   user-select: none;
 }
 
+.sound-toggle:hover {
+  opacity: 0.75;
+}
+
 .sound-toggle input {
-  margin: 0;
-  accent-color: var(--brand-blue);
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.sound-toggle-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.sound-toggle:has(input:not(:checked)) .sound-toggle-icon {
+  opacity: 0.55;
+}
+
+.sound-toggle:has(input:not(:checked)) .sound-toggle-icon path:last-child {
+  display: none;
 }
 
 .header-action-btn {

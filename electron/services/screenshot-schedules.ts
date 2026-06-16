@@ -65,3 +65,37 @@ export function delayMsUntilEarlierTarget(
   const untilDesigner = Math.max(0, designerTargetMs - elapsedMs);
   return Math.max(250, Math.min(untilSuperadmin, untilDesigner));
 }
+
+/** Which screenshot tiers are due at elapsed session time (10-min wins on overlap). */
+export function schedulesDueAtElapsed(
+  elapsedMs: number,
+  nextSuperadminTargetMs: number,
+  nextDesignerTargetMs: number,
+  toleranceMs = 500
+): ScreenshotSchedule[] {
+  const superadminDue = elapsedMs + toleranceMs >= nextSuperadminTargetMs;
+  const designerDue = elapsedMs + toleranceMs >= nextDesignerTargetMs;
+
+  if (superadminDue && designerDue) {
+    const employeeSchedule = scheduleForVisibility("admin_and_employee");
+    return employeeSchedule ? [employeeSchedule] : [];
+  }
+
+  const due: ScreenshotSchedule[] = [];
+
+  if (superadminDue) {
+    const schedule = scheduleForVisibility("superadmin_only");
+    if (schedule) {
+      due.push(schedule);
+    }
+  }
+
+  if (designerDue) {
+    const schedule = scheduleForVisibility("admin_and_employee");
+    if (schedule) {
+      due.push(schedule);
+    }
+  }
+
+  return due;
+}

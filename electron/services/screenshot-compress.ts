@@ -1,14 +1,11 @@
 import { nativeImage, type NativeImage } from "electron";
+import { releaseNativeImage } from "../utils/native-image";
 
 /** Target max bytes after JPEG compression (before upload). */
 export const TARGET_SCREENSHOT_BYTES = 520 * 1024;
 
 /** Prefer this JPEG quality when it still fits the byte budget. */
 export const PREFERRED_JPEG_QUALITY = 88;
-
-const JPEG_QUALITY_CEILING = 92;
-const JPEG_QUALITY_FLOOR = 68;
-const JPEG_QUALITY_FALLBACK = 58;
 
 /** Max upload width — downscale larger captures (better than crushing JPEG quality). */
 export const SCREENSHOT_MAX_UPLOAD_WIDTH = 1600;
@@ -40,49 +37,61 @@ export function computeScaledDimensions(
   };
 }
 
-function scaleImageToMaxWidth(image: NativeImage, maxWidth: number): NativeImage {
+function trackImage(images: NativeImage[], image: NativeImage): NativeImage {
+  if (!images.includes(image)) {
+    images.push(image);
+  }
+  return image;
+}
+
+function destroyTrackedImages(images: NativeImage[]): void {
+  for (const image of images) {
+    releaseNativeImage(image);
+  }
+}
+
+function scaleImageToMaxWidth(
+  images: NativeImage[],
+  image: NativeImage,
+  maxWidth: number
+): NativeImage {
   const { width, height } = image.getSize();
   const target = computeScaledDimensions(width, height, maxWidth);
   if (target.width === width && target.height === height) {
     return image;
   }
-  return image.resize({
+  const resized = image.resize({
     width: target.width,
     height: target.height,
     quality: "best"
   });
+  return trackImage(images, resized);
 }
 
-function encodeJpegUnderBudget(
+/** Linear quality steps — avoids binary-search JPEG buffer churn. */
+export const JPEG_ENCODE_QUALITIES = [PREFERRED_JPEG_QUALITY, 82, 76, 70, 64, 58] as const;
+
+export function encodeNativeImageToJpeg(
   image: NativeImage,
-  targetMaxBytes: number,
-  preferredQuality: number
+  targetMaxBytes: number = TARGET_SCREENSHOT_BYTES
 ): { buffer: Buffer; quality: number } | null {
-  const preferred = image.toJPEG(preferredQuality);
-  if (preferred.length > 0 && preferred.length <= targetMaxBytes) {
-    return { buffer: preferred, quality: preferredQuality };
+  if (image.isEmpty()) {
+    return null;
   }
 
-  let low = JPEG_QUALITY_FLOOR;
-  let high = Math.min(JPEG_QUALITY_CEILING, preferredQuality - 1);
-  let best: { buffer: Buffer; quality: number } | null = null;
-
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    const jpeg = image.toJPEG(mid);
+  let fallback: { buffer: Buffer; quality: number } | null = null;
+  for (const quality of JPEG_ENCODE_QUALITIES) {
+    const jpeg = image.toJPEG(quality);
     if (jpeg.length === 0) {
-      high = mid - 1;
       continue;
     }
+    fallback = { buffer: jpeg, quality };
     if (jpeg.length <= targetMaxBytes) {
-      best = { buffer: jpeg, quality: mid };
-      low = mid + 1;
-    } else {
-      high = mid - 1;
+      return fallback;
     }
   }
 
-  return best;
+  return fallback;
 }
 
 function buildResult(
@@ -112,30 +121,42 @@ export function compressPngToJpeg(
   height: number,
   targetMaxBytes: number = TARGET_SCREENSHOT_BYTES
 ): CompressedScreenshot | null {
-  const image = nativeImage.createFromBuffer(png);
-  if (image.isEmpty()) {
-    return null;
-  }
+  const ownedImages: NativeImage[] = [];
 
-  const originalBytes = png.length;
-
-  const attempts: Array<{ image: NativeImage; preferredQuality: number }> = [
-    { image: scaleImageToMaxWidth(image, SCREENSHOT_MAX_UPLOAD_WIDTH), preferredQuality: PREFERRED_JPEG_QUALITY },
-    { image: scaleImageToMaxWidth(image, FALLBACK_MAX_UPLOAD_WIDTH), preferredQuality: 82 }
-  ];
-
-  for (const attempt of attempts) {
-    const encoded = encodeJpegUnderBudget(attempt.image, targetMaxBytes, attempt.preferredQuality);
-    if (encoded) {
-      return buildResult(attempt.image, encoded, originalBytes);
+  try {
+    const image = trackImage(ownedImages, nativeImage.createFromBuffer(png));
+    if (image.isEmpty()) {
+      return null;
     }
-  }
 
-  const smallest = scaleImageToMaxWidth(image, FALLBACK_MAX_UPLOAD_WIDTH);
-  const fallback = smallest.toJPEG(JPEG_QUALITY_FALLBACK);
-  if (fallback.length === 0) {
-    return null;
-  }
+    const originalBytes = png.length;
 
-  return buildResult(smallest, { buffer: fallback, quality: JPEG_QUALITY_FALLBACK }, originalBytes);
+    const attempts: Array<{ image: NativeImage; preferredQuality: number }> = [
+      {
+        image: scaleImageToMaxWidth(ownedImages, image, SCREENSHOT_MAX_UPLOAD_WIDTH),
+        preferredQuality: PREFERRED_JPEG_QUALITY
+      },
+      {
+        image: scaleImageToMaxWidth(ownedImages, image, FALLBACK_MAX_UPLOAD_WIDTH),
+        preferredQuality: 82
+      }
+    ];
+
+    for (const attempt of attempts) {
+      const encoded = encodeNativeImageToJpeg(attempt.image, targetMaxBytes);
+      if (encoded) {
+        return buildResult(attempt.image, encoded, originalBytes);
+      }
+    }
+
+    const smallest = scaleImageToMaxWidth(ownedImages, image, FALLBACK_MAX_UPLOAD_WIDTH);
+    const fallback = encodeNativeImageToJpeg(smallest, targetMaxBytes);
+    if (!fallback) {
+      return null;
+    }
+
+    return buildResult(smallest, fallback, originalBytes);
+  } finally {
+    destroyTrackedImages(ownedImages);
+  }
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 const POLL_MS = 30_000;
+const NOTIFICATIONS_URL = `${import.meta.env.VITE_API_BASE_URL ?? "https://landev.vercel.app"}/admin/notifications`;
 
 export function NotificationBell() {
   const [unreadCount, setUnreadCount] = useState(0);
@@ -34,13 +35,17 @@ export function NotificationBell() {
       ? `${unreadCount} unread notification${unreadCount === 1 ? "" : "s"}`
       : "No unread notifications";
 
+  const onOpenNotifications = () => {
+    void window.desktopAPI.openExternalUrl(NOTIFICATIONS_URL);
+  };
+
   return (
-    <div
+    <button
+      type="button"
       className={`notification-bell-indicator ${unreadCount > 0 ? "has-unread" : ""}`}
-      role="status"
-      aria-live="polite"
-      aria-label={label}
-      title={label}
+      aria-label={`${label}. Open notifications in browser.`}
+      title={`${label} — open in browser`}
+      onClick={onOpenNotifications}
     >
       <svg className="notification-bell-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M12 2a5 5 0 0 0-5 5v2.1c0 .5-.2 1-.5 1.4L4.4 13.2A2 2 0 0 0 6 17h12a2 2 0 0 0 1.6-3.8l-2.1-2.7c-.3-.4-.5-.9-.5-1.4V7a5 5 0 0 0-5-5Z" />
@@ -51,6 +56,6 @@ export function NotificationBell() {
           {badgeLabel}
         </span>
       )}
-    </div>
+    </button>
   );
 }

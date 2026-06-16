@@ -87,6 +87,7 @@ declare global {
       authStatus: () => Promise<{ authenticated: boolean; roles: string[] }>;
       logout: () => Promise<{ ok: true }>;
       getAppInfo: () => Promise<AppInfo>;
+      openExternalUrl: (url: string) => Promise<{ ok: true }>;
       testConnection: () => Promise<{ reachable: boolean; message: string }>;
       getProjects: () => Promise<{ projects: Project[]; roles?: string[] }>;
       onProjectsPush: (

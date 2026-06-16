@@ -9,9 +9,10 @@ function mockSource(id: string, width: number, height: number): DesktopCapturerS
     display_id: id,
     thumbnail: {
       getSize: () => ({ width, height }),
-      toPNG: () => Buffer.alloc(10)
+      toPNG: () => Buffer.alloc(10),
+      destroy: () => undefined
     }
-  } as DesktopCapturerSource;
+  } as unknown as DesktopCapturerSource;
 }
 
 describe("pickPrimaryScreenSource", () => {

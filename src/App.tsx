@@ -359,7 +359,7 @@ function App() {
     setTrackingError(null);
     try {
       const selectedProject = projects.find((project) => project.id === session.projectId);
-      const result = await window.desktopAPI.startSession({
+      await window.desktopAPI.startSession({
         projectId: session.projectId,
         projectName: selectedProject
           ? (selectedProject.displayLabel || selectedProject.name)
@@ -367,8 +367,6 @@ function App() {
         isNonChargeable: selectedProject?.isNonChargeable,
         description: trimmedDescription
       });
-      setSession({ active: true, sessionId: result.sessionId, startedAt: new Date().toISOString() });
-      await loadWorkSummary();
       pushToast("success", "Tracking started.");
     } catch (error) {
       setTrackingError(toFriendlyMessage(error));
@@ -396,27 +394,22 @@ function App() {
     setTrackingError(null);
   };
 
-  const onStop = async () => {
+  const onStop = () => {
     if (sessionLoading || !session.active || stopInFlightRef.current) return;
     stopInFlightRef.current = true;
-    setSessionLoading(true);
     setTrackingError(null);
-    try {
-      const result = await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
-      setSession({ active: false, sessionId: null, startedAt: null });
-      await loadWorkSummary();
-      if (result.queued) {
-        pushToast("info", "Queued for sync.");
-      } else {
-        pushToast("success", "Stopped and synced.");
-      }
-    } catch (error) {
-      setTrackingError(toFriendlyMessage(error));
-      pushToast("error", "Failed to stop session.");
-    } finally {
-      setSessionLoading(false);
-      stopInFlightRef.current = false;
-    }
+    void window.desktopAPI
+      .stopSession({ stoppedAt: new Date().toISOString() })
+      .then(() => {
+        pushToast("success", "Stopped.");
+      })
+      .catch((error) => {
+        setTrackingError(toFriendlyMessage(error));
+        pushToast("error", "Failed to stop session.");
+      })
+      .finally(() => {
+        stopInFlightRef.current = false;
+      });
   };
 
   const onToggleTracking = () => {
@@ -529,7 +522,7 @@ function App() {
               </div>
               <div className="compact-header-actions">
                 <NotificationBell />
-                <label className="sound-toggle" title="Desktop notification sounds (not web dashboard)">
+                <label className="sound-toggle" title="Desktop notification sounds" aria-label="Toggle notification sounds">
                   <input
                     type="checkbox"
                     checked={notificationSoundEnabled}
@@ -539,7 +532,10 @@ function App() {
                       void window.desktopAPI.setNotificationSoundEnabled(enabled);
                     }}
                   />
-                  <span>Sounds</span>
+                  <svg className="sound-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+                    <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+                  </svg>
                 </label>
                 <button
                   type="button"

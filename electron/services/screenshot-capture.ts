@@ -1,11 +1,18 @@
-import { desktopCapturer, type DesktopCapturerSource } from "electron";
+import { desktopCapturer, type DesktopCapturerSource, type NativeImage } from "electron";
 import { logger } from "../config/logger";
+import { releaseNativeImage } from "../utils/native-image";
+import { withSilentWindowsCapture } from "../utils/windows-silent-capture";
+import {
+  PREFERRED_JPEG_QUALITY,
+  TARGET_SCREENSHOT_BYTES,
+  encodeNativeImageToJpeg
+} from "./screenshot-compress";
 
+/** Default capture size; smaller sizes only used after upload 413. */
 export const CAPTURE_SIZES = [
-  { width: 1920, height: 1080 },
-  { width: 1600, height: 900 },
-  { width: 1366, height: 768 },
-  { width: 1280, height: 720 }
+  { width: 1280, height: 720 },
+  { width: 1024, height: 576 },
+  { width: 960, height: 540 }
 ] as const;
 
 export const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
@@ -27,36 +34,103 @@ export function pickPrimaryScreenSource(sources: DesktopCapturerSource[]): Deskt
   });
 }
 
-export type ScreenCaptureResult = {
-  png: Buffer;
+export type ScreenCaptureJpegResult = {
+  buffer: Buffer;
   width: number;
   height: number;
+  quality: number;
   sourceId: string;
   sourceName: string;
+  compressedBytes: number;
 };
 
-export async function capturePrimaryScreenPng(
-  size: { width: number; height: number }
-): Promise<ScreenCaptureResult | null> {
-  const sources = await desktopCapturer.getSources({
-    types: ["screen"],
-    thumbnailSize: { width: size.width, height: size.height },
-    fetchWindowIcons: false
-  });
+function encodeThumbnailJpeg(
+  thumbnail: NativeImage,
+  targetMaxBytes: number
+): { buffer: Buffer; quality: number; width: number; height: number } | null {
+  const { width, height } = thumbnail.getSize();
+  const encoded = encodeNativeImageToJpeg(thumbnail, targetMaxBytes);
+  if (!encoded) {
+    return null;
+  }
+  return { ...encoded, width, height };
+}
+
+async function getScreenSources(size: { width: number; height: number }): Promise<DesktopCapturerSource[]> {
+  return withSilentWindowsCapture(() =>
+    desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width: size.width, height: size.height },
+      fetchWindowIcons: false
+    })
+  );
+}
+
+/**
+ * Capture primary screen as JPEG directly (no PNG round-trip).
+ * Keeps peak memory low during screenshot intervals.
+ */
+export async function capturePrimaryScreenJpeg(
+  size: { width: number; height: number },
+  targetMaxBytes: number = TARGET_SCREENSHOT_BYTES
+): Promise<ScreenCaptureJpegResult | null> {
+  const sources = await getScreenSources(size);
 
   const source = pickPrimaryScreenSource(sources);
+  for (const candidate of sources) {
+    if (candidate !== source) {
+      releaseNativeImage(candidate.thumbnail);
+    }
+  }
   if (!source) {
     logger.warn("screenshot-source-missing", { sourceCount: sources.length });
     return null;
   }
 
-  const png = source.thumbnail.toPNG();
-  if (!png || png.length === 0) {
+  const thumbnail = source.thumbnail;
+  const encoded = encodeThumbnailJpeg(thumbnail, targetMaxBytes);
+  releaseNativeImage(thumbnail);
+
+  if (!encoded || encoded.buffer.length === 0) {
     logger.warn("screenshot-empty", { sourceId: source.id, sourceName: source.name });
     return null;
   }
 
-  const { width, height } = source.thumbnail.getSize();
+  return {
+    buffer: encoded.buffer,
+    width: encoded.width,
+    height: encoded.height,
+    quality: encoded.quality,
+    sourceId: source.id,
+    sourceName: source.name,
+    compressedBytes: encoded.buffer.length
+  };
+}
+
+/** @deprecated PNG capture retained for tests only — production uses capturePrimaryScreenJpeg. */
+export async function capturePrimaryScreenPng(
+  size: { width: number; height: number }
+): Promise<{ png: Buffer; width: number; height: number; sourceId: string; sourceName: string } | null> {
+  const sources = await getScreenSources(size);
+
+  const source = pickPrimaryScreenSource(sources);
+  for (const candidate of sources) {
+    if (candidate !== source) {
+      releaseNativeImage(candidate.thumbnail);
+    }
+  }
+  if (!source) {
+    return null;
+  }
+
+  const thumbnail = source.thumbnail;
+  const { width, height } = thumbnail.getSize();
+  const png = thumbnail.toPNG();
+  releaseNativeImage(thumbnail);
+  if (!png || png.length === 0) {
+    return null;
+  }
+
   return {
     png,
     width,
@@ -65,3 +139,5 @@ export async function capturePrimaryScreenPng(
     sourceName: source.name
   };
 }
+
+export { PREFERRED_JPEG_QUALITY, TARGET_SCREENSHOT_BYTES };

@@ -22,5 +22,6 @@ export const IPC_CHANNELS = {
   APP_UPDATE_STATUS: "app:update-status",
   APP_UPDATE_CHECK: "app:update-check",
   APP_UPDATE_DOWNLOAD: "app:update-download",
-  APP_UPDATE_INSTALL: "app:update-install"
+  APP_UPDATE_INSTALL: "app:update-install",
+  APP_OPEN_EXTERNAL: "app:open-external"
 } as const;

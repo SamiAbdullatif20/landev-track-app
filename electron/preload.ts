@@ -108,6 +108,8 @@ contextBridge.exposeInMainWorld("desktopAPI", {
   authStatus: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_STATUS) as Promise<{ authenticated: boolean; roles: string[] }>,
   logout: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGOUT),
   getAppInfo: () => ipcRenderer.invoke(IPC_CHANNELS.APP_INFO) as Promise<AppInfo>,
+  openExternalUrl: (url: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.APP_OPEN_EXTERNAL, url) as Promise<{ ok: true }>,
   testConnection: () => ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{ reachable: boolean; message: string }>,
   getProjects: () =>
     ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[]; roles: string[] }>,
