@@ -29,11 +29,16 @@
       "to": ".env.prod"
     },
     {
-      "from": "build/sounds",
-      "to": "sounds"
+      "from": "build/icons/icon.ico",
+      "to": "icon.ico"
+    },
+    {
+      "from": "public/app-icon.png",
+      "to": "app-icon.png"
     }
   ],
   "npmRebuild": true,
+  "afterPack": "./scripts/embed-win-icon.cjs",
   "win": {
     "target": [
       {
@@ -51,7 +56,12 @@
     "allowToChangeInstallationDirectory": true,
     "deleteAppDataOnUninstall": true,
     "unicode": true,
-    "installerLanguages": ["en_US"]
+    "installerLanguages": ["en_US"],
+    "installerIcon": "icons/icon.ico",
+    "uninstallerIcon": "icons/icon.ico",
+    "include": "installer.nsh",
+    "createDesktopShortcut": "always",
+    "shortcutName": "LANDEV Tracker"
   },
   // GitHub Releases (recommended): set owner/repo, then publish with GH_TOKEN.
   // See RELEASE_UPDATES.md for setup and costs.

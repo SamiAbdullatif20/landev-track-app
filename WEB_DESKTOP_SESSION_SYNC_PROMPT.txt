@@ -1,0 +1,168 @@
+Copy everything below into your Landev web/backend Cursor chat.
+
+---
+
+## Task: Bidirectional session sync — desktop app ↔ web dashboard must Start/Stop together
+
+Employees use **LANDEV Tracker** (Electron) and the **web dashboard** timer. After the first Start/Stop cycle, actions on one side no longer mirror the other. Fix the web so both stay in sync for every Start/Stop, including 2nd, 3rd, … cycles in the same day.
+
+**Desktop app has been updated** to poll session state every 5 seconds and mirror web Start/Stop locally. Web must implement the matching APIs and real-time UI updates.
+
+---
+
+## Expected behavior
+
+| Action | Expected result |
+|--------|-----------------|
+| User clicks **Start** on desktop | Web timer shows **running** within ~5s |
+| User clicks **Stop** on desktop | Web timer shows **stopped** within ~5s |
+| User clicks **Start** on web | Desktop app shows **Tracking** within ~5s |
+| User clicks **Stop** on web | Desktop app shows **Paused** within ~5s |
+| Stop → Start → Stop → Start (same day) | Both sides stay aligned every time |
+
+---
+
+## Desktop → web (already implemented on desktop)
+
+Desktop calls on every user Start/Stop:
+
+### POST `/api/tracking/session/start`
+```json
+{
+  "projectId": "uuid-or-catalog",
+  "projectName": "Admin - New Task",
+  "description": "TEST",
+  "clientTimeZone": "Europe/Istanbul",
+  "workDateKey": "2026-06-18",
+  "startedAt": "2026-06-18T12:00:00.000Z",
+  "startTime": "2026-06-18T12:00:00.000Z"
+}
+```
+
+**Required response (every start, including 2nd+ same day):**
+```json
+{
+  "sessionId": "clx-new-segment-id",
+  "workSessionId": "clx-new-segment-id",
+  "active": true,
+  "workSession": {
+    "id": "clx-new-segment-id",
+    "projectId": "...",
+    "projectName": "Admin - New Task",
+    "description": "TEST",
+    "startedAt": "2026-06-18T12:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+### POST `/api/tracking/session/stop`
+```json
+{
+  "sessionId": "clx...",
+  "workSessionId": "clx...",
+  "stoppedAt": "2026-06-18T12:30:00.000Z",
+  "startedAt": "2026-06-18T12:00:00.000Z",
+  "durationMs": 1800000,
+  "workDateKey": "2026-06-18",
+  "clientTimeZone": "Europe/Istanbul",
+  "trailingEvents": [{ "eventKind": "SESSION_STOP", "occurredAtIso": "...", "workDateKey": "..." }]
+}
+```
+
+**Web must:**
+1. Set `stopTime` on the correct WorkSession row (match `sessionId` / `workSessionId`).
+2. Mark session **inactive** in DB/cache immediately.
+3. Update web UI timer to **stopped** without requiring page refresh.
+4. On **next** start, create a **new** WorkSession segment (new id) — do not reuse stopped session as “active”.
+
+---
+
+## Web → desktop (desktop polls these endpoints)
+
+Desktop polls every **5 seconds** while logged in:
+
+### GET `/api/tracking/session/active` (primary)
+### GET `/api/tracking/session/status` (fallback)
+### GET `/api/attendance/today` (fallback)
+
+**Required response when tracking is RUNNING:**
+```json
+{
+  "active": true,
+  "workSession": {
+    "id": "clx...",
+    "sessionId": "clx...",
+    "projectId": "1604",
+    "projectName": "Admin - New Task",
+    "description": "TEST",
+    "startedAt": "2026-06-18T12:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+**Required response when STOPPED:**
+```json
+{
+  "active": false,
+  "workSession": null
+}
+```
+
+Or return last session with `stoppedAt` set and `active: false`.
+
+**Critical:** After web Stop, the next poll must return `active: false` within 5 seconds. After web Start, must return `active: true` with `startedAt`, `projectId`, `projectName`, `description`.
+
+If web Start/Stop only updates React state but not the DB row these endpoints read, desktop will never mirror web.
+
+---
+
+## Common bugs to fix (likely causes)
+
+1. **Web timer is UI-only** — Start/Stop on web does not call the same APIs desktop uses, or does not persist `active` flag.
+2. **Stale session id** — 2nd desktop start reuses stopped session; status endpoint still returns old stopped session or nothing.
+3. **No real-time UI** — Desktop stop succeeds but web dashboard only reads state on full page load.
+4. **Single global “active session” cache** — Not invalidated after stop; 2nd start/stop reads wrong state.
+5. **Report/timer scoped to first session only** — After 2nd start, web shows 0:00 or wrong time (see WEB_TRACKED_TIME_FIX_PROMPT.txt).
+
+---
+
+## Web UI requirements
+
+1. **Single source of truth** — One server-side “current session for user” record (or derived query), not duplicate client-only state.
+2. **Poll or push** — Either:
+   - Poll `GET /api/tracking/session/active` every 3–5s on dashboard, **or**
+   - WebSocket/SSE to push session state changes to open tabs.
+3. **After desktop start/stop** — Web refetches active session and updates timer + “2:00 tracked” card.
+4. **After web start/stop** — Same APIs desktop calls so desktop poll sees the change.
+
+---
+
+## Acceptance tests
+
+1. Start on desktop → web shows running within 5s.
+2. Stop on desktop → web shows stopped within 5s.
+3. Start on web → desktop shows Tracking within 5s.
+4. Stop on web → desktop shows Paused within 5s.
+5. Repeat Stop/Start **5 times** — still synced every cycle.
+6. Two browser tabs — both show same state after any action.
+7. `GET /api/tracking/session/active` returns correct `active` flag after each action (verify with curl).
+
+---
+
+## Do not break
+
+- Event batch ingest, screenshots, activity metrics.
+- Multi-segment day reports (`workDateKey` aggregation).
+- Login/session cookie auth used by desktop.
+
+---
+
+## Reference files in desktop repo
+
+- `electron/services/session-remote-sync.ts` — 5s poll + mirror logic
+- `electron/services/session-remote-status.ts` — response parser
+- `electron/api/client.ts` — `fetchRemoteSessionStatus`, `startSession`, `stopSession`
+- `WEB_TRACKED_TIME_FIX_PROMPT.txt` — tracked time / multi-segment rules
+- `WEB_SESSION_REPORT_FIX_PROMPT.txt` — report query scoping

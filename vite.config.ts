@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import electron from 'vite-plugin-electron/simple'
 import react from '@vitejs/plugin-react'
 
@@ -20,6 +21,16 @@ export default defineConfig({
     electron({
       main: {
         entry: 'electron/main.ts',
+        onstart({ startup }) {
+          if (process.platform === 'win32') {
+            const devElectronPath = pathToFileURL(
+              path.join(__dirname, 'scripts', 'dev-electron-path.cjs')
+            ).href
+            startup(['.', '--no-sandbox'], {}, devElectronPath)
+            return
+          }
+          startup(['.', '--no-sandbox'])
+        },
         vite: {
           define: {
             __LANDEV_PACKAGED_ENV__: JSON.stringify(packagedEnv),

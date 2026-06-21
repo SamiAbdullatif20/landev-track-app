@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, session } from "electron";
+import { app, BrowserWindow, desktopCapturer, nativeImage, session } from "electron";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
@@ -7,6 +7,7 @@ import { logger } from "./config/logger";
 import dotenv from "dotenv";
 import { setupCrashAndDiagnostics } from "./services/diagnostics";
 import { setupAutoUpdate } from "./services/auto-update";
+import { refreshWindowsShortcuts } from "./services/windows-shortcut-icon";
 import { readEnv } from "./config/env";
 import { applyPackagedEnvDefaults } from "./config/packaged-defaults";
 
@@ -32,9 +33,8 @@ function loadEnvFiles(): void {
 loadEnvFiles();
 
 /** Windows toast AUMID — required for Notification sounds/toasts on Windows 10/11. */
-const WINDOWS_APP_USER_MODEL_ID = "com.landev.track";
 if (process.platform === "win32") {
-  app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
+  app.setAppUserModelId(app.isPackaged ? "com.landev.track" : "com.landev.track.dev");
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -93,14 +93,44 @@ function setupDisplayMediaHandler(): void {
   });
 }
 
+function resolveAppIconPath(): string {
+  const candidates: string[] = [];
+  if (app.isPackaged) {
+    candidates.push(
+      path.join(process.resourcesPath, "icon.ico"),
+      path.join(process.resourcesPath, "app-icon.png")
+    );
+  }
+  candidates.push(
+    path.join(process.env.APP_ROOT, "build", "icons", "icon.ico"),
+    path.join(process.env.VITE_PUBLIC, "app-icon.png")
+  );
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[candidates.length - 1];
+}
+
+function loadAppIcon() {
+  const iconPath = resolveAppIconPath();
+  if (!fs.existsSync(iconPath)) {
+    return undefined;
+  }
+  const image = nativeImage.createFromPath(iconPath);
+  return image.isEmpty() ? undefined : image;
+}
+
 function createWindow() {
+  const windowIcon = loadAppIcon();
   win = new BrowserWindow({
     width: 400,
     height: 720,
     minWidth: 360,
     minHeight: 560,
     title: "LANDEV Tracker",
-    icon: path.join(process.env.APP_ROOT, "public", "logo.png"),
+    ...(windowIcon ? { icon: windowIcon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.mjs"),
       contextIsolation: true,
@@ -156,6 +186,9 @@ app.whenReady().then(() => {
   readEnv();
   setupCrashAndDiagnostics();
   setupDisplayMediaHandler();
+  if (process.platform === "win32" && app.isPackaged) {
+    refreshWindowsShortcuts();
+  }
   createWindow();
   if (win) {
     setupAutoUpdate(win);

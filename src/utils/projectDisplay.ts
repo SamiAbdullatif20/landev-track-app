@@ -1,7 +1,11 @@
 import type { Project } from "../store/trackingStore";
 
-/** Primary line in picker trigger and list rows (project number for client jobs). */
+/** Primary line in picker trigger and list rows (project name). */
 export function getProjectDisplayLabel(project: Pick<Project, "displayLabel" | "name" | "projectNumber">): string {
+  const name = project.name.trim();
+  if (name) {
+    return name;
+  }
   const label = project.displayLabel?.trim();
   if (label) {
     return label;
@@ -10,7 +14,7 @@ export function getProjectDisplayLabel(project: Pick<Project, "displayLabel" | "
   if (number) {
     return number;
   }
-  return project.name.trim();
+  return "Unnamed project";
 }
 
 function searchFields(project: Project): string[] {

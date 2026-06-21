@@ -362,7 +362,7 @@ function App() {
       await window.desktopAPI.startSession({
         projectId: session.projectId,
         projectName: selectedProject
-          ? (selectedProject.displayLabel || selectedProject.name)
+          ? selectedProject.name || selectedProject.displayLabel
           : undefined,
         isNonChargeable: selectedProject?.isNonChargeable,
         description: trimmedDescription

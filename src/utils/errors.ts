@@ -9,7 +9,8 @@ export function toFriendlyMessage(raw: unknown): string {
   }
 
   if (raw.message.startsWith("AUTH:")) {
-    return "Authentication issue. Please log in again.";
+    const detail = raw.message.replace("AUTH:", "").trim();
+    return detail || "Invalid username or password.";
   }
 
   if (raw.message.startsWith("VALIDATION:")) {

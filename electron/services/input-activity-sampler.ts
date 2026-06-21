@@ -22,6 +22,7 @@ export class InputActivitySampler {
   private maxIdleMsInWindow = 0;
   private lastSampleX: number | null = null;
   private lastSampleY: number | null = null;
+  private pollTravelPx: number[] = [];
   private runGeneration = 0;
 
   start(): void {
@@ -34,6 +35,7 @@ export class InputActivitySampler {
     this.maxIdleMsInWindow = 0;
     this.lastSampleX = null;
     this.lastSampleY = null;
+    this.pollTravelPx = [];
     this.lastIdleMs = 0;
 
     logger.info("input-activity-sampler-started", {
@@ -82,6 +84,9 @@ export class InputActivitySampler {
     if (isMouseActivePoll(travelPx, snapshot.scrollCount)) {
       this.pollsWithSignificantMovement += 1;
     }
+    if (travelPx > 0) {
+      this.pollTravelPx.push(travelPx);
+    }
     this.lastSampleX = snapshot.x;
     this.lastSampleY = snapshot.y;
     this.lastIdleMs = snapshot.idleMs;
@@ -117,6 +122,8 @@ export class InputActivitySampler {
     this.pollCount = 0;
     this.pollsWithSignificantMovement = 0;
     this.maxIdleMsInWindow = 0;
+    const pollTravelPx = this.pollTravelPx;
+    this.pollTravelPx = [];
 
     await recordInputActivityEvent({
       mouseMoveCount: drained.mouseMoveCount,
@@ -130,6 +137,7 @@ export class InputActivitySampler {
       mouseMoveSamples,
       mouseMovePercent,
       mouseActiveSeconds,
+      pollTravelPx,
       triggerType
     });
   }

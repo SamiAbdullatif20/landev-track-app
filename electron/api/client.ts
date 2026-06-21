@@ -7,6 +7,10 @@ import { API_ENDPOINTS } from "./endpoints";
 import { logger } from "../config/logger";
 import { getSetting, setSetting } from "../db/queue-repo";
 import { isCatalogProjectId, isNonChargeableProjectName } from "../config/role-project-catalog";
+import { parseRemoteSessionStatus, type RemoteSessionStatus } from "../services/session-remote-status";
+import { formatAxiosErrorBody, formatUnknownErrorMessage } from "./error-message";
+
+export type { RemoteSessionStatus };
 
 export type LoginInput = {
   username: string;
@@ -123,7 +127,12 @@ export type AuthAwareRequestOptions = RequestOptions & {
   onAuthRefresh?: () => Promise<RequestOptions | null>;
 };
 
-export const BATCH_TRACKING_EVENT_KINDS = ["INPUT_ACTIVITY", "APP_FOCUS", "HEARTBEAT"] as const;
+export const BATCH_TRACKING_EVENT_KINDS = [
+  "INPUT_ACTIVITY",
+  "APP_FOCUS",
+  "HEARTBEAT",
+  "ACTIVITY_INTERVAL"
+] as const;
 
 export type TrackingBatchEventInput = TrackingEventInput & {
   eventUuid: string;
@@ -146,9 +155,13 @@ function getClient() {
   return client;
 }
 
-const loginResponseSchema = z.object({
-  token: z.string().optional()
-});
+const loginResponseSchema = z
+  .object({
+    token: z.string().optional(),
+    accessToken: z.string().optional(),
+    access_token: z.string().optional()
+  })
+  .passthrough();
 const projectSchema = z.object({
   id: z.union([z.string(), z.number()]).transform((value) => String(value)),
   name: z
@@ -311,10 +324,11 @@ function asStringOrNull(value: unknown): string | null {
 function mapAxiosError(error: unknown): ApiError {
   if (error instanceof z.ZodError) {
     const firstIssue = error.issues[0];
-    return new ApiError(
-      "validation",
-      firstIssue?.message ?? "Response validation failed for backend payload."
-    );
+    const issueMessage =
+      formatUnknownErrorMessage(firstIssue)
+      ?? firstIssue?.message
+      ?? "Response validation failed for backend payload.";
+    return new ApiError("validation", issueMessage);
   }
 
   if (!axios.isAxiosError(error)) {
@@ -324,25 +338,22 @@ function mapAxiosError(error: unknown): ApiError {
     return new ApiError("server", "Unexpected error while talking to server.");
   }
 
-  const axiosError = error as AxiosError<{ message?: string; error?: string; errors?: string[] }>;
+  const axiosError = error as AxiosError<unknown>;
   if (!axiosError.response) {
     return new ApiError("network", "Network unavailable. Check your connection and retry.");
   }
 
-  if (axiosError.response.status === 401 || axiosError.response.status === 403) {
-    return new ApiError("auth", "Session expired or unauthorized. Please log in again.");
+  const status = axiosError.response.status;
+  if (status === 401 || status === 403) {
+    const details = formatAxiosErrorBody(axiosError.response.data, status);
+    return new ApiError("auth", details);
   }
 
-  if (axiosError.response.status >= 500) {
-    return new ApiError("server", "Server is currently unavailable. Try again shortly.");
+  if (status >= 500) {
+    return new ApiError("server", formatAxiosErrorBody(axiosError.response.data, status));
   }
 
-  const details =
-    axiosError.response.data?.message
-    ?? axiosError.response.data?.error
-    ?? axiosError.response.data?.errors?.[0]
-    ?? `Request failed with status ${axiosError.response.status}.`;
-  return new ApiError("validation", details);
+  return new ApiError("validation", formatAxiosErrorBody(axiosError.response.data, status));
 }
 
 export async function withAuthRetry<T>(
@@ -517,8 +528,8 @@ export async function fetchActiveWorkSessionId(options: RequestOptions): Promise
   const client = getClient();
   const headers = authHeader(options);
   const paths = [
-    "/api/tracking/session/active",
-    "/api/tracking/session/status",
+    API_ENDPOINTS.tracking.sessionActive,
+    API_ENDPOINTS.tracking.sessionStatus,
     ...API_ENDPOINTS.attendance.today
   ];
 
@@ -543,6 +554,58 @@ export async function fetchActiveWorkSessionId(options: RequestOptions): Promise
   }
 
   return null;
+}
+
+/** Poll web for the user's current session (active or stopped). */
+export async function fetchRemoteSessionStatus(
+  options: AuthAwareRequestOptions
+): Promise<RemoteSessionStatus> {
+  const client = getClient();
+  const headers = authHeader(options);
+  const paths = [
+    API_ENDPOINTS.tracking.sessionActive,
+    API_ENDPOINTS.tracking.sessionStatus,
+    ...API_ENDPOINTS.attendance.today
+  ];
+
+  for (const path of paths) {
+    try {
+      const response = await client.get(path, { headers });
+      persistCookieIfPresent(response, options);
+      const parsed = parseRemoteSessionStatus(response.data);
+      if (!parsed) {
+        continue;
+      }
+      if (parsed.sessionId && !shouldSendSessionId(parsed.sessionId)) {
+        parsed.sessionId = null;
+      }
+      logger.info("remote-session-status", {
+        path,
+        active: parsed.active,
+        hasSessionId: Boolean(parsed.sessionId)
+      });
+      return parsed;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        continue;
+      }
+      logger.warn("remote-session-status-failed", {
+        path,
+        error: error instanceof Error ? error.message : "unknown"
+      });
+    }
+  }
+
+  return {
+    active: false,
+    sessionId: null,
+    projectId: null,
+    projectName: null,
+    description: null,
+    startedAt: null,
+    stoppedAt: null,
+    source: null
+  };
 }
 
 async function firstSuccess<T>(paths: readonly string[], call: (path: string) => Promise<T>): Promise<T> {
@@ -673,25 +736,57 @@ export async function fetchUserRoles(options: RequestOptions): Promise<string[]>
   return readCachedUserRoles();
 }
 
+function buildLoginBody(payload: LoginInput): Record<string, string> {
+  const username = payload.username.trim();
+  const body: Record<string, string> = {
+    username,
+    password: payload.password
+  };
+  if (username.includes("@")) {
+    body.email = username;
+  }
+  return body;
+}
+
+function extractLoginToken(data: unknown): string | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+  const record = data as Record<string, unknown>;
+  return (
+    asStringOrNull(record.token)
+    ?? asStringOrNull(record.accessToken)
+    ?? asStringOrNull(record.access_token)
+  );
+}
+
 export async function login(payload: LoginInput, options: RequestOptions): Promise<{ token: string | null; sessionCookie: string | null; roles: string[] }> {
   return withRetry(async () => {
     const client = getClient();
     const finalUrl = `${client.defaults.baseURL}${API_ENDPOINTS.auth.login}`;
     logger.info("auth-login-request", { url: finalUrl, username: payload.username, hasCookie: Boolean(options.sessionCookie) });
     try {
-      const response = await client.post(API_ENDPOINTS.auth.login, {
-        username: payload.username,
-        password: payload.password
-      }, { headers: authHeader(options) });
+      const response = await client.post(API_ENDPOINTS.auth.login, buildLoginBody(payload), {
+        headers: authHeader(options)
+      });
       persistCookieIfPresent(response, options);
-      const parsed = loginResponseSchema.parse(response.data);
+      const parsed = loginResponseSchema.safeParse(response.data);
+      if (!parsed.success) {
+        logger.warn("auth-login-response-shape-unexpected", {
+          issues: parsed.error.issues.map((issue) => issue.message).slice(0, 3)
+        });
+      }
       const sessionCookie = extractCookieHeader(response.headers["set-cookie"] as string[] | undefined);
+      const token = extractLoginToken(response.data);
       const loginRoles = extractRolesFromPayload(response.data);
       if (loginRoles.length > 0) {
         saveCachedUserRoles(loginRoles);
       }
       const roles = loginRoles.length > 0 ? loginRoles : await fetchUserRoles(options);
-      return { token: parsed.token ?? null, sessionCookie, roles };
+      if (!token && !sessionCookie && roles.length === 0) {
+        throw new ApiError("auth", "Login did not return a session. Check your username and password.");
+      }
+      return { token, sessionCookie, roles };
     } catch (error) {
       if (axios.isAxiosError(error) && error.response) {
         const preview =

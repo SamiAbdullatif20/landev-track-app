@@ -5,6 +5,13 @@ import { logger } from "../config/logger";
 import { collectActivityContext } from "./activity-metadata";
 import { buildWorkSessionEventFields } from "./session-event-fields";
 import { buildTrackingMetadata } from "./tracking-event-utils";
+import { applyAntiCheatFilter } from "./activity-anti-cheat";
+import { computeSampleActivityScore } from "./activity-score";
+import {
+  ingestActivityIntervalSubsample,
+  type ActivityIntervalSubsample
+} from "./activity-interval-tracker";
+import { recordActivityIntervalEvent } from "./tracking-activity-interval";
 import {
   recordInputActivityRollupSample
 } from "./input-activity-rollup";
@@ -22,6 +29,7 @@ export type InputActivitySample = {
   mouseActiveSeconds?: number;
   totalSamples?: number;
   triggerType?: string;
+  pollTravelPx?: number[];
 };
 
 function shouldSkipAllZero(sample: InputActivitySample, eventKind: "INPUT_ACTIVITY" | "HEARTBEAT"): boolean {
@@ -61,6 +69,25 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
       ? Math.min(100, Math.max(0, Number(sample.mouseMovePercent.toFixed(2))))
       : Number(((mouseActiveSeconds / windowSeconds) * 100).toFixed(2));
 
+  const antiCheat = applyAntiCheatFilter({
+    mouseMoveCount: sample.mouseMoveCount,
+    keyPressCount: sample.keyPressCount,
+    clickCount: sample.clickCount ?? 0,
+    scrollCount: sample.scrollCount ?? 0,
+    mouseActiveSeconds,
+    activeSeconds: sample.activeSeconds,
+    windowSeconds,
+    pollTravelPx: sample.pollTravelPx
+  });
+  const activityMetrics = computeSampleActivityScore({
+    validKeyboardSeconds: antiCheat.validKeyboardSeconds,
+    validMouseSeconds: antiCheat.validMouseSeconds,
+    trackedSeconds: windowSeconds
+  });
+  const estimatedEfficiencyPercent = Number(
+    ((sample.activeSeconds / windowSeconds) * 100).toFixed(2)
+  );
+
   const built = buildTrackingMetadata({
     source: "tracking-input-activity",
     projectId: state.projectId,
@@ -91,6 +118,12 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     mouseActiveSeconds,
     activeSeconds: sample.activeSeconds,
     idleSeconds: sample.idleSeconds,
+    keyboardActivityPercent: activityMetrics.keyboardActivityPercent,
+    mouseActivityPercent: activityMetrics.mouseActivityPercent,
+    activityScore: activityMetrics.activityScore,
+    estimatedEfficiencyPercent,
+    activityLevel: activityMetrics.activityLevel,
+    timelineColor: activityMetrics.timelineColor,
     trackerElapsedMs: sample.trackerElapsedMs,
     application: built.metadata.application,
     processName: built.metadata.processName,
@@ -106,6 +139,15 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
       mouseActiveSeconds,
       activeSeconds: sample.activeSeconds,
       idleSeconds: sample.idleSeconds,
+      validKeyboardSeconds: antiCheat.validKeyboardSeconds,
+      validMouseSeconds: antiCheat.validMouseSeconds,
+      keyboardActivityPercent: activityMetrics.keyboardActivityPercent,
+      mouseActivityPercent: activityMetrics.mouseActivityPercent,
+      activityScore: activityMetrics.activityScore,
+      estimatedEfficiencyPercent,
+      activityLevel: activityMetrics.activityLevel,
+      timelineColor: activityMetrics.timelineColor,
+      antiCheatFlags: antiCheat.flags,
       trackerElapsedMs: sample.trackerElapsedMs,
       clientTimeZone: getClientIanaTimeZone(),
       hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
@@ -116,9 +158,26 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
   enqueueEvent(eventKind, payload);
   recordInputActivityRollupSample({
     endedAtMs: Date.parse(occurredAtIso),
-    mouseActiveSeconds,
+    mouseActiveSeconds: antiCheat.validMouseSeconds,
+    keyboardActiveSeconds: antiCheat.validKeyboardSeconds,
+    activeSeconds: sample.activeSeconds,
     trackerElapsedMs: sample.trackerElapsedMs
   });
+
+  const intervalSubsample: ActivityIntervalSubsample = {
+    endedAtMs: Date.parse(occurredAtIso),
+    trackedSeconds: windowSeconds,
+    activeSeconds: sample.activeSeconds,
+    idleSeconds: sample.idleSeconds,
+    validKeyboardSeconds: antiCheat.validKeyboardSeconds,
+    validMouseSeconds: antiCheat.validMouseSeconds,
+    antiCheatFlags: antiCheat.flags
+  };
+  const completedIntervals = ingestActivityIntervalSubsample(intervalSubsample);
+  for (const interval of completedIntervals) {
+    await recordActivityIntervalEvent(interval);
+  }
+
   logger.info("input-activity-sample", payload);
   return true;
 }

@@ -5,6 +5,8 @@ import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
 import { IPC_CHANNELS } from "./channels";
 import { eventSchema, loginSchema, startSchema, stopSchema } from "./schemas";
+import { formatUnknownErrorMessage } from "../api/error-message";
+import { z } from "zod";
 import * as api from "../api/client";
 import {
   clearSessionCookie,
@@ -58,6 +60,8 @@ import {
 import { recordInputActivityEvent } from "../services/tracking-input-activity";
 import { clearAppFocusDedupeState } from "../services/tracking-app-focus";
 import { clearInputActivityRollup } from "../services/input-activity-rollup";
+import { clearActivityIntervalTracker } from "../services/activity-interval-tracker";
+import { flushPendingActivityIntervals } from "../services/tracking-activity-interval";
 import {
   clearLocalNotificationUnreadCount,
   getLocalNotificationUnreadCount,
@@ -75,6 +79,7 @@ import {
   DESIGNER_PROJECT_NAMES,
   isCatalogProjectId,
   isModeratorRole,
+  isNonChargeableProjectName,
   mergeCatalogWithApi,
   MODERATOR_PROJECT_NAMES,
   resolveProjectsForRoles
@@ -88,6 +93,8 @@ import {
   setActiveSessionProjectName
 } from "../db/work-log";
 import { TrackingOverlayManager } from "../services/tracking-overlay";
+import { SessionRemoteSyncService } from "../services/session-remote-sync";
+import type { RemoteSessionStatus } from "../services/session-remote-status";
 
 let stopActiveTrackingSession: ((stoppedAt: string) => Promise<api.SessionStopResult>) | null = null;
 
@@ -107,6 +114,15 @@ export async function stopActiveSessionIfRunning(): Promise<boolean> {
 function asUserError(error: unknown): Error {
   if (error instanceof api.ApiError) {
     return new Error(`${error.kind.toUpperCase()}: ${error.message}`);
+  }
+
+  if (error instanceof z.ZodError) {
+    const issue = error.issues[0];
+    const message =
+      formatUnknownErrorMessage(issue)
+      ?? issue?.message
+      ?? "Invalid request.";
+    return new Error(`VALIDATION: ${message}`);
   }
 
   if (error instanceof Error) {
@@ -166,6 +182,34 @@ function clampSeconds(value: number | null): number {
   return Math.min(MAX_PER_EVENT_SECONDS, Math.max(0, value));
 }
 
+function resolveRemoteProject(remote: RemoteSessionStatus): {
+  projectId: string;
+  projectName: string;
+  isNonChargeable: boolean;
+} | null {
+  const projectName = remote.projectName?.trim();
+  const projectId = remote.projectId?.trim();
+  if (projectId) {
+    return {
+      projectId,
+      projectName: projectName ?? projectId,
+      isNonChargeable: isCatalogProjectId(projectId) || (projectName ? isNonChargeableProjectName(projectName) : false)
+    };
+  }
+  if (projectName) {
+    const slug = projectName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return {
+      projectId: `catalog:${slug || "unknown"}`,
+      projectName,
+      isNonChargeable: isNonChargeableProjectName(projectName)
+    };
+  }
+  return null;
+}
+
 export function registerIpc(mainWindow: BrowserWindow): void {
   registerNotificationBadgeWindow(mainWindow);
   const env = readEnv();
@@ -198,17 +242,17 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   const startLiveSync = (): void => {
     projectSync.start();
     worker.start();
+    sessionRemoteSync?.start();
   };
 
   const stopLiveSync = (): void => {
+    sessionRemoteSync?.stop();
     projectSync.stop();
     worker.stop();
   };
 
-  if (isAuthenticated()) {
-    startLiveSync();
-    void projectSync.syncNow();
-  }
+  let sessionRemoteSync: SessionRemoteSyncService | undefined;
+
   const clearedOnBoot = clearSyntheticSessionPendingEvents();
   if (clearedOnBoot > 0) {
     logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedOnBoot });
@@ -229,7 +273,9 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     sessionReminder.stop();
     stopAllWindowsProbeSessions();
     clearAppFocusDedupeState();
+    void flushPendingActivityIntervals();
     clearInputActivityRollup();
+    clearActivityIntervalTracker();
   };
 
   const notifySessionStatus = (): void => {
@@ -442,7 +488,9 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         saveSessionCookie(result.sessionCookie);
       }
       startLiveSync();
-      await Promise.all([worker.flush(), projectSync.syncNow()]);
+      void Promise.all([worker.flush(), projectSync.syncNow()]).catch((syncError) => {
+        logger.warn("auth-login-post-sync-failed", { error: syncError });
+      });
       const roles = result.roles.length > 0 ? result.roles : await fetchUserRoles(authContext());
       return { ok: true, roles };
     } catch (error) {
@@ -548,6 +596,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.SESSION_START, async (_event, payload) => {
     try {
+      sessionRemoteSync?.markLocalUserAction();
       const parsed = startSchema.parse(payload);
       const currentState = getSessionState();
 
@@ -572,29 +621,14 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         setActiveSessionOwnerKey(userKey);
       }
 
-      // Start tracking locally immediately (do not wait for the remote session id),
-      // so the timer and "worked today" update feel instant.
-      saveSessionState({
-        active: 1,
-        sessionId: null,
+      await startLocalCapture({
         projectId: parsed.projectId,
+        projectName: (parsed.projectName ?? parsed.projectId).trim(),
         description: parsed.description,
-        startedAt: startTimeUtc
+        startedAt: startTimeUtc,
+        sessionId: null,
+        isNonChargeable: parsed.isNonChargeable ?? catalogProject
       });
-    clearAppFocusDedupeState();
-    clearInputActivityRollup();
-    startSessionPowerBlocker();
-      await resetAndWarmUpWindowsProbes();
-      await screenshotWorker.start({
-        projectId: catalogProject ? null : parsed.projectId,
-        sessionId: null
-      });
-      appFocusPoller.start();
-      inputActivitySampler.start();
-      sessionReminder.start();
-
-      setActiveSessionProjectName((parsed.projectName ?? parsed.projectId).trim());
-      setSetting("activeSessionIsNonChargeable", parsed.isNonChargeable ? "true" : "false");
 
       sendSessionStatus(mainWindow, trackingOverlay);
 
@@ -703,10 +737,30 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   };
 
   const performSessionStop = async (stoppedAt: string): Promise<api.SessionStopResult> => {
-    const state = getSessionState();
+    sessionRemoteSync?.markLocalUserAction();
+
+    let state = getSessionState();
 
     if ((!readToken() && !readSessionCookie()) || !state.active) {
       throw new Error("VALIDATION: No active session to stop.");
+    }
+
+    if (!hasUsableWorkSessionId(state.sessionId)) {
+      try {
+        const resolved = await api.fetchActiveWorkSessionId(authContext());
+        if (hasUsableWorkSessionId(resolved)) {
+          saveSessionState({
+            active: state.active,
+            sessionId: resolved,
+            projectId: state.projectId,
+            description: state.description,
+            startedAt: state.startedAt
+          });
+          state = getSessionState();
+        }
+      } catch (error) {
+        logger.warn("tracking-stop-session-id-resolve-failed", { error });
+      }
     }
 
     const stopPayload = buildSessionStopInput(state, stoppedAt);
@@ -770,6 +824,124 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   stopActiveTrackingSession = performSessionStop;
   registerSessionPowerLifecycle(performSessionStop);
+
+  const performLocalSessionStopOnly = async (stoppedAt: string): Promise<void> => {
+    const state = getSessionState();
+    if (!state.active) {
+      return;
+    }
+    try {
+      await appFocusPoller.flushPending();
+      stopTrackingCapture();
+      const clearedAfterStop = clearSyntheticSessionPendingEvents();
+      if (clearedAfterStop > 0) {
+        logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "mirror-stop" });
+      }
+    } catch (error) {
+      logger.warn("mirror-stop-local-cleanup-failed", { error });
+    } finally {
+      if (getSessionState().active) {
+        finalizeLocalSessionStop(state, stoppedAt);
+      }
+    }
+    try {
+      await worker.flush();
+    } catch (error) {
+      logger.warn("mirror-stop-flush-failed", { error });
+    }
+  };
+
+  const startLocalCapture = async (input: {
+    projectId: string;
+    projectName: string;
+    description: string;
+    startedAt: string;
+    sessionId: string | null;
+    isNonChargeable: boolean;
+  }): Promise<void> => {
+    const userKey = getCurrentAppUserKey();
+    if (userKey) {
+      setActiveSessionOwnerKey(userKey);
+    }
+
+    saveSessionState({
+      active: 1,
+      sessionId: input.sessionId,
+      projectId: input.projectId,
+      description: input.description,
+      startedAt: input.startedAt
+    });
+    clearAppFocusDedupeState();
+    clearInputActivityRollup();
+    clearActivityIntervalTracker();
+    startSessionPowerBlocker();
+    await resetAndWarmUpWindowsProbes();
+    await screenshotWorker.start({
+      projectId: isCatalogProjectId(input.projectId) ? null : input.projectId,
+      sessionId: input.sessionId
+    });
+    appFocusPoller.start();
+    inputActivitySampler.start();
+    sessionReminder.start();
+    setActiveSessionProjectName(input.projectName);
+    setSetting("activeSessionIsNonChargeable", input.isNonChargeable ? "true" : "false");
+  };
+
+  sessionRemoteSync = new SessionRemoteSyncService(mainWindow, {
+    getLocalState: () => {
+      const state = normalizeSessionState();
+      return {
+        active: state.active,
+        sessionId: state.sessionId,
+        startedAt: state.startedAt
+      };
+    },
+    mirrorStart: async (remote) => {
+      if (getSessionState().active) {
+        return;
+      }
+      if (getSetting("trackingConsentAccepted") !== "true") {
+        return;
+      }
+      const project = resolveRemoteProject(remote);
+      if (!project) {
+        logger.warn("session-remote-sync-mirror-start-skipped", { reason: "missing-project" });
+        return;
+      }
+      const startedAt = remote.startedAt ?? new Date().toISOString();
+      await startLocalCapture({
+        projectId: project.projectId,
+        projectName: project.projectName,
+        description: remote.description?.trim() || "Web session",
+        startedAt,
+        sessionId: hasUsableWorkSessionId(remote.sessionId) ? remote.sessionId : null,
+        isNonChargeable: project.isNonChargeable
+      });
+    },
+    mirrorStop: async (stoppedAt) => {
+      await performLocalSessionStopOnly(stoppedAt);
+    },
+    updateSessionId: (sessionId) => {
+      const state = getSessionState();
+      if (!state.active || !hasUsableWorkSessionId(sessionId)) {
+        return;
+      }
+      saveSessionState({
+        active: state.active,
+        sessionId,
+        projectId: state.projectId,
+        description: state.description,
+        startedAt: state.startedAt
+      });
+    },
+    notifyStatus: notifySessionStatus
+  });
+
+  if (isAuthenticated()) {
+    startLiveSync();
+    void projectSync.syncNow();
+  }
+
   void recoverOrphanedActiveSessionOnBoot();
 
   ipcMain.handle(IPC_CHANNELS.SESSION_STOP, async (_event, payload) => {

@@ -10,7 +10,9 @@ export const API_ENDPOINTS = {
     eventsBatch: "/api/tracking/events/batch",
     screenshotsIngest: ["/api/tracking/screenshots/ingest", "/tracking/screenshots/ingest"],
     sessionStart: "/api/tracking/session/start",
-    sessionStop: "/api/tracking/session/stop"
+    sessionStop: "/api/tracking/session/stop",
+    sessionActive: "/api/tracking/session/active",
+    sessionStatus: "/api/tracking/session/status"
   },
   attendance: {
     today: ["/api/attendance/today", "/attendance/today"]

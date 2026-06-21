@@ -1,6 +1,8 @@
 export type InputActivitySampleRecord = {
   endedAtMs: number;
   mouseActiveSeconds: number;
+  keyboardActiveSeconds: number;
+  activeSeconds: number;
   windowSeconds: number;
 };
 
@@ -15,12 +17,16 @@ export function clearInputActivityRollup(): void {
 export function recordInputActivityRollupSample(input: {
   endedAtMs?: number;
   mouseActiveSeconds: number;
+  keyboardActiveSeconds?: number;
+  activeSeconds?: number;
   trackerElapsedMs: number;
 }): void {
   const endedAtMs = input.endedAtMs ?? Date.now();
   samples.push({
     endedAtMs,
     mouseActiveSeconds: Math.max(0, input.mouseActiveSeconds),
+    keyboardActiveSeconds: Math.max(0, input.keyboardActiveSeconds ?? 0),
+    activeSeconds: Math.max(0, input.activeSeconds ?? 0),
     windowSeconds: Math.max(0.001, input.trackerElapsedMs / 1000)
   });
 

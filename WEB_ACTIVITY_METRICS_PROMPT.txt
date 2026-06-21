@@ -1,0 +1,114 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Implement Traqq-style Activity Metrics & Timeline (match desktop tracker)
+
+The Electron desktop app now emits **15-minute activity intervals** and enriched **15-second INPUT_ACTIVITY** samples. Implement the same rules on the web for session reports, employee dashboards, and admin timelines.
+
+### Metric definitions (must match desktop exactly)
+
+#### Activity Score
+- Based on **valid keyboard activity** + **valid mouse activity** after anti-cheat filtering.
+- For any window (15s sample or 15-min interval):
+
+```ts
+keyboardActivityPercent = (validKeyboardSeconds / trackedSeconds) * 100
+mouseActivityPercent = (validMouseSeconds / trackedSeconds) * 100
+activityScore = round((keyboardActivityPercent + mouseActivityPercent) / 2)
+```
+
+#### Estimated Efficiency
+```ts
+estimatedEfficiencyPercent = (activeSeconds / trackedSeconds) * 100
+```
+- `activeSeconds` = time with meaningful input (not system idle).
+- `idleSeconds` = periods with no meaningful keyboard or mouse activity.
+
+#### Rollups
+- **Daily Activity** = average of all **15-minute interval** `activityScore` values for that employee day.
+- **Weekly Activity** = average of all interval scores in the week.
+- **Monthly Activity** = average of all interval scores in the month.
+- Use **simple average of interval scores**, not weighted by session length.
+
+#### Anti-cheat filtering
+Desktop flags and filters before scoring; web should trust `valid*Seconds` but may show flags in admin UI:
+- `repetitive_clicking`
+- `artificial_mouse_movement`
+
+---
+
+### Event types from desktop
+
+#### `INPUT_ACTIVITY` (every ~15s)
+New optional fields (top-level + `metadata`):
+- `validKeyboardSeconds`, `validMouseSeconds`
+- `keyboardActivityPercent`, `mouseActivityPercent`
+- `activityScore`, `estimatedEfficiencyPercent`
+- `activityLevel`: `high` | `medium` | `low` | `idle`
+- `timelineColor`: `green` | `orange` | `red` | `gray`
+- `antiCheatFlags`: string[]
+
+#### `ACTIVITY_INTERVAL` (new — every 15 minutes, wall-clock in employee timezone)
+Add to batch ingest allowlist.
+
+Key fields: `intervalMinutes` (15), `intervalStartAt`, `intervalEndAt`, `trackedSeconds`, `activeSeconds`, `idleSeconds`, `validKeyboardSeconds`, `validMouseSeconds`, `keyboardActivityPercent`, `mouseActivityPercent`, `activityScore`, `estimatedEfficiencyPercent`, `activityLevel`, `timelineColor`, `metadata.antiCheatFlags`, `metadata.sampleCount`.
+
+Upsert by `(userId, intervalStartAt)` to avoid duplicates.
+
+---
+
+### Timeline rendering
+
+1. Split day into **15-minute wall-clock blocks** in `clientTimeZone`.
+2. Render **each block separately** (do not merge same-color neighbors).
+3. Color mapping:
+   - Green = 60–100%
+   - Orange = 40–59%
+   - Red = 1–39%
+   - Gray = 0% or no data (idle)
+
+4. Tooltip: time range, activity score, efficiency %, keyboard %, mouse %, flags.
+
+---
+
+### API / DB
+
+1. Accept `ACTIVITY_INTERVAL` in `POST /api/tracking/events/batch`.
+2. Table `activity_intervals` indexed by user + `intervalStartAt` + `workDateKey`.
+3. Report API: intervals[], daily/weekly/monthly activity averages, efficiency %, idle total.
+4. **Fallback:** aggregate `INPUT_ACTIVITY` into 15-min buckets when interval rows missing.
+
+---
+
+### Color helper
+
+```ts
+function colorFromScore(score: number) {
+  if (score <= 0) return "gray";
+  if (score >= 60) return "green";
+  if (score >= 40) return "orange";
+  return "red";
+}
+
+function dailyActivity(intervals: { activityScore: number }[]) {
+  if (!intervals.length) return 0;
+  return Math.round(intervals.reduce((s, i) => s + i.activityScore, 0) / intervals.length);
+}
+```
+
+---
+
+### Acceptance tests
+
+1. Typing-only → low/medium score, not green.
+2. Active mouse + keyboard → green blocks.
+3. Idle → gray blocks.
+4. Anti-cheat patterns → low score + flags in admin.
+5. Batch API accepts `ACTIVITY_INTERVAL` without 400.
+6. Weekly/monthly = average of interval scores.
+
+### Do not break
+
+- Existing INPUT_ACTIVITY, APP_FOCUS, screenshots, session start/stop.
+- Legacy reports (fallback aggregation for old events).

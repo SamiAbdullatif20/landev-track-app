@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { getProjectDisplayLabel, projectMatchesQuery } from "./projectDisplay";
 
 describe("projectDisplay", () => {
-  it("uses displayLabel for the primary line", () => {
+  it("uses project name for the primary line", () => {
     expect(
       getProjectDisplayLabel({
         displayLabel: "P-1042",
         name: "123 Main St, Auckland",
         projectNumber: "P-1042"
       })
-    ).toBe("P-1042");
+    ).toBe("123 Main St, Auckland");
   });
 
   it("filters on searchLabel (address), not displayLabel alone", () => {
