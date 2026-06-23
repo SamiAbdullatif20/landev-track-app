@@ -1,0 +1,139 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Show **Meeting attributed time** on session reports (desktop now sends it)
+
+The session report **Meeting attributed time** row shows nothing because the web never aggregates the new desktop fields. Implement ingest + report aggregation.
+
+**Do NOT change the desktop app in this task — web/backend + admin UI only.**
+
+---
+
+## Problem
+
+| Symptom | Cause |
+|---------|--------|
+| Meeting attributed time always **—** or **0** | Web UI not reading `meetingAttributedSeconds` from events |
+| Time in Zoom/Teams not counted while user works in another app | Desktop now detects **background** meetings; web must sum those seconds |
+
+---
+
+## What the desktop sends
+
+### `INPUT_ACTIVITY` (every ~15s)
+
+Top-level **and** `metadata`:
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "trackerElapsedMs": 15000,
+  "meetingAttributedSeconds": 12,
+  "isMeetingActive": true,
+  "meetingPresenceReason": "background_zoom_meeting_window",
+  "meetingDetectionSource": "foreground | background",
+  "meetingPollSamples": 12,
+  "activeSeconds": 15,
+  "idleSeconds": 0
+}
+```
+
+### `APP_FOCUS` (every ~3–15s while an app is foreground)
+
+Same meeting fields when a meeting is active (foreground **or** background):
+
+```json
+{
+  "eventKind": "APP_FOCUS",
+  "activeSeconds": 15,
+  "meetingAttributedSeconds": 15,
+  "isMeetingActive": true,
+  "meetingPresenceReason": "background_zoom_meeting_window",
+  "meetingDetectionSource": "background",
+  "metadata": {
+    "meetingPresenceOverride": true
+  }
+}
+```
+
+### Detection semantics
+
+- **Foreground meeting:** Zoom, Teams, Meet, Webex, Slack huddle, etc. when that window is focused.
+- **Background meeting:** User is in AutoCAD/Chrome/etc. but Zoom/Teams still has an active meeting window (e.g. **screen sharing**). `meetingDetectionSource = "background"`.
+- `meetingPresenceReason` examples: `zoom_meeting_window`, `teams_meeting_or_call`, `background_zoom_meeting_window`.
+
+---
+
+## Required aggregation for session / day report
+
+**Sum seconds — do NOT average percents:**
+
+```ts
+function aggregateMeetingAttributedMs(events: TrackingEvent[]): number {
+  let meetingSeconds = 0;
+
+  for (const event of events) {
+    if (event.eventKind !== "INPUT_ACTIVITY" && event.eventKind !== "APP_FOCUS") {
+      continue;
+    }
+
+    const sec =
+      event.meetingAttributedSeconds ??
+      event.metadata?.meetingAttributedSeconds ??
+      0;
+
+    if (sec > 0) {
+      meetingSeconds += sec;
+    }
+  }
+
+  return Math.round(meetingSeconds * 1000);
+}
+```
+
+### Prefer `INPUT_ACTIVITY` for headline meeting time
+
+Use **`INPUT_ACTIVITY` only** for the report total to avoid double-counting with overlapping `APP_FOCUS` ticks. Fallback to `APP_FOCUS` only if no `INPUT_ACTIVITY` rows exist (legacy).
+
+### Display
+
+```ts
+const meetingMs = aggregateMeetingAttributedMs(inputActivityEventsForSession);
+const formatted = formatDuration(meetingMs); // e.g. "1h 23m"
+```
+
+Show **—** only when no events have `meetingAttributedSeconds` (pre-v1.1 sessions).
+
+---
+
+## API / DB
+
+1. Persist on ingest: `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`, `meetingPollSamples`.
+2. Session report API: add `meetingAttributedMs` (or formatted string).
+3. Optional admin tooltip: breakdown by reason (`zoom_meeting_window` vs `background_*`).
+
+---
+
+## Acceptance tests
+
+1. Track a session **in Zoom foreground** → meeting attributed time > 0.
+2. **Zoom screen share + work in another app** → meeting time still > 0 (`meetingDetectionSource: background`).
+3. Session with **no meetings** → meeting time = 0 (not **—** if desktop sent zeros).
+4. Legacy sessions without fields → **—** or hidden with tooltip.
+5. **Total tracked time** (WorkSession wall clock) unchanged — meeting time is a breakdown metric, not billable hours replacement.
+
+---
+
+## Do not break
+
+- Activity score (keyboard + mouse movement).
+- Click / keyboard / movement breakdown rows.
+- App focus “apps used” breakdown.
+- Session wall-clock totals from WorkSession start/stop.
+
+---
+
+## Desktop reference
+
+`electron/services/meeting-detection.ts`, `meeting-attribution-state.ts`, `meeting-window-probe-windows.ts`, `tracking-input-activity.ts`, `tracking-app-focus.ts`.

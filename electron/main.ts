@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import { registerIpc, stopActiveSessionIfRunning } from "./ipc/handlers";
+import { releaseNativeImage } from "./utils/native-image";
 import { logger } from "./config/logger";
 import dotenv from "dotenv";
 import { setupCrashAndDiagnostics } from "./services/diagnostics";
@@ -77,9 +78,14 @@ if (!gotSingleInstanceLock) {
 function setupDisplayMediaHandler(): void {
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer
-      .getSources({ types: ["screen"], thumbnailSize: { width: 1920, height: 1080 } })
+      .getSources({ types: ["screen"], thumbnailSize: { width: 1280, height: 720 } })
       .then((sources) => {
         const screen = sources.find((source) => source.id.toLowerCase().startsWith("screen")) ?? sources[0];
+        for (const source of sources) {
+          if (source !== screen) {
+            releaseNativeImage(source.thumbnail);
+          }
+        }
         if (screen) {
           callback({ video: screen, audio: "loopback" });
           return;
@@ -136,7 +142,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      backgroundThrottling: false,
+      backgroundThrottling: true,
       devTools: !app.isPackaged
     }
   });

@@ -2,11 +2,25 @@ import { logger } from "../config/logger";
 import { getSessionState } from "../db/queue-repo";
 import { InputActivityCounter } from "./input-activity-counter";
 import {
+  computeClickActivityPercent,
   computeMouseMovePercent,
   cursorTravelPx,
+  isClickActivePoll,
   isMouseActivePoll
 } from "./mouse-activity-metrics";
+import {
+  applyEngagementPersistence,
+  computeEngagedSecondsFromPolls,
+  isFullMouseEngagementPoll,
+  isKeyboardEngagementPoll,
+  isMicroMouseEngagementPoll
+} from "./activity-engagement";
 import { probeWindowsInputSnapshot } from "./input-probe-windows";
+import {
+  consumeMeetingAttributionWindow,
+  recordMeetingAttributionPoll,
+  refreshBackgroundMeetingPresence
+} from "./meeting-attribution-state";
 import { recordInputActivityEvent } from "./tracking-input-activity";
 
 export const INPUT_ACTIVITY_SAMPLE_MS = 15_000;
@@ -19,6 +33,10 @@ export class InputActivitySampler {
   private lastIdleMs = 0;
   private pollCount = 0;
   private pollsWithSignificantMovement = 0;
+  private pollsWithClicks = 0;
+  private pollsWithFullEngagement = 0;
+  private pollsWithMicroOnly = 0;
+  private pollsWithKeyboardHeld = 0;
   private maxIdleMsInWindow = 0;
   private lastSampleX: number | null = null;
   private lastSampleY: number | null = null;
@@ -32,6 +50,10 @@ export class InputActivitySampler {
     this.runGeneration += 1;
     this.pollCount = 0;
     this.pollsWithSignificantMovement = 0;
+    this.pollsWithClicks = 0;
+    this.pollsWithFullEngagement = 0;
+    this.pollsWithMicroOnly = 0;
+    this.pollsWithKeyboardHeld = 0;
     this.maxIdleMsInWindow = 0;
     this.lastSampleX = null;
     this.lastSampleY = null;
@@ -84,6 +106,24 @@ export class InputActivitySampler {
     if (isMouseActivePoll(travelPx, snapshot.scrollCount)) {
       this.pollsWithSignificantMovement += 1;
     }
+    if (isClickActivePoll(snapshot.clickCount)) {
+      this.pollsWithClicks += 1;
+    }
+    const keysDownCount = snapshot.keysDown.length;
+    if (isKeyboardEngagementPoll(keysDownCount)) {
+      this.pollsWithKeyboardHeld += 1;
+    }
+    const hasFullMouse = isFullMouseEngagementPoll(
+      travelPx,
+      snapshot.scrollCount,
+      snapshot.clickCount
+    );
+    const hasKeyboard = isKeyboardEngagementPoll(keysDownCount);
+    if (hasKeyboard || hasFullMouse) {
+      this.pollsWithFullEngagement += 1;
+    } else if (isMicroMouseEngagementPoll(travelPx)) {
+      this.pollsWithMicroOnly += 1;
+    }
     if (travelPx > 0) {
       this.pollTravelPx.push(travelPx);
     }
@@ -91,6 +131,7 @@ export class InputActivitySampler {
     this.lastSampleY = snapshot.y;
     this.lastIdleMs = snapshot.idleMs;
     this.counter.ingest(snapshot);
+    recordMeetingAttributionPoll();
   }
 
   private async emitSample(triggerType: string): Promise<void> {
@@ -104,12 +145,18 @@ export class InputActivitySampler {
       return;
     }
 
+    await refreshBackgroundMeetingPresence();
+
     const drained = this.counter.drain();
     const windowMs = INPUT_ACTIVITY_SAMPLE_MS;
     const idleMs = Math.min(windowMs, this.maxIdleMsInWindow);
-    const activeMs = Math.max(0, windowMs - idleMs);
-    const activeSeconds = Number((activeMs / 1000).toFixed(3));
-    const idleSeconds = Number(((windowMs - activeMs) / 1000).toFixed(3));
+    let activeMs = Math.max(0, windowMs - idleMs);
+    const meetingAttribution = consumeMeetingAttributionWindow(windowMs, INPUT_ACTIVITY_POLL_MS);
+    if (meetingAttribution.meetingAttributedSeconds > 0) {
+      activeMs = Math.max(activeMs, Math.round(meetingAttribution.meetingAttributedSeconds * 1000));
+    }
+    const activeSeconds = Number((Math.min(windowMs, activeMs) / 1000).toFixed(3));
+    const idleSeconds = Number(((windowMs - Math.min(windowMs, activeMs)) / 1000).toFixed(3));
 
     const { mouseMovePercent, mouseMoveSamples, totalSamples, mouseActiveSeconds } =
       computeMouseMovePercent(
@@ -119,11 +166,51 @@ export class InputActivitySampler {
         },
         windowMs
       );
+    const { clickActivityPercent, clickSamples, clickActiveSeconds } = computeClickActivityPercent(
+      {
+        pollCount: this.pollCount,
+        pollsWithClicks: this.pollsWithClicks
+      },
+      windowMs
+    );
+    const savedPollCount = this.pollCount;
+    const savedFullEngagement = this.pollsWithFullEngagement;
+    const savedMicroOnly = this.pollsWithMicroOnly;
+    const savedKeyboardHeld = this.pollsWithKeyboardHeld;
+
     this.pollCount = 0;
     this.pollsWithSignificantMovement = 0;
+    this.pollsWithClicks = 0;
+    this.pollsWithFullEngagement = 0;
+    this.pollsWithMicroOnly = 0;
+    this.pollsWithKeyboardHeld = 0;
     this.maxIdleMsInWindow = 0;
     const pollTravelPx = this.pollTravelPx;
     this.pollTravelPx = [];
+
+    const windowSeconds = windowMs / 1000;
+    const engagedFromPolls = computeEngagedSecondsFromPolls(
+      {
+        pollCount: savedPollCount,
+        pollsWithFullEngagement: savedFullEngagement,
+        pollsWithMicroOnly: savedMicroOnly,
+        pollsWithKeyboardHeld: savedKeyboardHeld
+      },
+      windowMs,
+      INPUT_ACTIVITY_POLL_MS
+    );
+    let validEngagedSeconds = applyEngagementPersistence(
+      engagedFromPolls.validEngagedSeconds,
+      windowSeconds,
+      activeSeconds,
+      Date.now()
+    );
+    if (meetingAttribution.meetingAttributedSeconds > 0) {
+      validEngagedSeconds = Math.max(
+        validEngagedSeconds,
+        Math.min(windowSeconds, meetingAttribution.meetingAttributedSeconds)
+      );
+    }
 
     await recordInputActivityEvent({
       mouseMoveCount: drained.mouseMoveCount,
@@ -137,7 +224,18 @@ export class InputActivitySampler {
       mouseMoveSamples,
       mouseMovePercent,
       mouseActiveSeconds,
+      clickActivityPercent,
+      clickActiveSeconds,
+      clickSamples,
       pollTravelPx,
+      meetingAttributedSeconds: meetingAttribution.meetingAttributedSeconds,
+      meetingPollSamples: meetingAttribution.meetingPollSamples,
+      isMeetingActive: meetingAttribution.isMeetingActive,
+      meetingPresenceReason: meetingAttribution.meetingPresenceReason,
+      meetingDetectionSource: meetingAttribution.meetingDetectionSource,
+      validEngagedSeconds,
+      fullEngagementPolls: engagedFromPolls.fullEngagementPolls,
+      microEngagementPolls: engagedFromPolls.microEngagementPolls,
       triggerType
     });
   }

@@ -14,7 +14,22 @@ describe("detectMeetingOrCallPresence", () => {
   it("detects Zoom by process name", () => {
     const r = detectMeetingOrCallPresence(ctx({ processName: "Zoom", windowTitle: "Meeting" }));
     expect(r.treatIntervalAsFullActiveWork).toBe(true);
-    expect(r.reason).toBe("zoom_foreground");
+    expect(r.reason).toBe("zoom_meeting_window");
+  });
+
+  it("ignores Zoom Workplace home screen", () => {
+    const r = detectMeetingOrCallPresence(
+      ctx({ processName: "Zoom", windowTitle: "Zoom Workplace", executablePath: "C:\\Zoom\\bin\\Zoom.exe" })
+    );
+    expect(r.treatIntervalAsFullActiveWork).toBe(false);
+  });
+
+  it("detects Zoom screen sharing window in background scan titles", () => {
+    const r = detectMeetingOrCallPresence(
+      ctx({ processName: "Zoom", windowTitle: "Sharing screen - Zoom Meeting" })
+    );
+    expect(r.treatIntervalAsFullActiveWork).toBe(true);
+    expect(r.reason).toBe("zoom_meeting_window");
   });
 
   it("detects Google Meet in browser title", () => {

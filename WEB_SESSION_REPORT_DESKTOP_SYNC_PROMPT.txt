@@ -1,0 +1,231 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Sync session report with desktop tracker v1.1+ (clicks + meeting time)
+
+The Electron desktop app now sends fields the web report does not yet use. Fix ingest, aggregation, and admin UI so these rows work:
+
+| Report row | Status today | Desktop fix (already shipped) |
+|------------|--------------|----------------------------------|
+| Activity → **Mouse clicks** | **—** | Sends `clickActivityPercent` / `validClickSeconds` |
+| Activity → Mouse movements | Works | Unchanged |
+| Activity → Keyboard strokes | Works | Unchanged |
+| **Meeting attributed time** | **—** / empty | Sends `meetingAttributedSeconds` (incl. background Zoom/Teams) |
+
+**Do NOT change the desktop app — web/backend + admin UI only.**
+
+---
+
+# Part 1 — Activity breakdown: Mouse clicks %
+
+## Score rule (do not change)
+
+Headline **Activity score** uses **keyboard + mouse movement only** — not clicks:
+
+```ts
+activityScore = round((keyboardActivityPercent + mouseActivityPercent) / 2)
+```
+
+Three breakdown rows are **independent**:
+
+| UI label | Field | Seconds field (for aggregation) |
+|----------|-------|----------------------------------|
+| Keyboard strokes | `keyboardActivityPercent` | `validKeyboardSeconds` |
+| Mouse movements | `mouseActivityPercent` | `validMouseSeconds` |
+| Mouse clicks | `clickActivityPercent` | `validClickSeconds` or `clickActiveSeconds` |
+
+## `INPUT_ACTIVITY` fields (every ~15s)
+
+Top-level **and** `metadata`:
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "trackerElapsedMs": 15000,
+  "clickCount": 4,
+  "keyboardActivityPercent": 20.8,
+  "mouseActivityPercent": 27.3,
+  "clickActivityPercent": 13.33,
+  "activityScore": 24,
+  "validKeyboardSeconds": 3.12,
+  "validMouseSeconds": 4.0,
+  "validClickSeconds": 2.0,
+  "clickActiveSeconds": 2.0,
+  "metadata": {
+    "validClickSeconds": 2.0,
+    "clickActivityPercent": 13.33,
+    "clickSamples": 2
+  }
+}
+```
+
+## `ACTIVITY_INTERVAL` fields (every 15 min)
+
+Also includes `clickActivityPercent` and `validClickSeconds` (top-level + metadata).
+
+## Aggregate clicks for session / day (REQUIRED)
+
+**Sum seconds — do NOT average per-event percents:**
+
+```ts
+function aggregateClickActivityPercent(inputActivityEvents: TrackingEvent[]): number | null {
+  let clickSeconds = 0;
+  let windowSeconds = 0;
+
+  for (const event of inputActivityEvents) {
+    const winSec = (event.trackerElapsedMs ?? 15_000) / 1000;
+    windowSeconds += Math.max(0, winSec);
+    clickSeconds += Math.max(
+      0,
+      event.validClickSeconds ??
+        event.metadata?.validClickSeconds ??
+        event.clickActiveSeconds ??
+        event.metadata?.clickActiveSeconds ??
+        0
+    );
+  }
+
+  if (windowSeconds <= 0) return null;
+  return Math.round((clickSeconds / windowSeconds) * 1000) / 10;
+}
+```
+
+**Legacy fallback:** if no click fields on any event → show **—** (not 0%). Do not derive % from raw `clickCount` alone.
+
+---
+
+# Part 2 — Meeting attributed time
+
+## Problem
+
+Meeting time shows nothing because the web never reads `meetingAttributedSeconds`. Desktop now counts:
+
+- **Foreground meetings** — Zoom, Teams, Meet, Webex, Slack huddle, etc.
+- **Background meetings** — user shares screen in Zoom and works in another app; meeting window still detected.
+
+## `INPUT_ACTIVITY` fields (every ~15s)
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "trackerElapsedMs": 15000,
+  "meetingAttributedSeconds": 12,
+  "isMeetingActive": true,
+  "meetingPresenceReason": "background_zoom_meeting_window",
+  "meetingDetectionSource": "background",
+  "meetingPollSamples": 12,
+  "activeSeconds": 15,
+  "idleSeconds": 0
+}
+```
+
+## `APP_FOCUS` fields (every ~3–15s)
+
+Same meeting fields when a meeting is active:
+
+```json
+{
+  "eventKind": "APP_FOCUS",
+  "activeSeconds": 15,
+  "meetingAttributedSeconds": 15,
+  "isMeetingActive": true,
+  "meetingPresenceReason": "background_zoom_meeting_window",
+  "meetingDetectionSource": "background",
+  "metadata": { "meetingPresenceOverride": true }
+}
+```
+
+### `meetingDetectionSource`
+
+| Value | Meaning |
+|-------|---------|
+| `foreground` | Meeting app is the focused window |
+| `background` | Meeting app open (e.g. Zoom sharing) while user works elsewhere |
+
+### `meetingPresenceReason` examples
+
+`zoom_meeting_window`, `teams_meeting_or_call`, `browser_meeting_title`, `background_zoom_meeting_window`
+
+## Aggregate meeting time for session / day (REQUIRED)
+
+```ts
+function aggregateMeetingAttributedMs(inputActivityEvents: TrackingEvent[]): number {
+  let meetingSeconds = 0;
+
+  for (const event of inputActivityEvents) {
+    const sec =
+      event.meetingAttributedSeconds ??
+      event.metadata?.meetingAttributedSeconds ??
+      0;
+    if (sec > 0) meetingSeconds += sec;
+  }
+
+  return Math.round(meetingSeconds * 1000);
+}
+```
+
+**Use `INPUT_ACTIVITY` only** for the headline meeting total (avoids double-count with `APP_FOCUS`). Fallback to `APP_FOCUS` only if no `INPUT_ACTIVITY` rows exist.
+
+**Display:** format as duration (`1h 23m`). Show **—** only for legacy sessions with no meeting fields.
+
+---
+
+# Part 3 — API / DB checklist
+
+### Batch ingest — persist new optional fields
+
+**INPUT_ACTIVITY / ACTIVITY_INTERVAL:**
+- `clickActivityPercent`, `validClickSeconds`, `clickActiveSeconds`, `clickCount`, `clickSamples`
+- `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`, `meetingPollSamples`
+
+**APP_FOCUS:**
+- `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`
+
+### Session report API — expose
+
+```ts
+{
+  activityScore: number,
+  keyboardActivityPercent: number,
+  mouseActivityPercent: number,
+  clickActivityPercent: number | null,   // null → UI shows —
+  meetingAttributedMs: number,           // 0 = no meetings; null → legacy —
+  meetingAttributedFormatted: string       // e.g. "45m"
+}
+```
+
+---
+
+# Part 4 — Acceptance tests
+
+### Activity breakdown
+1. Session with clicks → **Mouse clicks** shows numeric % (not **—**).
+2. **Mouse movements** and **Keyboard strokes** unchanged vs before.
+3. Headline score still `(keyboard % + movement %) / 2`.
+4. Legacy sessions → clicks show **—**; keyboard/movement still work.
+
+### Meeting time
+5. Zoom/Teams foreground for 5+ min → meeting attributed time > 0.
+6. Zoom screen share + work in another app → meeting time > 0, `meetingDetectionSource: background`.
+7. No meetings → `0` (not **—**) when desktop sent zero fields.
+8. Legacy sessions → **—** with optional tooltip.
+
+### Do not break
+- WorkSession wall-clock **total tracked time** (Start → Stop).
+- App focus “apps used” breakdown.
+- Activity timeline colors (still from `activityScore`).
+- Screenshot badges, session sync, existing batch ingest.
+
+---
+
+# Part 5 — Related desktop prompts (detail)
+
+For full spec on each area if needed:
+- Mouse clicks: `WEB_CLICK_ACTIVITY_PROMPT.txt` (desktop repo)
+- Meeting time: `WEB_MEETING_ATTRIBUTED_TIME_PROMPT.txt` (desktop repo)
+- Activity timeline / intervals: `WEB_ACTIVITY_METRICS_PROMPT.txt` (desktop repo)
+
+Desktop source files:
+- Clicks: `mouse-activity-metrics.ts`, `tracking-input-activity.ts`
+- Meetings: `meeting-detection.ts`, `meeting-attribution-state.ts`, `meeting-window-probe-windows.ts`, `tracking-input-activity.ts`, `tracking-app-focus.ts`

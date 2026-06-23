@@ -4,6 +4,7 @@ export type AntiCheatSampleInput = {
   clickCount: number;
   scrollCount: number;
   mouseActiveSeconds: number;
+  clickActiveSeconds: number;
   activeSeconds: number;
   windowSeconds: number;
   pollTravelPx?: number[];
@@ -12,6 +13,7 @@ export type AntiCheatSampleInput = {
 export type AntiCheatSampleResult = {
   validMouseSeconds: number;
   validKeyboardSeconds: number;
+  validClickSeconds: number;
   flags: string[];
 };
 
@@ -42,6 +44,7 @@ function isArtificialMouseMovement(input: AntiCheatSampleInput): boolean {
 export function applyAntiCheatFilter(input: AntiCheatSampleInput): AntiCheatSampleResult {
   const flags: string[] = [];
   let validMouseSeconds = Math.max(0, input.mouseActiveSeconds);
+  let validClickSeconds = Math.max(0, input.clickActiveSeconds);
   let validKeyboardSeconds =
     input.keyPressCount > 0
       ? Math.min(input.activeSeconds, input.windowSeconds)
@@ -51,9 +54,11 @@ export function applyAntiCheatFilter(input: AntiCheatSampleInput): AntiCheatSamp
     flags.push("repetitive_clicking");
     validMouseSeconds = 0;
     validKeyboardSeconds = 0;
+    validClickSeconds = 0;
   } else if (input.clickCount >= 5 && input.mouseMoveCount === 0 && input.scrollCount === 0) {
     flags.push("repetitive_clicking");
     validMouseSeconds = 0;
+    validClickSeconds = 0;
   }
 
   if (isArtificialMouseMovement(input)) {
@@ -64,6 +69,7 @@ export function applyAntiCheatFilter(input: AntiCheatSampleInput): AntiCheatSamp
   return {
     validMouseSeconds: Math.max(0, Number(validMouseSeconds.toFixed(3))),
     validKeyboardSeconds: Math.max(0, Number(validKeyboardSeconds.toFixed(3))),
+    validClickSeconds: Math.max(0, Number(validClickSeconds.toFixed(3))),
     flags
   };
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   activityLevelFromScore,
   activityScoreFromPercents,
+  computeEngagementActivityScore,
   estimatedEfficiencyPercent,
   timelineColorFromScore
 } from "./activity-score";
@@ -29,5 +30,15 @@ describe("activity-score", () => {
   it("computes estimated efficiency from active vs tracked time", () => {
     expect(estimatedEfficiencyPercent(450, 900)).toBe(50);
     expect(estimatedEfficiencyPercent(0, 900)).toBe(0);
+  });
+
+  it("scores timeline from union engaged seconds", () => {
+    const result = computeEngagementActivityScore({
+      validEngagedSeconds: 12,
+      trackedSeconds: 15
+    });
+    expect(result.activityScore).toBe(80);
+    expect(result.engagementActivityPercent).toBe(80);
+    expect(result.timelineColor).toBe("green");
   });
 });

@@ -6,7 +6,12 @@ import { collectActivityContext } from "./activity-metadata";
 import { buildWorkSessionEventFields } from "./session-event-fields";
 import { buildTrackingMetadata } from "./tracking-event-utils";
 import { applyAntiCheatFilter } from "./activity-anti-cheat";
-import { computeSampleActivityScore } from "./activity-score";
+import { adjustEngagedSecondsForAntiCheat } from "./activity-engagement";
+import {
+  computeEngagementActivityScore,
+  computeSampleActivityScore,
+  percentFromSeconds
+} from "./activity-score";
 import {
   ingestActivityIntervalSubsample,
   type ActivityIntervalSubsample
@@ -27,13 +32,34 @@ export type InputActivitySample = {
   mouseMovePercent?: number;
   mouseMoveSamples?: number;
   mouseActiveSeconds?: number;
+  clickActivityPercent?: number;
+  clickActiveSeconds?: number;
+  clickSamples?: number;
   totalSamples?: number;
   triggerType?: string;
   pollTravelPx?: number[];
+  meetingAttributedSeconds?: number;
+  meetingPollSamples?: number;
+  isMeetingActive?: boolean;
+  meetingPresenceReason?: string | null;
+  meetingDetectionSource?: "foreground" | "background" | null;
+  validEngagedSeconds?: number;
+  fullEngagementPolls?: number;
+  microEngagementPolls?: number;
 };
 
 function shouldSkipAllZero(sample: InputActivitySample, eventKind: "INPUT_ACTIVITY" | "HEARTBEAT"): boolean {
-  const noInput = sample.mouseMoveCount <= 0 && sample.keyPressCount <= 0;
+  if ((sample.meetingAttributedSeconds ?? 0) > 0 || sample.isMeetingActive) {
+    return false;
+  }
+  if ((sample.validEngagedSeconds ?? 0) > 0) {
+    return false;
+  }
+  const noInput =
+    sample.mouseMoveCount <= 0 &&
+    sample.keyPressCount <= 0 &&
+    (sample.clickCount ?? 0) <= 0 &&
+    (sample.scrollCount ?? 0) <= 0;
   const noActiveTime = sample.activeSeconds <= 0;
   if (!noInput || !noActiveTime) {
     return false;
@@ -60,6 +86,13 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
   const totalSamples = Math.max(1, sample.totalSamples ?? 1);
   const mouseMoveSamples = Math.min(totalSamples, Math.max(0, sample.mouseMoveSamples ?? 0));
   const windowSeconds = Math.max(0.001, sample.trackerElapsedMs / 1000);
+  let activeSeconds = Math.max(0, sample.activeSeconds);
+  let idleSeconds = Math.max(0, sample.idleSeconds);
+  const meetingAttributedSeconds = Math.max(0, sample.meetingAttributedSeconds ?? 0);
+  if (meetingAttributedSeconds > 0) {
+    activeSeconds = Math.max(activeSeconds, Math.min(windowSeconds, meetingAttributedSeconds));
+    idleSeconds = Math.max(0, Number((windowSeconds - activeSeconds).toFixed(3)));
+  }
   const mouseActiveSeconds =
     typeof sample.mouseActiveSeconds === "number"
       ? Math.min(windowSeconds, Math.max(0, sample.mouseActiveSeconds))
@@ -68,6 +101,11 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     typeof sample.mouseMovePercent === "number"
       ? Math.min(100, Math.max(0, Number(sample.mouseMovePercent.toFixed(2))))
       : Number(((mouseActiveSeconds / windowSeconds) * 100).toFixed(2));
+  const clickSamples = Math.min(totalSamples, Math.max(0, sample.clickSamples ?? 0));
+  const clickActiveSeconds =
+    typeof sample.clickActiveSeconds === "number"
+      ? Math.min(windowSeconds, Math.max(0, sample.clickActiveSeconds))
+      : clickSamples;
 
   const antiCheat = applyAntiCheatFilter({
     mouseMoveCount: sample.mouseMoveCount,
@@ -75,17 +113,34 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     clickCount: sample.clickCount ?? 0,
     scrollCount: sample.scrollCount ?? 0,
     mouseActiveSeconds,
+    clickActiveSeconds,
     activeSeconds: sample.activeSeconds,
     windowSeconds,
     pollTravelPx: sample.pollTravelPx
   });
-  const activityMetrics = computeSampleActivityScore({
+
+  let validEngagedSeconds = Math.min(
+    windowSeconds,
+    Math.max(0, sample.validEngagedSeconds ?? 0)
+  );
+  validEngagedSeconds = adjustEngagedSecondsForAntiCheat(
+    validEngagedSeconds,
+    antiCheat.flags,
+    windowSeconds
+  );
+
+  const breakdownMetrics = computeSampleActivityScore({
     validKeyboardSeconds: antiCheat.validKeyboardSeconds,
     validMouseSeconds: antiCheat.validMouseSeconds,
     trackedSeconds: windowSeconds
   });
+  const engagementMetrics = computeEngagementActivityScore({
+    validEngagedSeconds,
+    trackedSeconds: windowSeconds
+  });
+  const clickActivityPercent = percentFromSeconds(antiCheat.validClickSeconds, windowSeconds);
   const estimatedEfficiencyPercent = Number(
-    ((sample.activeSeconds / windowSeconds) * 100).toFixed(2)
+    ((activeSeconds / windowSeconds) * 100).toFixed(2)
   );
 
   const built = buildTrackingMetadata({
@@ -113,17 +168,26 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     ...sessionFields,
     mouseMoveCount: sample.mouseMoveCount,
     keyPressCount: sample.keyPressCount,
+    clickCount: sample.clickCount ?? 0,
     scrollCount: sample.scrollCount ?? 0,
     mouseMovePercent: built.metadata.mouseMovePercent,
     mouseActiveSeconds,
-    activeSeconds: sample.activeSeconds,
-    idleSeconds: sample.idleSeconds,
-    keyboardActivityPercent: activityMetrics.keyboardActivityPercent,
-    mouseActivityPercent: activityMetrics.mouseActivityPercent,
-    activityScore: activityMetrics.activityScore,
+    clickActiveSeconds: antiCheat.validClickSeconds,
+    meetingAttributedSeconds,
+    isMeetingActive: Boolean(sample.isMeetingActive ?? meetingAttributedSeconds > 0),
+    meetingPresenceReason: sample.meetingPresenceReason ?? null,
+    meetingDetectionSource: sample.meetingDetectionSource ?? null,
+    activeSeconds,
+    idleSeconds,
+    validEngagedSeconds,
+    engagementActivityPercent: engagementMetrics.engagementActivityPercent,
+    keyboardActivityPercent: breakdownMetrics.keyboardActivityPercent,
+    mouseActivityPercent: breakdownMetrics.mouseActivityPercent,
+    clickActivityPercent,
+    activityScore: engagementMetrics.activityScore,
     estimatedEfficiencyPercent,
-    activityLevel: activityMetrics.activityLevel,
-    timelineColor: activityMetrics.timelineColor,
+    activityLevel: engagementMetrics.activityLevel,
+    timelineColor: engagementMetrics.timelineColor,
     trackerElapsedMs: sample.trackerElapsedMs,
     application: built.metadata.application,
     processName: built.metadata.processName,
@@ -137,16 +201,29 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
       mouseMoveCount: sample.mouseMoveCount,
       keyPressCount: sample.keyPressCount,
       mouseActiveSeconds,
-      activeSeconds: sample.activeSeconds,
-      idleSeconds: sample.idleSeconds,
+      clickActiveSeconds: antiCheat.validClickSeconds,
+      clickSamples,
+      meetingAttributedSeconds,
+      meetingPollSamples: sample.meetingPollSamples ?? 0,
+      isMeetingActive: Boolean(sample.isMeetingActive ?? meetingAttributedSeconds > 0),
+      meetingPresenceReason: sample.meetingPresenceReason ?? null,
+      meetingDetectionSource: sample.meetingDetectionSource ?? null,
+      activeSeconds,
+      idleSeconds,
+      validEngagedSeconds,
+      engagementActivityPercent: engagementMetrics.engagementActivityPercent,
+      fullEngagementPolls: sample.fullEngagementPolls ?? 0,
+      microEngagementPolls: sample.microEngagementPolls ?? 0,
       validKeyboardSeconds: antiCheat.validKeyboardSeconds,
       validMouseSeconds: antiCheat.validMouseSeconds,
-      keyboardActivityPercent: activityMetrics.keyboardActivityPercent,
-      mouseActivityPercent: activityMetrics.mouseActivityPercent,
-      activityScore: activityMetrics.activityScore,
+      validClickSeconds: antiCheat.validClickSeconds,
+      keyboardActivityPercent: breakdownMetrics.keyboardActivityPercent,
+      mouseActivityPercent: breakdownMetrics.mouseActivityPercent,
+      clickActivityPercent,
+      activityScore: engagementMetrics.activityScore,
       estimatedEfficiencyPercent,
-      activityLevel: activityMetrics.activityLevel,
-      timelineColor: activityMetrics.timelineColor,
+      activityLevel: engagementMetrics.activityLevel,
+      timelineColor: engagementMetrics.timelineColor,
       antiCheatFlags: antiCheat.flags,
       trackerElapsedMs: sample.trackerElapsedMs,
       clientTimeZone: getClientIanaTimeZone(),
@@ -169,11 +246,16 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     trackedSeconds: windowSeconds,
     activeSeconds: sample.activeSeconds,
     idleSeconds: sample.idleSeconds,
+    validEngagedSeconds,
     validKeyboardSeconds: antiCheat.validKeyboardSeconds,
     validMouseSeconds: antiCheat.validMouseSeconds,
+    validClickSeconds: antiCheat.validClickSeconds,
     antiCheatFlags: antiCheat.flags
   };
-  const completedIntervals = ingestActivityIntervalSubsample(intervalSubsample);
+  const segmentStartedAtMs = state.startedAt ? Date.parse(state.startedAt) : null;
+  const completedIntervals = ingestActivityIntervalSubsample(intervalSubsample, {
+    segmentStartedAtMs: Number.isFinite(segmentStartedAtMs) ? segmentStartedAtMs : null
+  });
   for (const interval of completedIntervals) {
     await recordActivityIntervalEvent(interval);
   }

@@ -21,7 +21,7 @@ export class TrackingOverlayManager {
       this.show();
       return;
     }
-    this.hide();
+    this.destroy();
   }
 
   hide(): void {

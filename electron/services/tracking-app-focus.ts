@@ -5,7 +5,7 @@ import { logger } from "../config/logger";
 import { buildWorkSessionEventFields } from "./session-event-fields";
 import type { ActivityContext } from "./activity-metadata";
 import { collectActivityContext } from "./activity-metadata";
-import { detectMeetingOrCallPresence } from "./meeting-detection";
+import { resolveCurrentMeetingPresence } from "./meeting-attribution-state";
 import {
   buildTrackingMetadata,
   formatProcessNameForPayload
@@ -130,13 +130,14 @@ export function buildAppFocusPayload(
     windowTitle: context.windowTitle ?? context.activeWindowTitle
   });
 
-  const meetingPresence = detectMeetingOrCallPresence(context);
+  const meetingPresence = resolveCurrentMeetingPresence(context);
   let idleSeconds = 0;
   let resolvedActiveSeconds = activeSeconds;
-  if (meetingPresence.treatIntervalAsFullActiveWork) {
-    resolvedActiveSeconds = Math.max(resolvedActiveSeconds, activeSeconds);
+  if (meetingPresence.inMeeting) {
+    resolvedActiveSeconds = Math.max(resolvedActiveSeconds, Number((trackerElapsedMs / 1000).toFixed(3)));
     idleSeconds = 0;
   }
+  const meetingAttributedSeconds = meetingPresence.inMeeting ? resolvedActiveSeconds : 0;
 
   const occurredAtIso = new Date().toISOString();
   const sessionFields = buildWorkSessionEventFields(state, new Date(occurredAtIso));
@@ -156,6 +157,10 @@ export function buildAppFocusPayload(
     windowTitle: built.metadata.windowTitle,
     activeSeconds: resolvedActiveSeconds,
     idleSeconds,
+    meetingAttributedSeconds,
+    isMeetingActive: meetingPresence.inMeeting,
+    meetingPresenceReason: meetingPresence.reason,
+    meetingDetectionSource: meetingPresence.source,
     metadata: {
       ...built.metadata,
       ...sessionFields,
@@ -168,10 +173,13 @@ export function buildAppFocusPayload(
       hasForegroundWindowHandle: Boolean(context.hasForegroundWindowHandle),
       windowReasonCode: context.windowReasonCode ?? null,
       clientTimeZone: getClientIanaTimeZone(),
-      ...(meetingPresence.treatIntervalAsFullActiveWork
+      meetingAttributedSeconds,
+      isMeetingActive: meetingPresence.inMeeting,
+      meetingPresenceReason: meetingPresence.reason,
+      meetingDetectionSource: meetingPresence.source,
+      ...(meetingPresence.inMeeting
         ? {
-            meetingPresenceOverride: true,
-            meetingPresenceReason: meetingPresence.reason
+            meetingPresenceOverride: true
           }
         : {})
     }

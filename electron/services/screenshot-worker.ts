@@ -245,6 +245,16 @@ export class ScreenshotWorker {
           continue;
         }
 
+        const {
+          buffer: imageBytes,
+          width,
+          height,
+          quality,
+          compressedBytes,
+          sourceId,
+          sourceName
+        } = capture;
+
         const capturedAt = new Date().toISOString();
         const captureMs = Date.parse(capturedAt);
         const periodMs = schedule.intervalMinutes * 60 * 1000;
@@ -252,13 +262,13 @@ export class ScreenshotWorker {
         try {
           await this.uploadScreenshot({
             capturedAt,
-            imageBytes: capture.buffer,
+            imageBytes,
             mimeType: "image/jpeg",
             projectId: this.context.projectId,
             ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
             metadata: {
-              width: capture.width,
-              height: capture.height,
+              width,
+              height,
               source: "desktop-agent",
               clientTimeZone: getClientIanaTimeZone(),
               intervalMinutes: schedule.intervalMinutes,
@@ -271,10 +281,10 @@ export class ScreenshotWorker {
               activityPeriodStartAt: periodMouse.activityPeriodStartAt,
               activityPeriodEndAt: periodMouse.activityPeriodEndAt,
               activitySampleCount: periodMouse.sampleCount,
-              jpegQuality: capture.quality,
-              compressedBytes: capture.compressedBytes,
-              screenSourceId: capture.sourceId,
-              screenSourceName: capture.sourceName
+              jpegQuality: quality,
+              compressedBytes,
+              screenSourceId: sourceId,
+              screenSourceName: sourceName
             }
           });
           logger.info("screenshot-uploaded", {
@@ -286,9 +296,9 @@ export class ScreenshotWorker {
             periodMouseSeconds: periodMouse.mouseActiveSeconds,
             projectId: this.context.projectId,
             hasSessionId: Boolean(this.context.sessionId),
-            compressedBytes: capture.compressedBytes,
-            jpegQuality: capture.quality,
-            screenSourceId: capture.sourceId
+            compressedBytes,
+            jpegQuality: quality,
+            screenSourceId: sourceId
           });
           return;
         } catch (error) {

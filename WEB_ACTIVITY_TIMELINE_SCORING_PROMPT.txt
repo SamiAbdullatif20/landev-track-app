@@ -1,0 +1,287 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Fix activity timeline underreporting — use union engagement score (desktop v1.1+)
+
+The activity timeline shows **~30%** for normal working sessions; Traqq/Logwork show **~70–85%** for the same work. The desktop app now sends a **union engagement model**. Update web ingest, aggregation, and timeline UI to match.
+
+**Do NOT change the desktop app — web/backend + admin UI only.**
+
+---
+
+## Problem
+
+| Symptom | Cause on web |
+|---------|----------------|
+| Timeline blocks mostly orange/red during active work | Web recomputes `activityScore` as `(keyboard% + mouse%) / 2` |
+| Headline activity % much lower than Traqq | Ignores `validEngagedSeconds` / `engagementActivityPercent` from desktop |
+| Brief pauses show as fully idle | No persistence; each 15s window scored in isolation |
+
+---
+
+## Old formula (WRONG for v1.1+ events — stop using)
+
+```ts
+// ❌ DEPRECATED — underreports by ~40+ points
+activityScore = round((keyboardActivityPercent + mouseActivityPercent) / 2)
+```
+
+Why it fails:
+- Typing-heavy work (80% keyboard, 20% mouse) → **50%** instead of ~80%
+- CAD/design micro-movement ignored unless ≥12px
+- Clicks not counted in timeline score
+- Averages two independent breakdown metrics instead of union “any input” time
+
+---
+
+## New formula (REQUIRED for v1.1+ events)
+
+**Timeline color and headline activity %** use **union engaged seconds**:
+
+```ts
+engagementActivityPercent = (validEngagedSeconds / trackedSeconds) * 100
+activityScore = round(engagementActivityPercent)
+```
+
+### What `validEngagedSeconds` means (computed on desktop)
+
+Per 1-second poll, user is “engaged” if **any** of:
+- Keys held down
+- Mouse click
+- Scroll wheel
+- Cursor moved ≥12px → **1.0s** credit
+- Cursor moved 4–11px (micro) → **0.5s** credit
+
+Plus 45s persistence carry when system is still active (already baked into desktop `validEngagedSeconds`).
+
+### Breakdown rows (UNCHANGED — report card only)
+
+These are **separate** from timeline score. Do not use them to derive `activityScore`:
+
+```ts
+keyboardActivityPercent = (validKeyboardSeconds / trackedSeconds) * 100
+mouseActivityPercent      = (validMouseSeconds / trackedSeconds) * 100   // movement + scroll only
+clickActivityPercent      = (validClickSeconds / trackedSeconds) * 100
+```
+
+---
+
+## What the desktop sends
+
+### `INPUT_ACTIVITY` (every ~15s)
+
+Top-level **and** `metadata`:
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "occurredAt": "2026-06-21T10:15:00.000Z",
+  "trackerElapsedMs": 15000,
+  "trackedSeconds": 15,
+  "validEngagedSeconds": 12,
+  "engagementActivityPercent": 80,
+  "activityScore": 80,
+  "activityLevel": "high",
+  "timelineColor": "green",
+  "validKeyboardSeconds": 10,
+  "validMouseSeconds": 4,
+  "validClickSeconds": 2,
+  "keyboardActivityPercent": 66.67,
+  "mouseActivityPercent": 26.67,
+  "clickActivityPercent": 13.33,
+  "activeSeconds": 14,
+  "idleSeconds": 1,
+  "estimatedEfficiencyPercent": 93.33,
+  "antiCheatFlags": [],
+  "metadata": {
+    "validEngagedSeconds": 12,
+    "engagementActivityPercent": 80,
+    "fullEngagementPolls": 10,
+    "microEngagementPolls": 4
+  }
+}
+```
+
+### `ACTIVITY_INTERVAL` (every 15 minutes)
+
+Prefer this for timeline rendering when available:
+
+```json
+{
+  "eventKind": "ACTIVITY_INTERVAL",
+  "intervalMinutes": 15,
+  "intervalStartAt": "2026-06-21T10:00:00.000Z",
+  "intervalEndAt": "2026-06-21T10:15:00.000Z",
+  "trackedSeconds": 900,
+  "validEngagedSeconds": 720,
+  "engagementActivityPercent": 80,
+  "activityScore": 80,
+  "timelineColor": "green",
+  "keyboardActivityPercent": 45,
+  "mouseActivityPercent": 30,
+  "clickActivityPercent": 12,
+  "estimatedEfficiencyPercent": 85,
+  "metadata": {
+    "validEngagedSeconds": 720,
+    "engagementActivityPercent": 80,
+    "sampleCount": 60
+  }
+}
+```
+
+---
+
+## Web implementation checklist
+
+### 1. Batch ingest — persist new fields
+
+On `INPUT_ACTIVITY` and `ACTIVITY_INTERVAL`:
+- `validEngagedSeconds`
+- `engagementActivityPercent`
+- Keep existing: `validKeyboardSeconds`, `validMouseSeconds`, `validClickSeconds`, breakdown percents
+
+### 2. Timeline rendering
+
+```ts
+function timelineScoreFromInterval(interval: ActivityInterval): number {
+  // Trust desktop when present
+  if (typeof interval.activityScore === "number") {
+    return interval.activityScore;
+  }
+  const engaged =
+    interval.validEngagedSeconds ??
+    interval.metadata?.validEngagedSeconds ??
+    0;
+  const tracked = interval.trackedSeconds ?? 900;
+  return tracked > 0 ? Math.round((engaged / tracked) * 100) : 0;
+}
+
+function colorFromScore(score: number): "gray" | "red" | "orange" | "green" {
+  if (score <= 0) return "gray";
+  if (score >= 60) return "green";
+  if (score >= 40) return "orange";
+  return "red";
+}
+```
+
+Rules:
+1. Split day into **15-minute wall-clock blocks** in `clientTimeZone`
+2. Render **each block separately** (do not merge same-color neighbors)
+3. Tooltip: time range, `activityScore`, efficiency %, keyboard %, mouse %, click %, anti-cheat flags
+
+### 3. Fallback when `ACTIVITY_INTERVAL` rows missing
+
+Aggregate `INPUT_ACTIVITY` into 15-min buckets:
+
+```ts
+function aggregateIntervalFromInputActivity(events: InputActivityEvent[]): {
+  validEngagedSeconds: number;
+  trackedSeconds: number;
+  activityScore: number;
+} {
+  let engaged = 0;
+  let tracked = 0;
+
+  for (const event of events) {
+    tracked += (event.trackerElapsedMs ?? 15_000) / 1000;
+    engaged += Math.max(
+      0,
+      event.validEngagedSeconds ??
+        event.metadata?.validEngagedSeconds ??
+        0
+    );
+  }
+
+  const activityScore = tracked > 0 ? Math.round((engaged / tracked) * 100) : 0;
+  return { validEngagedSeconds: engaged, trackedSeconds: tracked, activityScore };
+}
+```
+
+**Do NOT** fall back to `(keyboard + mouse) / 2` for v1.1+ events.
+
+### 4. Legacy events (pre-v1.1, no `validEngagedSeconds`)
+
+```ts
+function activityScoreWithLegacyFallback(event: TrackingEvent): number | null {
+  const engaged =
+    event.validEngagedSeconds ??
+    event.metadata?.validEngagedSeconds;
+
+  if (typeof engaged === "number") {
+    const tracked = (event.trackerElapsedMs ?? 15_000) / 1000;
+    return tracked > 0 ? Math.round((engaged / tracked) * 100) : 0;
+  }
+
+  // Legacy only — old desktop events
+  const kb = event.keyboardActivityPercent ?? event.metadata?.keyboardActivityPercent ?? 0;
+  const mouse = event.mouseActivityPercent ?? event.metadata?.mouseActivityPercent ?? 0;
+  if (kb === 0 && mouse === 0) return null;
+  return Math.round((kb + mouse) / 2);
+}
+```
+
+### 5. Daily / weekly / monthly rollups
+
+```ts
+function dailyActivity(intervals: { activityScore: number }[]): number {
+  if (!intervals.length) return 0;
+  return Math.round(
+    intervals.reduce((sum, i) => sum + i.activityScore, 0) / intervals.length
+  );
+}
+```
+
+Use **simple average of interval `activityScore` values**, not weighted by session length.
+
+---
+
+## API / report response shape
+
+Expose on session/day report:
+
+```ts
+{
+  activityScore: number,              // from union engagement
+  engagementActivityPercent: number,
+  validEngagedSeconds: number,
+  keyboardActivityPercent: number,    // breakdown only
+  mouseActivityPercent: number,
+  clickActivityPercent: number,
+  estimatedEfficiencyPercent: number,
+  intervals: ActivityInterval[]
+}
+```
+
+---
+
+## Acceptance tests
+
+1. **Active typing + mouse** session → timeline blocks mostly **green** (60–90%), not ~30%
+2. **CAD / design** (micro-movement) → **orange/green**, not flat red
+3. **Genuine idle** 5+ min → **gray** blocks (0%)
+4. Headline `activityScore` matches `round(validEngagedSeconds / trackedSeconds * 100)`, **not** average of breakdown rows
+5. `ACTIVITY_INTERVAL` rows drive timeline when present
+6. Legacy sessions without `validEngagedSeconds` still render (fallback formula)
+7. Batch ingest accepts `validEngagedSeconds` on `INPUT_ACTIVITY` and `ACTIVITY_INTERVAL` without 400
+
+---
+
+## Do not break
+
+- WorkSession wall-clock **total tracked time** (Start → Stop)
+- Activity breakdown card rows (keyboard / mouse / click %)
+- Meeting attributed time (`meetingAttributedSeconds`)
+- Screenshots, APP_FOCUS, session sync
+- Anti-cheat flag display in admin
+
+---
+
+## Related desktop prompts (same repo)
+
+- Full metrics spec: `WEB_ACTIVITY_METRICS_PROMPT.txt`
+- Clicks breakdown: `WEB_CLICK_ACTIVITY_PROMPT.txt`
+- Meeting time: `WEB_MEETING_ATTRIBUTED_TIME_PROMPT.txt`
+- Combined session report: `WEB_SESSION_REPORT_DESKTOP_SYNC_PROMPT.txt` (note: its old `activityScore = avg(kb, mouse)` line is **superseded** by this prompt for timeline)
+
+Desktop source: `electron/services/activity-engagement.ts`, `activity-score.ts`, `tracking-input-activity.ts`, `activity-interval-tracker.ts`

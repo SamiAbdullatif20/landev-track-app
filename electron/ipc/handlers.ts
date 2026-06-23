@@ -59,6 +59,8 @@ import {
 } from "../services/notification-settings";
 import { recordInputActivityEvent } from "../services/tracking-input-activity";
 import { clearAppFocusDedupeState } from "../services/tracking-app-focus";
+import { clearMeetingAttributionState } from "../services/meeting-attribution-state";
+import { clearEngagementPersistenceState } from "../services/activity-engagement";
 import { clearInputActivityRollup } from "../services/input-activity-rollup";
 import { clearActivityIntervalTracker } from "../services/activity-interval-tracker";
 import { flushPendingActivityIntervals } from "../services/tracking-activity-interval";
@@ -76,6 +78,7 @@ import { hasUsableWorkSessionId } from "../services/session-event-fields";
 import { buildSessionStopInput } from "../services/session-stop-payload";
 import { registerSessionPowerLifecycle } from "../services/session-power-lifecycle";
 import {
+  catalogDisplayNameFromProjectId,
   DESIGNER_PROJECT_NAMES,
   isCatalogProjectId,
   isModeratorRole,
@@ -147,8 +150,14 @@ function normalizeSessionState() {
   };
 }
 
+let ipcHandlersRegistered = false;
+
 function sendSessionStatus(mainWindow: BrowserWindow, overlay?: TrackingOverlayManager): void {
-  mainWindow.webContents.send("tracking:status-push", normalizeSessionState());
+  const state = normalizeSessionState();
+  if (!mainWindow.isDestroyed()) {
+    mainWindow.webContents.setBackgroundThrottling(!state.active);
+  }
+  mainWindow.webContents.send("tracking:status-push", state);
   overlay?.syncVisibility();
 }
 
@@ -178,9 +187,27 @@ function toFiniteNumber(value: unknown): number | null {
 }
 
 function clampSeconds(value: number | null): number {
-  if (value == null) return 0;
-  return Math.min(MAX_PER_EVENT_SECONDS, Math.max(0, value));
+  return Math.min(MAX_PER_EVENT_SECONDS, Math.max(0, Math.floor(value ?? 0)));
 }
+
+function enrichSessionStartPayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+  const record = payload as Record<string, unknown>;
+  const projectId = typeof record.projectId === "string" ? record.projectId.trim() : "";
+  const projectName = typeof record.projectName === "string" ? record.projectName.trim() : "";
+  if (!projectId || projectName || !isCatalogProjectId(projectId)) {
+    return payload;
+  }
+  const resolved = catalogDisplayNameFromProjectId(projectId);
+  if (!resolved) {
+    return payload;
+  }
+  logger.info("tracking-start-projectname-enriched", { projectId, projectName: resolved });
+  return { ...record, projectName: resolved };
+}
+
 
 function resolveRemoteProject(remote: RemoteSessionStatus): {
   projectId: string;
@@ -212,13 +239,19 @@ function resolveRemoteProject(remote: RemoteSessionStatus): {
 
 export function registerIpc(mainWindow: BrowserWindow): void {
   registerNotificationBadgeWindow(mainWindow);
+  if (ipcHandlersRegistered) {
+    return;
+  }
+  ipcHandlersRegistered = true;
+
   const env = readEnv();
   const electronDir = path.dirname(fileURLToPath(import.meta.url));
   const preloadPath = path.join(electronDir, "preload.mjs");
-  const rendererIndex = path.join(process.env.APP_ROOT ?? app.getAppPath(), "dist", "index.html");
+  const rendererDist = path.join(process.env.APP_ROOT ?? app.getAppPath(), "dist");
+  const overlayHtmlPath = path.join(rendererDist, "overlay.html");
   const overlayUrl = process.env.VITE_DEV_SERVER_URL
-    ? `${process.env.VITE_DEV_SERVER_URL}?view=overlay`
-    : `${pathToFileURL(rendererIndex).href}?view=overlay`;
+    ? `${process.env.VITE_DEV_SERVER_URL}/overlay.html`
+    : pathToFileURL(overlayHtmlPath).href;
   const trackingOverlay = new TrackingOverlayManager({
     preloadPath,
     overlayUrl
@@ -273,6 +306,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     sessionReminder.stop();
     stopAllWindowsProbeSessions();
     clearAppFocusDedupeState();
+    clearMeetingAttributionState();
+    clearEngagementPersistenceState();
     void flushPendingActivityIntervals();
     clearInputActivityRollup();
     clearActivityIntervalTracker();
@@ -597,7 +632,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.SESSION_START, async (_event, payload) => {
     try {
       sessionRemoteSync?.markLocalUserAction();
-      const parsed = startSchema.parse(payload);
+      const parsed = startSchema.parse(enrichSessionStartPayload(payload));
       const currentState = getSessionState();
 
       if (!readToken() && !readSessionCookie()) {
@@ -696,11 +731,16 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         mouseMoveCount,
         keyPressCount,
         clickCount: Math.max(0, Math.floor(toFiniteNumber(metadataInput.clickCount) ?? 0)),
+        scrollCount: Math.max(0, Math.floor(toFiniteNumber(metadataInput.scrollCount) ?? 0)),
         activeSeconds,
         idleSeconds,
         trackerElapsedMs: Number(metadataInput.trackerElapsedMs ?? activeSeconds * 1000),
         mouseMovePercent: typeof metadataInput.mouseMovePercent === "number" ? metadataInput.mouseMovePercent : undefined,
         mouseMoveSamples: typeof metadataInput.mouseMoveSamples === "number" ? metadataInput.mouseMoveSamples : undefined,
+        mouseActiveSeconds: typeof metadataInput.mouseActiveSeconds === "number" ? metadataInput.mouseActiveSeconds : undefined,
+        clickActivityPercent: typeof metadataInput.clickActivityPercent === "number" ? metadataInput.clickActivityPercent : undefined,
+        clickActiveSeconds: typeof metadataInput.clickActiveSeconds === "number" ? metadataInput.clickActiveSeconds : undefined,
+        clickSamples: typeof metadataInput.clickSamples === "number" ? metadataInput.clickSamples : undefined,
         totalSamples: typeof metadataInput.totalSamples === "number" ? metadataInput.totalSamples : undefined,
         triggerType: typeof metadataInput.triggerType === "string" ? metadataInput.triggerType : "renderer"
       });
@@ -741,8 +781,23 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
     let state = getSessionState();
 
-    if ((!readToken() && !readSessionCookie()) || !state.active) {
+    if (!readToken() && !readSessionCookie()) {
       throw new Error("VALIDATION: No active session to stop.");
+    }
+
+    if (!state.active) {
+      stopTrackingCapture();
+      sendSessionStatus(mainWindow, trackingOverlay);
+      return {
+        ok: true as const,
+        queued: false,
+        endpointPath: "/api/tracking/session/stop",
+        status: null,
+        confirmedBy: "idempotent" as const,
+        sessionId: state.sessionId,
+        timesheetId: null,
+        responsePreview: null
+      };
     }
 
     if (!hasUsableWorkSessionId(state.sessionId)) {
@@ -872,6 +927,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       startedAt: input.startedAt
     });
     clearAppFocusDedupeState();
+    clearMeetingAttributionState();
+    clearEngagementPersistenceState();
     clearInputActivityRollup();
     clearActivityIntervalTracker();
     startSessionPowerBlocker();

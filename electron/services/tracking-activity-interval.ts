@@ -35,8 +35,12 @@ export async function recordActivityIntervalEvent(
     idleSeconds: interval.idleSeconds,
     validKeyboardSeconds: interval.validKeyboardSeconds,
     validMouseSeconds: interval.validMouseSeconds,
+    validClickSeconds: interval.validClickSeconds,
+    validEngagedSeconds: interval.validEngagedSeconds,
     keyboardActivityPercent: interval.keyboardActivityPercent,
     mouseActivityPercent: interval.mouseActivityPercent,
+    clickActivityPercent: interval.clickActivityPercent,
+    engagementActivityPercent: interval.engagementActivityPercent,
     activityScore: interval.activityScore,
     estimatedEfficiencyPercent: interval.estimatedEfficiencyPercent,
     activityLevel: interval.activityLevel,
@@ -52,8 +56,12 @@ export async function recordActivityIntervalEvent(
       idleSeconds: interval.idleSeconds,
       validKeyboardSeconds: interval.validKeyboardSeconds,
       validMouseSeconds: interval.validMouseSeconds,
+      validClickSeconds: interval.validClickSeconds,
+      validEngagedSeconds: interval.validEngagedSeconds,
       keyboardActivityPercent: interval.keyboardActivityPercent,
       mouseActivityPercent: interval.mouseActivityPercent,
+      clickActivityPercent: interval.clickActivityPercent,
+      engagementActivityPercent: interval.engagementActivityPercent,
       activityScore: interval.activityScore,
       estimatedEfficiencyPercent: interval.estimatedEfficiencyPercent,
       activityLevel: interval.activityLevel,
@@ -74,7 +82,11 @@ export async function recordActivityIntervalEvent(
 }
 
 export async function flushPendingActivityIntervals(): Promise<void> {
-  const interval = flushActivityIntervalTracker();
+  const state = getSessionState();
+  const segmentStartedAtMs = state.startedAt ? Date.parse(state.startedAt) : null;
+  const interval = flushActivityIntervalTracker({
+    segmentStartedAtMs: Number.isFinite(segmentStartedAtMs) ? segmentStartedAtMs : null
+  });
   if (interval) {
     await recordActivityIntervalEvent(interval);
   }

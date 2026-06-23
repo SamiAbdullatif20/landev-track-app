@@ -80,3 +80,27 @@ export function computeSampleActivityScore(input: {
     timelineColor: timelineColorFromScore(activityScore)
   };
 }
+
+/** Traqq-style timeline score from union engaged seconds (not keyboard/mouse average). */
+export function computeEngagementActivityScore(input: {
+  validEngagedSeconds: number;
+  trackedSeconds: number;
+}): {
+  activityScore: number;
+  engagementActivityPercent: number;
+  activityLevel: ActivityLevel;
+  timelineColor: TimelineColor;
+} {
+  const engagementActivityPercent = percentFromSeconds(
+    input.validEngagedSeconds,
+    input.trackedSeconds
+  );
+  const activityScore = Math.round(engagementActivityPercent);
+
+  return {
+    activityScore,
+    engagementActivityPercent,
+    activityLevel: activityLevelFromScore(activityScore),
+    timelineColor: timelineColorFromScore(activityScore)
+  };
+}

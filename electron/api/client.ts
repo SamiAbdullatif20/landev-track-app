@@ -109,10 +109,18 @@ export type SessionStopResult = {
 
 export class ApiError extends Error {
   public readonly kind: "network" | "auth" | "server" | "validation";
+  public readonly statusCode?: number;
+  public readonly responsePreview?: string;
 
-  constructor(kind: "network" | "auth" | "server" | "validation", message: string) {
+  constructor(
+    kind: "network" | "auth" | "server" | "validation",
+    message: string,
+    options?: { statusCode?: number; responsePreview?: string }
+  ) {
     super(message);
     this.kind = kind;
+    this.statusCode = options?.statusCode;
+    this.responsePreview = options?.responsePreview;
   }
 }
 
@@ -321,6 +329,18 @@ function asStringOrNull(value: unknown): string | null {
   return null;
 }
 
+function previewAxiosResponseBody(data: unknown): string | undefined {
+  if (data == null) {
+    return undefined;
+  }
+  try {
+    const text = typeof data === "string" ? data : JSON.stringify(data);
+    return text.length > 500 ? `${text.slice(0, 500)}…` : text;
+  } catch {
+    return undefined;
+  }
+}
+
 function mapAxiosError(error: unknown): ApiError {
   if (error instanceof z.ZodError) {
     const firstIssue = error.issues[0];
@@ -344,16 +364,24 @@ function mapAxiosError(error: unknown): ApiError {
   }
 
   const status = axiosError.response.status;
+  const errorOptions = {
+    statusCode: status,
+    responsePreview: previewAxiosResponseBody(axiosError.response.data)
+  };
   if (status === 401 || status === 403) {
     const details = formatAxiosErrorBody(axiosError.response.data, status);
-    return new ApiError("auth", details);
+    return new ApiError("auth", details, errorOptions);
   }
 
   if (status >= 500) {
-    return new ApiError("server", formatAxiosErrorBody(axiosError.response.data, status));
+    return new ApiError("server", formatAxiosErrorBody(axiosError.response.data, status), errorOptions);
   }
 
-  return new ApiError("validation", formatAxiosErrorBody(axiosError.response.data, status));
+  return new ApiError(
+    "validation",
+    formatAxiosErrorBody(axiosError.response.data, status),
+    errorOptions
+  );
 }
 
 export async function withAuthRetry<T>(

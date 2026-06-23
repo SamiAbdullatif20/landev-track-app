@@ -9,6 +9,7 @@ describe("activity-anti-cheat", () => {
       clickCount: 12,
       scrollCount: 0,
       mouseActiveSeconds: 2,
+      clickActiveSeconds: 5,
       activeSeconds: 2,
       windowSeconds: 15,
       pollTravelPx: []
@@ -17,6 +18,7 @@ describe("activity-anti-cheat", () => {
     expect(result.flags).toContain("repetitive_clicking");
     expect(result.validMouseSeconds).toBe(0);
     expect(result.validKeyboardSeconds).toBe(0);
+    expect(result.validClickSeconds).toBe(0);
   });
 
   it("flags artificial mouse movement in a tight drift band", () => {
@@ -26,6 +28,7 @@ describe("activity-anti-cheat", () => {
       clickCount: 0,
       scrollCount: 0,
       mouseActiveSeconds: 10,
+      clickActiveSeconds: 0,
       activeSeconds: 10,
       windowSeconds: 15,
       pollTravelPx: Array.from({ length: 10 }, () => 14)
@@ -42,6 +45,7 @@ describe("activity-anti-cheat", () => {
       clickCount: 2,
       scrollCount: 1,
       mouseActiveSeconds: 6,
+      clickActiveSeconds: 3,
       activeSeconds: 12,
       windowSeconds: 15,
       pollTravelPx: [40, 30, 25, 18]
@@ -50,5 +54,6 @@ describe("activity-anti-cheat", () => {
     expect(result.flags).toEqual([]);
     expect(result.validKeyboardSeconds).toBe(12);
     expect(result.validMouseSeconds).toBe(6);
+    expect(result.validClickSeconds).toBe(3);
   });
 });

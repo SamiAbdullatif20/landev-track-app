@@ -16,6 +16,15 @@ const packagedEnv = {
 // https://vitejs.dev/config/
 export default defineConfig({
   base: './',
+  build: {
+    sourcemap: false,
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        overlay: path.resolve(__dirname, 'overlay.html'),
+      },
+    },
+  },
   plugins: [
     react(),
     electron({

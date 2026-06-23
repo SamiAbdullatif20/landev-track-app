@@ -1,0 +1,238 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Fix Activity breakdown — show **Mouse clicks %** (desktop now sends it)
+
+The session report **Activity** card shows three breakdown rows:
+
+| Row | Status today |
+|-----|----------------|
+| Mouse clicks | Shows **—** (missing) |
+| Mouse movements | Works (`mouseActivityPercent`) |
+| Keyboard strokes | Works (`keyboardActivityPercent`) |
+
+The Electron desktop tracker **now emits click activity** on every `INPUT_ACTIVITY` sample and on `ACTIVITY_INTERVAL` rollups. Update batch ingest, aggregation, and the report UI so **Mouse clicks** displays a percentage like the other two rows.
+
+**Do NOT change the desktop app in this task — web/backend + admin UI only.**
+
+---
+
+## Important: three metrics, one score
+
+The breakdown has **three independent metrics**. The headline **Activity score** uses only two of them:
+
+```ts
+// Per 15s sample or 15-min interval (after anti-cheat):
+keyboardActivityPercent = (validKeyboardSeconds / trackedSeconds) * 100
+mouseActivityPercent      = (validMouseSeconds / trackedSeconds) * 100   // movement + scroll only
+clickActivityPercent      = (validClickSeconds / trackedSeconds) * 100   // clicks only
+
+// Headline score — UNCHANGED, do not include clicks:
+activityScore = round((keyboardActivityPercent + mouseActivityPercent) / 2)
+```
+
+- **Mouse movements %** = cursor moved ≥12px or wheel scrolled (not clicks).
+- **Mouse clicks %** = at least one click in a 1-second poll (left/right/middle/x-button).
+- **Keyboard strokes %** = key presses in the window.
+- Clicks are **separate** from movement; a click-only second counts for clicks, not movement.
+
+---
+
+## What the desktop sends
+
+### `INPUT_ACTIVITY` (every ~15s while tracking)
+
+Top-level **and** duplicated in `metadata`:
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "occurredAt": "2026-06-21T12:00:00.000Z",
+  "trackerElapsedMs": 15000,
+  "clickCount": 4,
+  "mouseMoveCount": 8,
+  "keyPressCount": 12,
+  "scrollCount": 1,
+  "keyboardActivityPercent": 20.8,
+  "mouseActivityPercent": 27.3,
+  "clickActivityPercent": 13.33,
+  "activityScore": 24,
+  "mouseActiveSeconds": 4.0,
+  "clickActiveSeconds": 2.0,
+  "activeSeconds": 15,
+  "idleSeconds": 0,
+  "metadata": {
+    "validKeyboardSeconds": 3.12,
+    "validMouseSeconds": 4.0,
+    "validClickSeconds": 2.0,
+    "clickActivityPercent": 13.33,
+    "clickSamples": 2,
+    "clickCount": 4,
+    "mouseMoveSamples": 4,
+    "totalSamples": 15,
+    "antiCheatFlags": []
+  }
+}
+```
+
+**Field map for UI labels:**
+
+| UI label | Primary field | Seconds field (for aggregation) |
+|----------|---------------|----------------------------------|
+| Keyboard strokes | `keyboardActivityPercent` | `validKeyboardSeconds` or `metadata.validKeyboardSeconds` |
+| Mouse movements | `mouseActivityPercent` | `validMouseSeconds` or `metadata.validMouseSeconds` |
+| Mouse clicks | `clickActivityPercent` | `validClickSeconds` or `clickActiveSeconds` or `metadata.validClickSeconds` |
+
+Use **`validClickSeconds`** when present (post anti-cheat). Fall back to `clickActiveSeconds` for older rows.
+
+### `ACTIVITY_INTERVAL` (every 15 minutes)
+
+Also includes click fields (top-level + metadata):
+
+- `validClickSeconds`
+- `clickActivityPercent`
+
+Same aggregation rules as keyboard/mouse on intervals.
+
+---
+
+## Per-event semantics (do NOT reinterpret)
+
+**Click % per 15s window:**
+
+```ts
+clickActivityPercent = (validClickSeconds / (trackerElapsedMs / 1000)) * 100
+```
+
+- `validClickSeconds` ≈ number of 1-second polls with ≥1 click × 1 second, capped at window length.
+- Denominator is the **full sample window** (usually 15s), same as movement and keyboard.
+- Anti-cheat may zero clicks: `repetitive_clicking` → `validClickSeconds = 0`.
+
+---
+
+## Session / day report aggregation (REQUIRED)
+
+**Sum seconds across events — do NOT average per-event percents** (same rule as mouse movement fix).
+
+```ts
+function aggregateActivityBreakdown(inputActivityEvents: TrackingEvent[]) {
+  let keyboardSeconds = 0;
+  let mouseSeconds = 0;
+  let clickSeconds = 0;
+  let windowSeconds = 0;
+
+  for (const event of inputActivityEvents) {
+    const winSec = (event.trackerElapsedMs ?? 15_000) / 1000;
+    windowSeconds += Math.max(0, winSec);
+
+    keyboardSeconds += Math.max(
+      0,
+      event.validKeyboardSeconds ??
+        event.metadata?.validKeyboardSeconds ??
+        0
+    );
+    mouseSeconds += Math.max(
+      0,
+      event.validMouseSeconds ??
+        event.metadata?.validMouseSeconds ??
+        event.mouseActiveSeconds ??
+        event.metadata?.mouseActiveSeconds ??
+        0
+    );
+    clickSeconds += Math.max(
+      0,
+      event.validClickSeconds ??
+        event.metadata?.validClickSeconds ??
+        event.clickActiveSeconds ??
+        event.metadata?.clickActiveSeconds ??
+        0
+    );
+  }
+
+  if (windowSeconds <= 0) {
+    return {
+      keyboardActivityPercent: null,
+      mouseActivityPercent: null,
+      clickActivityPercent: null,
+      activityScore: null
+    };
+  }
+
+  const keyboardActivityPercent = round1((keyboardSeconds / windowSeconds) * 100);
+  const mouseActivityPercent = round1((mouseSeconds / windowSeconds) * 100);
+  const clickActivityPercent = round1((clickSeconds / windowSeconds) * 100);
+  const activityScore = Math.round((keyboardActivityPercent + mouseActivityPercent) / 2);
+
+  return {
+    keyboardActivityPercent,
+    mouseActivityPercent,
+    clickActivityPercent,
+    activityScore
+  };
+}
+
+function round1(n: number) {
+  return Math.round(n * 10) / 10;
+}
+```
+
+### Fallback for legacy events (no click fields)
+
+If `validClickSeconds` and `clickActiveSeconds` are missing on all events in the range:
+
+- Show **—** or **N/A** for Mouse clicks (not 0% — that implies measured zero activity).
+- Optionally show a tooltip: “Click tracking requires desktop app v1.1+”.
+
+Do **not** infer click % from `clickCount` alone (raw count ≠ time-based percent).
+
+### Prefer `ACTIVITY_INTERVAL` when available
+
+For day/session rollups, if `ACTIVITY_INTERVAL` rows exist for the range, aggregate interval `valid*Seconds` the same way. Fall back to `INPUT_ACTIVITY` only when intervals are missing.
+
+---
+
+## UI changes
+
+1. **Activity card breakdown** — bind **Mouse clicks** to aggregated `clickActivityPercent` (one decimal, e.g. `13.3%`).
+2. **Headline Activity %** — keep using `activityScore` from aggregation above (keyboard + movement only).
+3. **Tooltips** (optional) — show raw seconds: “2.0s clicks / 120.0s tracked”.
+4. **Screenshot tiles** — if you show per-interval breakdown, include click % for that interval using the same seconds-based rule scoped to events before capture time.
+
+---
+
+## API / DB
+
+1. Ensure batch ingest persists new fields on `INPUT_ACTIVITY` and `ACTIVITY_INTERVAL` (JSON column or typed columns):
+   - `clickActivityPercent`, `clickActiveSeconds`, `validClickSeconds`, `clickCount`, `clickSamples`
+2. Expose aggregated breakdown on session/day report API alongside existing fields.
+3. No schema break — all new fields are optional for backward compatibility.
+
+---
+
+## Acceptance tests
+
+1. Session with desktop v1.1+ tracking → **Mouse clicks** shows a numeric % (not **—**).
+2. **Mouse movements** and **Keyboard strokes** unchanged vs before this fix.
+3. Headline **Activity score** still equals `(keyboard % + movement %) / 2`, **not** an average of all three rows.
+4. Click-heavy session (many clicks, little movement) → high click %, lower movement %.
+5. Movement-heavy session (dragging, scrolling) → high movement %, click % may be lower.
+6. Legacy sessions (pre-click fields) → movements + keyboard still work; clicks show **—** or N/A.
+7. `repetitive_clicking` anti-cheat events → click seconds excluded from click %.
+
+---
+
+## Do not break
+
+- Existing mouse movement aggregation (`validMouseSeconds` / `mouseActivityPercent`).
+- Existing keyboard aggregation.
+- Activity timeline colors (still driven by `activityScore`, not click %).
+- Session start/stop, screenshots, APP_FOCUS, sync batch API.
+
+---
+
+## Reference
+
+Desktop implementation: `electron/services/mouse-activity-metrics.ts` (`computeClickActivityPercent`), `electron/services/tracking-input-activity.ts`, `electron/services/activity-interval-tracker.ts`.
+
+Related prior prompt: `WEB_ACTIVITY_METRICS_PROMPT.txt` (timeline + score — add click breakdown as extension, do not rewrite score formula).

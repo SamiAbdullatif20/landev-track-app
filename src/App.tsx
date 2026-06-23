@@ -9,13 +9,17 @@ import { LandevLogo } from "./components/LandevLogo";
 import { TodayWorkList } from "./components/TodayWorkList";
 import { NotificationBell } from "./components/NotificationBell";
 import { SoftwareUpdatePrompt } from "./components/SoftwareUpdatePrompt";
-import { designerCatalogFallbackProjects } from "./config/designer-project-fallback";
+import { designerCatalogFallbackProjects, isCatalogProjectId } from "./config/designer-project-fallback";
 import { useSessionTimer } from "./hooks/useSessionTimer";
 import type { RecentWorkTask } from "./types/recent-task";
 import type { ProjectDayTotal, WorkSummary } from "./types/work-summary";
 import type { Project } from "./store/trackingStore";
 import { formatClockDuration } from "./utils/formatElapsed";
 import { sanitizeDisplayText } from "./utils/sanitize";
+import {
+  canResolveProjectNameForStart,
+  resolveProjectNameForStart
+} from "./utils/resolveProjectNameForStart";
 import "./App.css";
 
 const DESCRIPTION_MIN_LENGTH = 3;
@@ -194,6 +198,7 @@ function App() {
           active: statusResult.active,
           sessionId: statusResult.sessionId,
           projectId: statusResult.projectId ?? "",
+          projectName: "",
           description: statusResult.description ?? "",
           startedAt: statusResult.startedAt
         });
@@ -215,6 +220,7 @@ function App() {
         active: status.active,
         sessionId: status.sessionId,
         projectId: status.projectId ?? current.projectId,
+        projectName: current.projectName,
         description: status.description ?? current.description,
         startedAt: status.startedAt
       };
@@ -222,6 +228,7 @@ function App() {
         current.active === next.active
         && current.sessionId === next.sessionId
         && current.projectId === next.projectId
+        && current.projectName === next.projectName
         && current.description === next.description
         && current.startedAt === next.startedAt
       ) {
@@ -262,14 +269,52 @@ function App() {
   const canStart = useMemo(() => {
     const trimmedDescription = session.description.trim();
     return (
-      authStatus === "authenticated" &&
-      !session.active &&
-      !sessionLoading &&
-      session.projectId.trim().length > 0 &&
-      trimmedDescription.length >= DESCRIPTION_MIN_LENGTH &&
-      trimmedDescription.length <= DESCRIPTION_MAX_LENGTH
+      authStatus === "authenticated"
+      && !session.active
+      && !sessionLoading
+      && session.projectId.trim().length > 0
+      && trimmedDescription.length >= DESCRIPTION_MIN_LENGTH
+      && trimmedDescription.length <= DESCRIPTION_MAX_LENGTH
+      && canResolveProjectNameForStart(
+        session.projectId,
+        workSummary,
+        projects,
+        session.projectName
+      )
     );
-  }, [authStatus, session.active, session.description, session.projectId, sessionLoading]);
+  }, [
+    authStatus,
+    session.active,
+    session.description,
+    session.projectId,
+    session.projectName,
+    sessionLoading,
+    workSummary,
+    projects
+  ]);
+
+  const projectSelectFallbackLabel = useMemo(() => {
+    if (!session.projectId.trim()) {
+      return undefined;
+    }
+    if (projects.some((project) => project.id === session.projectId)) {
+      return undefined;
+    }
+    const resolved = resolveProjectNameForStart(session.projectId, {
+      projects,
+      sessionProjectName: session.projectName,
+      todayByProject: workSummary.todayByProject,
+      recentTasks: workSummary.recentTasks
+    });
+    return resolved ?? undefined;
+  }, [projects, session.projectId, session.projectName, workSummary.recentTasks, workSummary.todayByProject]);
+
+  const catalogProjectStartError =
+    session.projectId.trim()
+    && isCatalogProjectId(session.projectId)
+    && !canResolveProjectNameForStart(session.projectId, workSummary, projects, session.projectName)
+      ? "Select an admin task type before starting."
+      : null;
 
   const trimmedDescriptionLength = session.description.trim().length;
   const descriptionValidationError =
@@ -309,6 +354,7 @@ function App() {
         active: statusResult.active,
         sessionId: statusResult.sessionId,
         projectId: statusResult.projectId ?? "",
+        projectName: "",
         description: statusResult.description ?? "",
         startedAt: statusResult.startedAt
       });
@@ -355,18 +401,28 @@ function App() {
       setTrackingError("Add a short description (min 3 characters).");
       return;
     }
+    const projectName = resolveProjectNameForStart(session.projectId, {
+      projects,
+      sessionProjectName: session.projectName,
+      todayByProject: workSummary.todayByProject,
+      recentTasks: workSummary.recentTasks
+    });
+    if (isCatalogProjectId(session.projectId) && !projectName) {
+      setTrackingError("Select an admin task type before starting.");
+      return;
+    }
     setSessionLoading(true);
     setTrackingError(null);
     try {
-      const selectedProject = projects.find((project) => project.id === session.projectId);
       await window.desktopAPI.startSession({
         projectId: session.projectId,
-        projectName: selectedProject
-          ? selectedProject.name || selectedProject.displayLabel
-          : undefined,
-        isNonChargeable: selectedProject?.isNonChargeable,
+        projectName: projectName ?? undefined,
+        isNonChargeable: projects.find((project) => project.id === session.projectId)?.isNonChargeable,
         description: trimmedDescription
       });
+      if (projectName) {
+        setSession({ projectName });
+      }
       pushToast("success", "Tracking started.");
     } catch (error) {
       setTrackingError(toFriendlyMessage(error));
@@ -380,6 +436,7 @@ function App() {
     if (session.active || sessionLoading) return;
     setSession({
       projectId: task.projectId,
+      projectName: task.projectName,
       description: task.description
     });
     setTrackingError(null);
@@ -389,27 +446,40 @@ function App() {
     if (session.active || sessionLoading) return;
     setSession({
       projectId: item.projectId,
+      projectName: item.projectName,
       description: item.lastDescription || session.description
     });
     setTrackingError(null);
   };
 
-  const onStop = () => {
+  const onStop = async () => {
     if (sessionLoading || !session.active || stopInFlightRef.current) return;
     stopInFlightRef.current = true;
+    setSessionLoading(true);
     setTrackingError(null);
-    void window.desktopAPI
-      .stopSession({ stoppedAt: new Date().toISOString() })
-      .then(() => {
-        pushToast("success", "Stopped.");
-      })
-      .catch((error) => {
-        setTrackingError(toFriendlyMessage(error));
-        pushToast("error", "Failed to stop session.");
-      })
-      .finally(() => {
-        stopInFlightRef.current = false;
-      });
+    try {
+      await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
+      pushToast("success", "Stopped.");
+      await loadWorkSummary();
+    } catch (error) {
+      const message = toFriendlyMessage(error);
+      setTrackingError(message);
+      pushToast("error", "Failed to stop session.");
+      if (message.toLowerCase().includes("no active session")) {
+        const statusResult = await window.desktopAPI.getStatus();
+        setSession({
+          active: statusResult.active,
+          sessionId: statusResult.sessionId,
+          projectId: statusResult.projectId ?? session.projectId,
+          projectName: session.projectName,
+          description: statusResult.description ?? session.description,
+          startedAt: statusResult.startedAt
+        });
+      }
+    } finally {
+      stopInFlightRef.current = false;
+      setSessionLoading(false);
+    }
   };
 
   const onToggleTracking = () => {
@@ -551,6 +621,7 @@ function App() {
 
             <section className="tracker-card">
               {trackingError && <p className="error">{trackingError}</p>}
+              {catalogProjectStartError && <p className="error">{catalogProjectStartError}</p>}
               {descriptionValidationError && <p className="error">{descriptionValidationError}</p>}
               <div className="compose-row">
                 <textarea
@@ -575,13 +646,20 @@ function App() {
               <ProjectSearchSelect
                 projects={projects}
                 value={session.projectId}
+                fallbackLabel={projectSelectFallbackLabel}
                 disabled={session.active || sessionLoading}
                 loading={projectsLoading}
                 onOpen={() => {
                   void fetchProjectsWithRetry(1);
                 }}
                 onChange={(projectId) => {
-                  setSession({ projectId });
+                  const selectedProject = projects.find((project) => project.id === projectId);
+                  setSession({
+                    projectId,
+                    projectName: selectedProject
+                      ? selectedProject.name || selectedProject.displayLabel
+                      : ""
+                  });
                   void fetchProjectsWithRetry(1);
                 }}
               />

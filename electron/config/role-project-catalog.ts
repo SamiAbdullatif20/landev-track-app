@@ -95,6 +95,24 @@ function catalogIdForName(name: string): string {
   return `catalog:${slug || "unknown"}`;
 }
 
+const ALL_CATALOG_NAMES = Array.from(
+  new Set([...DESIGNER_PROJECT_NAMES, ...MODERATOR_PROJECT_NAMES])
+);
+
+/** Reverse lookup: catalog:admin-general → Admin - General */
+export function catalogDisplayNameFromProjectId(projectId: string): string | null {
+  if (!isCatalogProjectId(projectId)) {
+    return null;
+  }
+  const normalizedId = projectId.trim().toLowerCase();
+  for (const name of ALL_CATALOG_NAMES) {
+    if (catalogIdForName(name).toLowerCase() === normalizedId) {
+      return name;
+    }
+  }
+  return null;
+}
+
 function normalizeNameKey(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
 }

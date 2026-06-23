@@ -1,12 +1,61 @@
 import type { ActivityContext } from "./activity-metadata";
+import { probeMeetingWindowContexts } from "./meeting-window-probe-windows";
 
 export type MeetingPresenceResult = {
   treatIntervalAsFullActiveWork: boolean;
   reason: string | null;
 };
 
+const ZOOM_NON_MEETING_TITLE_PARTS = [
+  "zoom workplace",
+  "sign in",
+  "sign-in",
+  "settings",
+  "preferences",
+  "about zoom",
+  "zoom launcher",
+  "join a meeting",
+  "join meeting - zoom",
+  "schedule meeting",
+  "profile"
+] as const;
+
+const ZOOM_MEETING_TITLE_PARTS = [
+  "zoom meeting",
+  "sharing",
+  "share screen",
+  "share preview",
+  "you are sharing",
+  "screen share",
+  "webinar",
+  "waiting room",
+  "breakout",
+  "passcode",
+  "meeting controls",
+  "floating meeting controls"
+] as const;
+
 function norm(value: string | undefined | null): string {
   return (value ?? "").trim().toLowerCase();
+}
+
+function isZoomProcess(proc: string, exe: string): boolean {
+  return proc.includes("zoom") || exe.endsWith("\\zoom.exe") || exe.includes("zoom.exe");
+}
+
+export function zoomWindowLooksLikeActiveMeeting(title: string): boolean {
+  const t = norm(title);
+  if (!t) {
+    return false;
+  }
+  if (ZOOM_NON_MEETING_TITLE_PARTS.some((part) => t.includes(part))) {
+    return false;
+  }
+  if (ZOOM_MEETING_TITLE_PARTS.some((part) => t.includes(part))) {
+    return true;
+  }
+  // Active calls often use the meeting topic as the window title.
+  return t.length > 0;
 }
 
 function teamsWindowLooksLikeMeetingOrCall(title: string, proc: string, exe: string): boolean {
@@ -15,7 +64,6 @@ function teamsWindowLooksLikeMeetingOrCall(title: string, proc: string, exe: str
     return false;
   }
 
-  // Common Teams title layout: "… | Meeting | Microsoft Teams" or "… | Call | Microsoft Teams"
   if (/\|\s*(meeting|call|live event|webinar|town hall|broadcast)\s*\|/i.test(title)) {
     return true;
   }
@@ -48,7 +96,6 @@ function teamsWindowLooksLikeMeetingOrCall(title: string, proc: string, exe: str
 }
 
 function browserMeetingFromTitle(title: string): boolean {
-  // Teams in Edge/Chrome often shows "… | Microsoft Teams" without a URL in the title
   if (/\bmicrosoft teams\b/.test(title) && /\b(meeting|call|webinar|live event)\b/i.test(title)) {
     return true;
   }
@@ -68,7 +115,6 @@ function browserMeetingFromTitle(title: string): boolean {
     return true;
   }
 
-  // Teams on the web often includes these hosts in the title or tab text
   if (title.includes("teams.live.com") || title.includes("teams.microsoft.com")) {
     if (/\b(meeting|call|webinar|live event|join)\b/i.test(title)) {
       return true;
@@ -88,8 +134,11 @@ export function detectMeetingOrCallPresence(context: ActivityContext): MeetingPr
   const title = norm(context.windowTitle ?? context.activeWindowTitle);
   const exe = norm(context.executablePath);
 
-  if (proc.includes("zoom") || exe.endsWith("\\zoom.exe") || exe.includes("zoom.exe")) {
-    return { treatIntervalAsFullActiveWork: true, reason: "zoom_foreground" };
+  if (isZoomProcess(proc, exe)) {
+    if (zoomWindowLooksLikeActiveMeeting(title)) {
+      return { treatIntervalAsFullActiveWork: true, reason: "zoom_meeting_window" };
+    }
+    return { treatIntervalAsFullActiveWork: false, reason: null };
   }
 
   if (proc.includes("webex") || title.includes("webex")) {
@@ -127,6 +176,23 @@ export function detectMeetingOrCallPresence(context: ActivityContext): MeetingPr
 
   if (proc.includes("skype") || proc.includes("viber") || proc.includes("facetime")) {
     return { treatIntervalAsFullActiveWork: true, reason: "legacy_call_app" };
+  }
+
+  return { treatIntervalAsFullActiveWork: false, reason: null };
+}
+
+/** Scan all top-level windows for an active meeting (covers Zoom share + work in another app). */
+export async function detectBackgroundMeetingPresence(): Promise<MeetingPresenceResult> {
+  if (process.platform !== "win32") {
+    return { treatIntervalAsFullActiveWork: false, reason: null };
+  }
+
+  const windows = await probeMeetingWindowContexts();
+  for (const context of windows) {
+    const presence = detectMeetingOrCallPresence(context);
+    if (presence.treatIntervalAsFullActiveWork) {
+      return { treatIntervalAsFullActiveWork: true, reason: `background_${presence.reason}` };
+    }
   }
 
   return { treatIntervalAsFullActiveWork: false, reason: null };

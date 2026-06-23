@@ -8,15 +8,30 @@ The Electron desktop app now emits **15-minute activity intervals** and enriched
 
 ### Metric definitions (must match desktop exactly)
 
-#### Activity Score
-- Based on **valid keyboard activity** + **valid mouse activity** after anti-cheat filtering.
-- For any window (15s sample or 15-min interval):
+#### Activity Score (timeline — v1.1+ union engagement model)
+
+**Timeline color and headline activity %** use union engaged seconds, NOT the average of keyboard and mouse breakdown percents.
+
+```ts
+// Per 15s sample or 15-min interval (after anti-cheat):
+engagementActivityPercent = (validEngagedSeconds / trackedSeconds) * 100
+activityScore = round(engagementActivityPercent)
+```
+
+`validEngagedSeconds` = seconds with any engagement in 1s polls:
+- Keys held, click, scroll, or mouse travel ≥12px (1s each)
+- Micro mouse travel 4–11px (0.5s each)
+- 45s persistence carry when system still active (desktop only)
+
+#### Breakdown rows (report card — unchanged semantics)
 
 ```ts
 keyboardActivityPercent = (validKeyboardSeconds / trackedSeconds) * 100
 mouseActivityPercent = (validMouseSeconds / trackedSeconds) * 100
-activityScore = round((keyboardActivityPercent + mouseActivityPercent) / 2)
+clickActivityPercent = (validClickSeconds / trackedSeconds) * 100
 ```
+
+Do **not** compute timeline `activityScore` as `(keyboard + mouse) / 2` on v1.1+ events.
 
 #### Estimated Efficiency
 ```ts
@@ -41,18 +56,20 @@ Desktop flags and filters before scoring; web should trust `valid*Seconds` but m
 ### Event types from desktop
 
 #### `INPUT_ACTIVITY` (every ~15s)
-New optional fields (top-level + `metadata`):
-- `validKeyboardSeconds`, `validMouseSeconds`
-- `keyboardActivityPercent`, `mouseActivityPercent`
-- `activityScore`, `estimatedEfficiencyPercent`
+Fields (top-level + `metadata`):
+- `validEngagedSeconds`, `engagementActivityPercent` — **timeline score source**
+- `validKeyboardSeconds`, `validMouseSeconds`, `validClickSeconds`
+- `keyboardActivityPercent`, `mouseActivityPercent`, `clickActivityPercent` — breakdown only
+- `activityScore` (= `engagementActivityPercent` rounded), `estimatedEfficiencyPercent`
 - `activityLevel`: `high` | `medium` | `low` | `idle`
 - `timelineColor`: `green` | `orange` | `red` | `gray`
 - `antiCheatFlags`: string[]
+- `fullEngagementPolls`, `microEngagementPolls` (optional diagnostics)
 
-#### `ACTIVITY_INTERVAL` (new — every 15 minutes, wall-clock in employee timezone)
+#### `ACTIVITY_INTERVAL` (every 15 minutes, wall-clock in employee timezone)
 Add to batch ingest allowlist.
 
-Key fields: `intervalMinutes` (15), `intervalStartAt`, `intervalEndAt`, `trackedSeconds`, `activeSeconds`, `idleSeconds`, `validKeyboardSeconds`, `validMouseSeconds`, `keyboardActivityPercent`, `mouseActivityPercent`, `activityScore`, `estimatedEfficiencyPercent`, `activityLevel`, `timelineColor`, `metadata.antiCheatFlags`, `metadata.sampleCount`.
+Key fields: `intervalMinutes` (15), `intervalStartAt`, `intervalEndAt`, `trackedSeconds`, `activeSeconds`, `idleSeconds`, `validEngagedSeconds`, `engagementActivityPercent`, `validKeyboardSeconds`, `validMouseSeconds`, `validClickSeconds`, `keyboardActivityPercent`, `mouseActivityPercent`, `clickActivityPercent`, `activityScore`, `estimatedEfficiencyPercent`, `activityLevel`, `timelineColor`, `metadata.antiCheatFlags`, `metadata.sampleCount`.
 
 Upsert by `(userId, intervalStartAt)` to avoid duplicates.
 

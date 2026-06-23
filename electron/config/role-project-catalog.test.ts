@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  catalogDisplayNameFromProjectId,
   isCatalogProjectId,
   isNonChargeableProjectName,
   isDesignerRole,
@@ -21,6 +22,18 @@ describe("isCatalogProjectId", () => {
   it("detects synthetic catalog ids", () => {
     expect(isCatalogProjectId("catalog:admin-phone-call")).toBe(true);
     expect(isCatalogProjectId("p1")).toBe(false);
+  });
+});
+
+describe("catalogDisplayNameFromProjectId", () => {
+  it("resolves catalog ids to canonical display names", () => {
+    expect(catalogDisplayNameFromProjectId("catalog:admin-general")).toBe("Admin - General");
+    expect(catalogDisplayNameFromProjectId("catalog:client-meeting")).toBe("Client Meeting");
+  });
+
+  it("returns null for non-catalog ids", () => {
+    expect(catalogDisplayNameFromProjectId("1604")).toBeNull();
+    expect(catalogDisplayNameFromProjectId("catalog:unknown-task")).toBeNull();
   });
 });
 

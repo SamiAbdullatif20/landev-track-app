@@ -18,7 +18,7 @@ export const startSchema = z
       if (!data.projectName?.trim()) {
         ctx.addIssue({
           code: "custom",
-          message: "projectName is required for admin work",
+          message: "Select an admin task type before starting",
           path: ["projectName"]
         });
       }

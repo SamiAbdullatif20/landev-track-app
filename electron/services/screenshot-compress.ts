@@ -68,8 +68,8 @@ function scaleImageToMaxWidth(
   return trackImage(images, resized);
 }
 
-/** Linear quality steps — avoids binary-search JPEG buffer churn. */
-export const JPEG_ENCODE_QUALITIES = [PREFERRED_JPEG_QUALITY, 82, 76, 70, 64, 58] as const;
+/** JPEG quality steps — preferred first, then fallbacks if over byte budget. */
+export const JPEG_ENCODE_QUALITIES = [PREFERRED_JPEG_QUALITY, 76, 64] as const;
 
 export function encodeNativeImageToJpeg(
   image: NativeImage,

@@ -16,6 +16,7 @@ export type SessionState = {
   active: boolean;
   sessionId: string | null;
   projectId: string;
+  projectName: string;
   description: string;
   startedAt: string | null;
 };
@@ -38,6 +39,7 @@ const initialSession: SessionState = {
   active: false,
   sessionId: null,
   projectId: "",
+  projectName: "",
   description: "",
   startedAt: null
 };

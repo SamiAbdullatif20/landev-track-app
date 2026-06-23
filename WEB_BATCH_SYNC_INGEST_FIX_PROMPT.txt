@@ -1,0 +1,293 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Fix `POST /api/tracking/events/batch` — stop 400s, drain desktop retry queue
+
+Desktop tracker **v1.1.1** shows **“Could not upload tracking data (N pending)”** when batch ingest returns **400** with a generic body like `{ "error": "Something went wrong" }`. Thousands of `APP_FOCUS` / `INPUT_ACTIVITY` events already ingest; failures cluster around **session stop/start same day**, **`ACTIVITY_INTERVAL`**, and **new v1.1 fields**.
+
+**Fix batch ingest + persistence only in this task.** Report UI (clicks, meeting time, timeline colors) can follow using the other `WEB_*` prompts — but ingest must accept and store the fields now so nothing is dropped.
+
+**Do NOT change the Electron desktop app.**
+
+---
+
+## Symptom (production)
+
+| What employees see | What logs show |
+|--------------------|----------------|
+| Toast: “Could not upload tracking data (36 pending). Will retry automatically.” | `sync-batch-failed { error: 'Something went wrong' }` |
+| Session report missing recent segment | Events stuck in desktop SQLite queue (`status = pending` / `retry`) |
+| Partial data (apps/movements OK, timeline gaps) | Some batches succeed; batches mixing bad + good events fail entirely |
+
+Auth is fine (session start/stop return 200). This is **validation / DB constraint / handler error** on batch ingest.
+
+---
+
+## Endpoint
+
+```
+POST /api/tracking/events/batch
+Content-Type: application/json
+Auth: Bearer token and/or session Cookie (same as web login)
+
+Body: { "events": [ ... ] }   // "events" array REQUIRED
+```
+
+Desktop base URL: `https://landev.vercel.app`  
+Path: `/api/tracking/events/batch`
+
+---
+
+## Event kinds (all must be accepted)
+
+| eventKind | Cadence | Notes |
+|-----------|---------|-------|
+| `APP_FOCUS` | ~1–5s while foreground app changes | Apps-used report |
+| `INPUT_ACTIVITY` | ~15s | Activity breakdown + timeline subsamples |
+| `HEARTBEAT` | occasional | Same shape as INPUT_ACTIVITY, `eventKind: "HEARTBEAT"` |
+| `ACTIVITY_INTERVAL` | every 15 min wall-clock (employee timezone) | Timeline blocks / daily rollups |
+
+If Zod/schema only allows the first three, **`ACTIVITY_INTERVAL` returns 400 for the whole batch**.
+
+---
+
+## Required batch behavior
+
+### 1. Per-event success (do not fail entire batch on one bad row)
+
+Return **200** with per-event results when possible:
+
+```json
+{
+  "ok": true,
+  "ingested": 18,
+  "failed": 2,
+  "results": [
+    { "eventUuid": "…", "ok": true },
+    { "eventUuid": "…", "ok": false, "error": "duplicate_interval" }
+  ]
+}
+```
+
+If you keep all-or-nothing transactions today, fix validation so rows that desktop sends are valid. Desktop v1.1.1 now retries **one event at a time** after a batch failure, but the server must still accept valid rows.
+
+### 2. Idempotent on `eventUuid`
+
+Desktop retries the same `eventUuid` after offline / 400. Re-posting the same event must **return success**, not 400/409.
+
+```ts
+// Pseudocode
+const existing = await db.trackingEvent.findUnique({ where: { eventUuid } });
+if (existing) return { ok: true, duplicate: true };
+```
+
+### 3. Persist unknown fields (do not strip)
+
+Store full event JSON in `metadata` or JSON column. Desktop sends many keys top-level **and** duplicated in `metadata`. **Rejecting unknown keys** causes `Something went wrong`.
+
+Use `.passthrough()` / `.strict(false)` in Zod, or an explicit allowlist that includes every field in section 5 below.
+
+### 4. `workSessionId` resolution
+
+If `workSessionId` / `sessionId` is missing:
+
+- Resolve from authenticated `userId` + `workDateKey` + active `WorkSession`, **or**
+- Create/link session server-side
+
+**Never silently drop** events with valid `workDateKey` + `eventUuid`.
+
+### 5. Fix Redis / DB 500s
+
+Past production issue: Redis `expire` wrong arity → 500 on batch. Grep batch handler for `expire(` and fix. Return structured JSON, not generic 500 HTML.
+
+---
+
+## Session segments (same work day, multiple stop/start)
+
+Desktop sends on **every** event:
+
+| Field | Purpose |
+|-------|---------|
+| `workDateKey` | `"YYYY-MM-DD"` employee local work date |
+| `workSessionId` / `sessionId` | Server WorkSession id (string) |
+| `sessionSegmentStartedAt` | ISO UTC — **changes on each desktop Stop → Start** |
+| `clientTimeZone` | IANA, e.g. `Europe/Istanbul` |
+| `projectId` | string or null |
+
+**Reports query by `userId` + `workDateKey`**, aggregating **all** segments — not only latest `workSessionId`.
+
+---
+
+## `ACTIVITY_INTERVAL` — critical for sync failures
+
+Emitted at each 15-minute wall-clock boundary in the employee timezone.
+
+### Shape (top-level + metadata)
+
+```json
+{
+  "eventUuid": "d9a378e3-38ab-43d8-bec4-6fcb29f2f629",
+  "eventKind": "ACTIVITY_INTERVAL",
+  "type": "ACTIVITY_INTERVAL",
+  "occurredAt": "2026-06-22T15:45:00.000Z",
+  "workDateKey": "2026-06-22",
+  "workSessionId": "724",
+  "sessionId": "724",
+  "sessionSegmentStartedAt": "2026-06-22T15:44:26.282Z",
+  "clientTimeZone": "Europe/Istanbul",
+  "projectId": "1604",
+  "intervalMinutes": 15,
+  "intervalStartAt": "2026-06-22T15:44:26.282Z",
+  "intervalEndAt": "2026-06-22T15:45:00.000Z",
+  "trackedSeconds": 30,
+  "activeSeconds": 28.5,
+  "idleSeconds": 1.5,
+  "validEngagedSeconds": 27,
+  "validKeyboardSeconds": 10,
+  "validMouseSeconds": 18,
+  "validClickSeconds": 5,
+  "keyboardActivityPercent": 33.33,
+  "mouseActivityPercent": 60,
+  "clickActivityPercent": 16.67,
+  "engagementActivityPercent": 90,
+  "activityScore": 90,
+  "estimatedEfficiencyPercent": 95,
+  "activityLevel": "high",
+  "timelineColor": "green",
+  "metadata": { "sampleCount": 2, "antiCheatFlags": [], "source": "tracking-activity-interval" }
+}
+```
+
+### Segment-split intervals (v1.1.1)
+
+When employee **stops and starts inside the same 15-minute block**, desktop clamps:
+
+```
+intervalStartAt = max(wallClockBlockStart, sessionSegmentStartedAt)
+```
+
+Example: wall block 15:30–15:45, new segment starts 15:44:26 → `intervalStartAt` = **15:44:26**, not 15:30.
+
+**Unique key must include segment**, not only wall clock:
+
+```ts
+// ✅ Correct — two segments same wall block, same workSessionId
+unique: [userId, workSessionId, sessionSegmentStartedAt, intervalStartAt, intervalEndAt]
+
+// ❌ Wrong — second segment 400s as duplicate
+unique: [workSessionId, intervalStartAt, intervalEndAt]
+```
+
+### Validation rules
+
+- `trackedSeconds` may be **much less than 15 minutes** (partial block / new segment) — **do not reject**
+- `intervalEndAt` = `intervalStartAt` + 15 min (wall-clock end of block) even when `intervalStartAt` is clamped
+- `activityScore` on v1.1+ intervals equals `round(engagementActivityPercent)` — trust desktop value for timeline
+
+---
+
+## v1.1+ field allowlist (INPUT_ACTIVITY / HEARTBEAT / APP_FOCUS)
+
+Add to schema or passthrough. Missing fields must **not** 400.
+
+### Shared session fields
+`eventUuid`, `eventKind`, `type`, `occurredAt`, `occurredAtIso`, `workDateKey`, `workSessionId`, `sessionId`, `sessionSegmentStartedAt`, `clientTimeZone`, `projectId`, `metadata`
+
+### INPUT_ACTIVITY / HEARTBEAT (activity)
+`mouseMoveCount`, `keyPressCount`, `clickCount`, `scrollCount`, `mouseMovePercent`, `mouseActiveSeconds`, `trackerElapsedMs`, `activeSeconds`, `idleSeconds`, `validEngagedSeconds`, `engagementActivityPercent`, `validKeyboardSeconds`, `validMouseSeconds`, `validClickSeconds`, `clickActiveSeconds`, `keyboardActivityPercent`, `mouseActivityPercent`, `clickActivityPercent`, `activityScore`, `estimatedEfficiencyPercent`, `activityLevel`, `timelineColor`, `application`, `processName`, `windowTitle`, `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`
+
+### APP_FOCUS (apps used)
+`appName`, `application`, `applicationDisplayName`, `processName`, `windowTitle`, `activeSeconds`, `idleSeconds`, `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`
+
+### metadata (nested, duplicate of top-level OK)
+`source`, `triggerType`, `antiCheatFlags`, `sampleCount`, `clickSamples`, `totalSamples`, `mouseMoveSamples`, `fullEngagementPolls`, `microEngagementPolls`, `meetingPollSamples`, `meetingPresenceOverride`, `executablePath`, `processId`, `hasForegroundWindowHandle`, `windowReasonCode`, `workDescription`, …
+
+---
+
+## Activity score version gate (for report UI — store now, display later)
+
+```ts
+function isUnionEngagementEvent(event: TrackingEvent): boolean {
+  return (
+    event.validEngagedSeconds != null ||
+    event.engagementActivityPercent != null ||
+    event.metadata?.validEngagedSeconds != null
+  );
+}
+
+function timelineActivityScore(event: TrackingEvent): number {
+  if (isUnionEngagementEvent(event)) {
+    return Math.round(
+      event.engagementActivityPercent ??
+      event.metadata?.engagementActivityPercent ??
+      event.activityScore ??
+      0
+    );
+  }
+  // Legacy sessions only
+  const kb = event.keyboardActivityPercent ?? 0;
+  const mouse = event.mouseActivityPercent ?? 0;
+  return Math.round((kb + mouse) / 2);
+}
+```
+
+See `WEB_ACTIVITY_TIMELINE_SCORING_PROMPT.txt` for full timeline UI rules.
+
+---
+
+## Debugging steps (do first)
+
+1. Grep web repo: `events/batch`, `eventsBatch`, `BATCH_TRACKING`, `ACTIVITY_INTERVAL`
+2. Log **validation errors with field path** — replace generic `Something went wrong` with Zod `issues[]` in dev/staging
+3. Reproduce with curl — single event from a failing desktop queue row:
+
+```bash
+curl -X POST "https://landev.vercel.app/api/tracking/events/batch" \
+  -H "Content-Type: application/json" \
+  -H "Cookie: <session>" \
+  -d '{"events":[{ ... one ACTIVITY_INTERVAL from desktop queue ... }]}'
+```
+
+4. Confirm row appears in DB with full JSON preserved
+5. Post same `eventUuid` again → 200 idempotent
+
+---
+
+## Deliverables
+
+1. **Root-cause note** — which constraint/schema rejected desktop payloads (duplicate interval, unknown field, missing eventKind, Redis 500, etc.)
+2. **Code changes** — batch handler, Zod schema, Prisma/DB unique indexes, error responses
+3. **Manual test checklist** (all must pass):
+
+- [ ] Batch with `APP_FOCUS` + `INPUT_ACTIVITY` + `ACTIVITY_INTERVAL` returns **200**
+- [ ] Batch with only new v1.1 fields (`validEngagedSeconds`, `meetingAttributedSeconds`, `clickActivityPercent`) returns **200**
+- [ ] Two `ACTIVITY_INTERVAL` rows: same wall block, **different** `sessionSegmentStartedAt` → both persist
+- [ ] Same `eventUuid` posted twice → second call **200**, one DB row
+- [ ] Stop → Start same day → events from both segments queryable by `workDateKey`
+- [ ] Validation failure returns `{ error, issues: [...] }` with field path (not generic 500)
+- [ ] Desktop pending queue drains (no recurring `sync-batch-failed` in `landev-track.log`)
+
+4. **List** which desktop fields you persist vs ignore
+
+---
+
+## Related prompts (UI / reports — separate tasks)
+
+| File | Scope |
+|------|--------|
+| `WEB_ACTIVITY_TIMELINE_SCORING_PROMPT.txt` | Timeline colors / union engagement % |
+| `WEB_CLICK_ACTIVITY_PROMPT.txt` | Mouse clicks row |
+| `WEB_MEETING_ATTRIBUTED_TIME_PROMPT.txt` | Meeting attributed time |
+| `WEB_ACTIVITY_METRICS_PROMPT.txt` | Full metrics + daily rollups |
+| `WEB_SESSION_REPORT_DESKTOP_SYNC_PROMPT.txt` | Combined session report (note: old activity formula superseded by timeline prompt) |
+
+---
+
+## Desktop reference (read-only)
+
+- Batch kinds: `electron/api/client.ts` → `BATCH_TRACKING_EVENT_KINDS`
+- Sync worker: `electron/services/sync-worker.ts`
+- Interval clamp before upload: `electron/services/batch-event-payload.ts`
+- Prod log path (Windows): `%APPDATA%\landev-track-app\logs\landev-track.log`
+- Local queue DB: `%APPDATA%\landev-track-app\tracker.sqlite` → table `queued_events`

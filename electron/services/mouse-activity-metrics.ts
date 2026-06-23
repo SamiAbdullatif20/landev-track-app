@@ -9,12 +9,25 @@ export type MouseActivityPollStats = {
   pollsWithSignificantMovement: number;
 };
 
+export type ClickActivityPollStats = {
+  pollCount: number;
+  pollsWithClicks: number;
+};
+
 export type MouseActivityPercentResult = {
   mouseMovePercent: number;
   mouseMoveSamples: number;
   totalSamples: number;
   /** Estimated seconds with real mouse use in this sample window. */
   mouseActiveSeconds: number;
+};
+
+export type ClickActivityPercentResult = {
+  clickActivityPercent: number;
+  clickSamples: number;
+  totalSamples: number;
+  /** Estimated seconds with at least one click in this sample window. */
+  clickActiveSeconds: number;
 };
 
 function clampPercent(value: number): number {
@@ -56,6 +69,34 @@ export function computeMouseMovePercent(
   };
 }
 
+/**
+ * Click % = share of sample window seconds where at least one click occurred.
+ * Independent of movement % so all three breakdown metrics can coexist.
+ */
+export function computeClickActivityPercent(
+  stats: ClickActivityPollStats,
+  windowMs: number,
+  pollIntervalMs = MOUSE_POLL_INTERVAL_MS
+): ClickActivityPercentResult {
+  const totalSamples = Math.max(1, stats.pollCount);
+  const clickSamples = Math.min(totalSamples, Math.max(0, stats.pollsWithClicks));
+  const windowSeconds = Math.max(0.001, windowMs / 1000);
+  const pollSeconds = Math.max(0.001, pollIntervalMs / 1000);
+
+  const clickActiveSeconds = Number(
+    Math.min(windowSeconds, clickSamples * pollSeconds).toFixed(3)
+  );
+
+  const clickActivityPercent = clampPercent((clickActiveSeconds / windowSeconds) * 100);
+
+  return {
+    clickActivityPercent,
+    clickSamples,
+    totalSamples,
+    clickActiveSeconds
+  };
+}
+
 export function cursorTravelPx(
   fromX: number,
   fromY: number,
@@ -69,6 +110,11 @@ export function cursorTravelPx(
 
 export function isSignificantMouseMove(travelPx: number): boolean {
   return travelPx >= MOUSE_MOVE_THRESHOLD_PX;
+}
+
+/** True when this poll had at least one mouse button down. */
+export function isClickActivePoll(clickCount: number): boolean {
+  return clickCount > 0;
 }
 
 /** True when this poll had deliberate mouse use (movement or wheel, not click-only). */

@@ -30,7 +30,7 @@ export function TrackingOverlayView() {
     };
 
     refreshTodayTotal();
-    const intervalId = window.setInterval(refreshTodayTotal, 1000);
+    const intervalId = window.setInterval(refreshTodayTotal, 5000);
     return () => window.clearInterval(intervalId);
   }, [active]);
 

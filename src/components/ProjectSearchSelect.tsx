@@ -8,6 +8,7 @@ type ProjectSearchSelectProps = {
   value: string;
   disabled?: boolean;
   loading?: boolean;
+  fallbackLabel?: string;
   onChange: (projectId: string) => void;
   /** Called when the menu opens — use to refresh from API (not cache-only). */
   onOpen?: () => void;
@@ -18,6 +19,7 @@ export function ProjectSearchSelect({
   value,
   disabled,
   loading,
+  fallbackLabel,
   onChange,
   onOpen
 }: ProjectSearchSelectProps) {
@@ -80,7 +82,13 @@ export function ProjectSearchSelect({
     return () => window.cancelAnimationFrame(frameId);
   }, [open]);
 
-  const selectedLabel = selectedProject ? getProjectDisplayLabel(selectedProject) : "Select project";
+  const resolvedLabel =
+    selectedProject
+      ? getProjectDisplayLabel(selectedProject)
+      : value && fallbackLabel?.trim()
+        ? fallbackLabel.trim()
+        : "Select project";
+  const hasResolvedSelection = Boolean(selectedProject || (value && fallbackLabel?.trim()));
 
   return (
     <div
@@ -102,8 +110,8 @@ export function ProjectSearchSelect({
           openMenu();
         }}
       >
-        <span className={`project-select-label${selectedProject ? "" : " is-placeholder"}`}>
-          {loading && open ? "Loading projects…" : selectedLabel}
+        <span className={`project-select-label${hasResolvedSelection ? "" : " is-placeholder"}`}>
+          {loading && open ? "Loading projects…" : resolvedLabel}
         </span>
         <span className="project-select-chevron" aria-hidden>
           {open ? "▴" : "▾"}

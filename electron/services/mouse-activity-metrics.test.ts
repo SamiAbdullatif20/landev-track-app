@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  computeClickActivityPercent,
   computeMouseMovePercent,
   cursorTravelPx,
+  isClickActivePoll,
   isMouseActivePoll,
   isSignificantMouseMove,
   MOUSE_MOVE_THRESHOLD_PX
@@ -16,6 +18,21 @@ describe("mouse-activity-metrics", () => {
   it("counts wheel scroll as mouse activity", () => {
     expect(isMouseActivePoll(0, 1)).toBe(true);
     expect(isMouseActivePoll(0, 0)).toBe(false);
+  });
+
+  it("counts clicks separately from movement", () => {
+    expect(isClickActivePoll(1)).toBe(true);
+    expect(isClickActivePoll(0)).toBe(false);
+    expect(isMouseActivePoll(0, 0)).toBe(false);
+  });
+
+  it("computes click percent from polls with clicks", () => {
+    const result = computeClickActivityPercent(
+      { pollCount: 15, pollsWithClicks: 4 },
+      15_000
+    );
+    expect(result.clickActivityPercent).toBeCloseTo(26.67, 1);
+    expect(result.clickActiveSeconds).toBe(4);
   });
 
   it("returns 0% when no mouse polls in the window", () => {
