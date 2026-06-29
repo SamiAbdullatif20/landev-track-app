@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   applyEngagementPersistence,
+  applyMinimumEngagementThreshold,
   clearEngagementPersistenceState,
   computeEngagedSecondsFromPolls,
   isFullMouseEngagementPoll,
   isKeyboardEngagementPoll,
   isMicroMouseEngagementPoll,
+  MIN_ENGAGEMENT_RATIO,
   MOUSE_MICRO_MOVE_THRESHOLD_PX,
   setLastEngagementAtMsForTests
 } from "./activity-engagement";
@@ -76,5 +78,24 @@ describe("activity-engagement", () => {
     });
     expect(score.activityScore).toBe(0);
     expect(score.timelineColor).toBe("gray");
+  });
+
+  it("zeros engaged seconds at or below 5% of the window", () => {
+    expect(applyMinimumEngagementThreshold(0.5, 15)).toBe(0);
+    expect(applyMinimumEngagementThreshold(0.75, 15)).toBe(0);
+  });
+
+  it("keeps engaged seconds above 5% of the window", () => {
+    expect(applyMinimumEngagementThreshold(1, 15)).toBe(1);
+    expect(applyMinimumEngagementThreshold(5, 15)).toBe(5);
+  });
+
+  it("persistence floor still passes 5% threshold when applied after", () => {
+    const now = Date.now();
+    setLastEngagementAtMsForTests(now - 20_000);
+    const persisted = applyEngagementPersistence(0, 15, 12, now);
+    expect(persisted).toBe(8.25);
+    expect(applyMinimumEngagementThreshold(persisted, 15)).toBe(8.25);
+    expect(persisted / 15).toBeGreaterThan(MIN_ENGAGEMENT_RATIO);
   });
 });

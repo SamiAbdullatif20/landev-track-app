@@ -82,6 +82,62 @@ export function resolveWorkDayStartMs(workDateKey: string, timeZone: string): nu
   return low;
 }
 
+export type MsInterval = {
+  startMs: number;
+  endMs: number;
+};
+
+/** Clip [rangeStartIso, rangeEndIso) to the local work day, or null if no overlap. */
+export function clipRangeToWorkDay(
+  rangeStartIso: string,
+  rangeEndIso: string,
+  workDateKey: string,
+  timeZone?: string
+): MsInterval | null {
+  const zone = timeZone ?? getClientIanaTimeZone();
+  const startMs = Date.parse(rangeStartIso);
+  const endMs = Date.parse(rangeEndIso);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return null;
+  }
+
+  const dayStartMs = resolveWorkDayStartMs(workDateKey, zone);
+  const dayEndMs = resolveWorkDayStartMs(nextWorkDateKey(workDateKey), zone);
+  const clipStart = Math.max(startMs, dayStartMs);
+  const clipEnd = Math.min(endMs, dayEndMs);
+  if (clipEnd <= clipStart) {
+    return null;
+  }
+
+  return { startMs: clipStart, endMs: clipEnd };
+}
+
+/** Union of intervals — overlapping ranges are counted once. */
+export function mergeIntervalsTotalMs(intervals: MsInterval[]): number {
+  const valid = intervals.filter((interval) => interval.endMs > interval.startMs);
+  if (valid.length === 0) {
+    return 0;
+  }
+
+  valid.sort((a, b) => a.startMs - b.startMs);
+  let total = 0;
+  let currentStart = valid[0].startMs;
+  let currentEnd = valid[0].endMs;
+
+  for (let index = 1; index < valid.length; index += 1) {
+    const next = valid[index];
+    if (next.startMs <= currentEnd) {
+      currentEnd = Math.max(currentEnd, next.endMs);
+      continue;
+    }
+    total += currentEnd - currentStart;
+    currentStart = next.startMs;
+    currentEnd = next.endMs;
+  }
+
+  return total + (currentEnd - currentStart);
+}
+
 /** Milliseconds of [rangeStartIso, rangeEndIso) that fall on workDateKey in timeZone. */
 export function getWorkDayOverlapMs(
   rangeStartIso: string,

@@ -1,4 +1,4 @@
-import logoSrc from "../../public/logo.png";
+import logoSrc from "../../public/app-icon.png";
 
 type LandevLogoProps = {
   className?: string;

@@ -1,0 +1,228 @@
+Copy everything below into your Landev web/backend Cursor chat.
+
+---
+
+## Task: Fix the **live session timer** on the web dashboard (counter stuck at 0:00 or frozen)
+
+Employees start tracking on desktop or web but the dashboard timer does **not tick** every second while the session is active.
+
+**Desktop app (v1.1.4+) now sends everything needed.** Fix is **web/backend + dashboard UI only** — do not change the desktop app in this task.
+
+---
+
+## Expected behavior
+
+| State | Web UI |
+|-------|--------|
+| Session **active** | Timer ticks every second (e.g. `0:01`, `0:02`, … `1:23:45`) |
+| Session **stopped** | Timer freezes at final duration; does not keep counting |
+| Desktop Start | Web timer starts within **≤5s** (or immediately if processing `SESSION_START` trailing event) |
+| Desktop Stop | Web timer stops within **≤5s** (or immediately on `SESSION_STOP` trailing event) |
+| Page refresh while active | Timer resumes from correct elapsed time |
+
+---
+
+## Root cause (typical)
+
+The live counter is **not** a server-pushed duration. It must be computed **client-side**:
+
+```ts
+elapsedMs = Date.now() - Date.parse(startedAt)
+```
+
+Common bugs:
+
+1. **No `setInterval`** — UI only shows static `durationMs` from last API poll (updates every 5s, not every second).
+2. **`startedAt` missing** — `GET /api/tracking/session/active` returns `active: true` but no `startedAt` / `startTime` / `startTimeUtc`.
+3. **Wrong field name** — UI reads `startTime` but API only returns `startedAt` (or vice versa).
+4. **Stale `active` flag** — Stop does not clear active session; timer keeps running after stop.
+5. **Using activity event sums** — Summing `INPUT_ACTIVITY.trackerElapsedMs` is **not** the live session timer (lags, gaps, wrong metric).
+6. **Ignoring trailing events** — Desktop sends immediate `SESSION_START` / `SESSION_STOP` on start/stop; web only polls slowly.
+
+---
+
+## What the desktop sends
+
+### POST `/api/tracking/session/start`
+
+```json
+{
+  "projectId": "uuid-or-catalog",
+  "projectName": "Admin - General",
+  "description": "Site drawings",
+  "clientTimeZone": "Pacific/Auckland",
+  "workDateKey": "2026-06-02",
+  "startedAt": "2026-06-02T08:00:00.000Z",
+  "startTime": "2026-06-02T08:00:00.000Z",
+  "startTimeUtc": "2026-06-02T08:00:00.000Z",
+  "occurredAt": "2026-06-02T08:00:00.000Z",
+  "trailingEvents": [{
+    "eventUuid": "...",
+    "eventKind": "SESSION_START",
+    "occurredAtIso": "2026-06-02T08:00:00.000Z",
+    "workDateKey": "2026-06-02",
+    "source": "DESKTOP_AGENT"
+  }]
+}
+```
+
+**Persist `startedAt` exactly as sent** (client clock at Start press). Return it on active-session endpoints.
+
+### POST `/api/tracking/session/stop`
+
+Includes `trailingEvents` with `eventKind: "SESSION_STOP"` for **immediate** timer cutoff (already documented in WEB_DESKTOP_SESSION_SYNC_PROMPT.txt).
+
+---
+
+## GET active session — required response shape
+
+`GET /api/tracking/session/active` (and fallbacks `/api/tracking/session/status`, `/api/attendance/today`):
+
+**While running:**
+```json
+{
+  "active": true,
+  "workSession": {
+    "id": "clx...",
+    "sessionId": "clx...",
+    "projectId": "...",
+    "projectName": "Admin - General",
+    "description": "Site drawings",
+    "startedAt": "2026-06-02T08:00:00.000Z",
+    "startTime": "2026-06-02T08:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+**While stopped:**
+```json
+{
+  "active": false,
+  "workSession": null
+}
+```
+
+Accept any of these field aliases for start instant: `startedAt`, `startTime`, `startTimeUtc`, `clockInAt`.
+
+---
+
+## Web UI implementation (REQUIRED)
+
+### 1. Hook: live timer from `startedAt`
+
+```tsx
+function useLiveSessionTimer(active: boolean, startedAt: string | null): string {
+  const [label, setLabel] = useState("0:00");
+
+  useEffect(() => {
+    if (!active || !startedAt) {
+      setLabel("0:00");
+      return;
+    }
+    const startedMs = Date.parse(startedAt);
+    if (!Number.isFinite(startedMs)) {
+      setLabel("0:00");
+      return;
+    }
+
+    const tick = () => {
+      setLabel(formatDuration(Date.now() - startedMs));
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [active, startedAt]);
+
+  return label;
+}
+```
+
+`formatDuration(ms)` → `H:MM:SS` or `M:SS` (same as desktop).
+
+### 2. Poll active session every 3–5s
+
+```ts
+const { active, startedAt, projectName } = await fetchActiveSession();
+const liveLabel = useLiveSessionTimer(active, startedAt);
+```
+
+On each poll, update `active` + `startedAt` in React state. The **interval** handles per-second ticks; poll only resyncs if drift or remote start/stop.
+
+### 3. Process trailing events on start/stop ingest
+
+On `POST /api/tracking/session/start`:
+
+```ts
+for (const event of body.trailingEvents ?? []) {
+  if (event.eventKind === "SESSION_START") {
+    await publishSessionState({ active: true, startedAt: event.occurredAtIso });
+  }
+}
+```
+
+On `POST /api/tracking/session/stop`:
+
+```ts
+for (const event of body.trailingEvents ?? []) {
+  if (event.eventKind === "SESSION_STOP") {
+    await publishSessionState({ active: false, stoppedAt: event.occurredAtIso });
+  }
+}
+```
+
+`publishSessionState` = update DB + push to open dashboard tabs (SSE/WebSocket) or invalidate React Query cache.
+
+### 4. “Today total” vs live segment timer
+
+| Display | Source |
+|---------|--------|
+| **Live segment timer** (while tracking) | `Date.now() - startedAt` for **current** active WorkSession |
+| **Worked today** total | Sum of **completed** segment durations + live segment overlap (see WEB_TRACKED_TIME_FIX_PROMPT.txt) |
+
+Do not use the same static value for both.
+
+---
+
+## Acceptance tests
+
+1. Start on **desktop** → web timer begins ticking within 5s; shows `0:01`, `0:02`, …
+2. Stop on **desktop** → web timer **stops** (no further ticks).
+3. Start on **web** → timer ticks immediately on that tab.
+4. Refresh page mid-session → timer shows correct elapsed (not `0:00`).
+5. `curl GET /api/tracking/session/active` while tracking → `active: true` and non-null `startedAt`.
+6. Stop → next `curl` → `active: false` within 5s.
+7. Five Start/Stop cycles in one day → live timer works every cycle (not just the first).
+
+---
+
+## Files to search (web repo)
+
+```
+useSessionTimer
+live timer
+session/active
+tracking/session/start
+trailingEvents
+SESSION_START
+SESSION_STOP
+startedAt
+startTimeUtc
+workSession
+active session
+```
+
+---
+
+## Reference (desktop repo)
+
+- `electron/api/client.ts` — `buildSessionStartBody`, `buildSessionStopBody`, trailing events
+- `electron/services/session-remote-sync.ts` — desktop polls web every 5s
+- `electron/services/session-remote-status.ts` — parses `startedAt` from web
+- `src/hooks/useSessionTimer.ts` — working desktop live timer (mirror this logic on web)
+- `WEB_DESKTOP_SESSION_SYNC_PROMPT.txt` — bidirectional start/stop sync
+- `WEB_TRACKED_TIME_FIX_PROMPT.txt` — day totals vs live segment
+
+---
+
+EOF

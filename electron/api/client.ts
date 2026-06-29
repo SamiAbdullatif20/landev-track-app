@@ -57,12 +57,20 @@ export type TrackingEventInput = {
   metadata?: Record<string, unknown>;
 };
 
-export type SessionStopTrailingEvent = {
+export type SessionLifecycleTrailingEvent = {
   eventUuid: string;
-  eventKind: "SESSION_STOP";
+  eventKind: "SESSION_START" | "SESSION_STOP";
   occurredAtIso: string;
   workDateKey: string;
   source: "DESKTOP_AGENT";
+  metadata?: Record<string, unknown>;
+};
+
+export type SessionStopReason = "USER" | "INACTIVITY_AUTO";
+
+/** @deprecated Use SessionLifecycleTrailingEvent */
+export type SessionStopTrailingEvent = SessionLifecycleTrailingEvent & {
+  eventKind: "SESSION_STOP";
 };
 
 export type SessionStopInput = {
@@ -84,7 +92,9 @@ export type SessionStopInput = {
   /** Stable per-install device id. */
   deviceUuid?: string;
   /** Immediate SESSION_STOP signal for web live-timer cutoff. */
-  trailingEvents?: SessionStopTrailingEvent[];
+  trailingEvents?: SessionLifecycleTrailingEvent[];
+  /** Why the desktop ended the session (user stop vs inactivity auto-stop). */
+  stopReason?: SessionStopReason;
 };
 
 export type ScreenshotIngestInput = {
@@ -942,6 +952,15 @@ export async function getProjects(options: AuthAwareRequestOptions): Promise<Pro
 function buildSessionStartBody(payload: SessionStartInput, clockStartUtc: string): Record<string, unknown> {
   const trimmedDescription = payload.description.trim();
   const workDateKey = getWorkDateKey(new Date(clockStartUtc));
+  const trailingEvents: SessionLifecycleTrailingEvent[] = [
+    {
+      eventUuid: randomUUID(),
+      eventKind: "SESSION_START",
+      occurredAtIso: clockStartUtc,
+      workDateKey,
+      source: "DESKTOP_AGENT"
+    }
+  ];
   const base: Record<string, unknown> = {
     description: trimmedDescription,
     workDetails: trimmedDescription,
@@ -951,7 +970,9 @@ function buildSessionStartBody(payload: SessionStartInput, clockStartUtc: string
     workDateKey,
     startTime: clockStartUtc,
     startedAt: clockStartUtc,
-    occurredAt: clockStartUtc
+    startTimeUtc: clockStartUtc,
+    occurredAt: clockStartUtc,
+    trailingEvents
   };
 
   if (isCatalogProjectId(payload.projectId)) {
@@ -992,7 +1013,8 @@ export async function startSession(payload: SessionStartInput, options: RequestO
         clientTimeZone: payload.clientTimeZone,
         startTimeUtc: clockStartUtc,
         usesCatalogProject,
-        projectName: usesCatalogProject ? payload.projectName : undefined
+        projectName: usesCatalogProject ? payload.projectName : undefined,
+        hasTrailingEvents: true
       });
       const response = await client.post(sessionStartPath, sharedDescriptionFields, { headers });
       persistCookieIfPresent(response, options);
@@ -1216,6 +1238,9 @@ function buildSessionStopBody(payload: SessionStopInput): Record<string, unknown
   }
   if (payload.trailingEvents && payload.trailingEvents.length > 0) {
     body.trailingEvents = payload.trailingEvents;
+  }
+  if (payload.stopReason) {
+    body.stopReason = payload.stopReason;
   }
   if (payload.startedAt) {
     body.startedAt = payload.startedAt;

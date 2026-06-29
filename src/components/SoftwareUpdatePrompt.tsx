@@ -54,31 +54,43 @@ export function SoftwareUpdatePrompt() {
         </h2>
 
         {showAvailable && (
-          <div className="update-prompt-actions">
-            <button type="button" className="update-prompt-primary" disabled={busy} onClick={() => void onDownload()}>
-              {busy ? "Starting download…" : "Update now"}
-            </button>
-            <button type="button" className="update-prompt-secondary" disabled={busy} onClick={onLater}>
-              Later
-            </button>
-          </div>
+          <>
+            <p className="update-prompt-message">
+              Version {status.version} is ready (you have {status.currentVersion}). This installs the latest
+              release in one step.
+            </p>
+            <div className="update-prompt-actions">
+              <button type="button" className="update-prompt-primary" disabled={busy} onClick={() => void onDownload()}>
+                {busy ? "Starting download…" : "Download update"}
+              </button>
+              <button type="button" className="update-prompt-secondary" disabled={busy} onClick={onLater}>
+                Later
+              </button>
+            </div>
+          </>
         )}
 
         {showDownloading && (
-          <div className="update-progress-track" aria-hidden>
-            <div className="update-progress-fill" style={{ width: `${status.percent}%` }} />
-          </div>
+          <>
+            <p className="update-prompt-message">Downloading the latest version…</p>
+            <div className="update-progress-track" aria-hidden>
+              <div className="update-progress-fill" style={{ width: `${status.percent}%` }} />
+            </div>
+          </>
         )}
 
         {showReady && (
-          <div className="update-prompt-actions">
-            <button type="button" className="update-prompt-primary" onClick={onInstall}>
-              Restart and update
-            </button>
-            <button type="button" className="update-prompt-secondary" onClick={onLater}>
-              Later
-            </button>
-          </div>
+          <>
+            <p className="update-prompt-message">Version {status.version} is ready to install.</p>
+            <div className="update-prompt-actions">
+              <button type="button" className="update-prompt-primary" onClick={onInstall}>
+                Restart and update
+              </button>
+              <button type="button" className="update-prompt-secondary" onClick={onLater}>
+                Later
+              </button>
+            </div>
+          </>
         )}
       </section>
     </div>

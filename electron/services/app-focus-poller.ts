@@ -7,15 +7,12 @@ import {
   isReportableForegroundContext,
   recordAppFocusEvent
 } from "./tracking-app-focus";
-import {
-  recordMeetingAttributionPoll,
-  refreshBackgroundMeetingPresence,
-  updateForegroundContextForMeeting
-} from "./meeting-attribution-state";
 
-export const APP_FOCUS_CHECK_MS = 3_000;
+export const APP_FOCUS_CHECK_MS = 5_000;
 export const APP_FOCUS_TICK_MS = 15_000;
-export const MEETING_BACKGROUND_SCAN_MS = 15_000;
+
+/** Minimum seconds credited when switching away from a brief foreground app. */
+const MIN_BRIEF_SWITCH_SECONDS = 1;
 
 export class AppFocusPoller {
   private checkTimer: NodeJS.Timeout | null = null;
@@ -23,7 +20,6 @@ export class AppFocusPoller {
   private lastSignature: string | null = null;
   private lastReportableContext: ActivityContext | null = null;
   private lastEmittedAtMs = 0;
-  private lastBackgroundMeetingScanMs = 0;
   private runGeneration = 0;
 
   start(): void {
@@ -34,7 +30,6 @@ export class AppFocusPoller {
     this.lastSignature = null;
     this.lastReportableContext = null;
     this.lastEmittedAtMs = Date.now();
-    this.lastBackgroundMeetingScanMs = 0;
     this.checkTimer = setInterval(() => void this.checkForeground(), APP_FOCUS_CHECK_MS);
     this.tickTimer = setInterval(() => void this.emitTick(), APP_FOCUS_TICK_MS);
     logger.info("app-focus-poller-started", {
@@ -112,12 +107,14 @@ export class AppFocusPoller {
     });
   }
 
-  private async maybeRefreshBackgroundMeeting(nowMs: number): Promise<void> {
-    if (nowMs - this.lastBackgroundMeetingScanMs < MEETING_BACKGROUND_SCAN_MS) {
-      return;
+  private leavingAppSeconds(elapsedSeconds: number): number {
+    if (elapsedSeconds <= 0) {
+      return 0;
     }
-    this.lastBackgroundMeetingScanMs = nowMs;
-    await refreshBackgroundMeetingPresence();
+    if (elapsedSeconds < MIN_BRIEF_SWITCH_SECONDS) {
+      return MIN_BRIEF_SWITCH_SECONDS;
+    }
+    return elapsedSeconds;
   }
 
   private async checkForeground(): Promise<void> {
@@ -134,9 +131,6 @@ export class AppFocusPoller {
     const reportableRaw = isReportableForegroundContext(raw) ? raw : null;
     const context = reportableRaw ?? this.lastReportableContext;
     const nowMs = Date.now();
-    updateForegroundContextForMeeting(reportableRaw);
-    await this.maybeRefreshBackgroundMeeting(nowMs);
-    recordMeetingAttributionPoll(reportableRaw);
     if (!context) {
       return;
     }
@@ -148,7 +142,7 @@ export class AppFocusPoller {
       && signature !== this.lastSignature
       && this.lastReportableContext
     ) {
-      const leavingSeconds = this.elapsedSecondsSinceLastEmit(nowMs);
+      const leavingSeconds = this.leavingAppSeconds(this.elapsedSecondsSinceLastEmit(nowMs));
       if (leavingSeconds > 0) {
         const queued = await this.emitFocusForContext(
           this.lastReportableContext,
@@ -196,10 +190,6 @@ export class AppFocusPoller {
     }
 
     const nowMs = Date.now();
-    updateForegroundContextForMeeting(isReportableForegroundContext(raw) ? raw : null);
-    await this.maybeRefreshBackgroundMeeting(nowMs);
-    recordMeetingAttributionPoll(isReportableForegroundContext(raw) ? raw : null);
-
     const context = isReportableForegroundContext(raw)
       ? raw
       : this.lastReportableContext;

@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { app } from "electron";
+import { runOneTimeLocalTrackingResetIfNeeded } from "./local-tracking-reset";
 
 let db: Database.Database;
 
@@ -90,6 +91,24 @@ function runMigration(database: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_project_cache_display_label
       ON project_cache(displayLabel COLLATE NOCASE);
+
+    CREATE TABLE IF NOT EXISTS queued_screenshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      uploadUuid TEXT NOT NULL UNIQUE,
+      filePath TEXT NOT NULL,
+      capturedAt TEXT NOT NULL,
+      projectId TEXT,
+      sessionId TEXT,
+      metadataJson TEXT NOT NULL,
+      mimeType TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      nextRunAt TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_queued_screenshots_status_next_run
+      ON queued_screenshots(status, nextRunAt);
   `);
 
   const hasLegacyQueueTable = database
@@ -117,6 +136,8 @@ function runMigration(database: Database.Database): void {
       DROP TABLE active_session_legacy;
     `);
   }
+
+  runOneTimeLocalTrackingResetIfNeeded(database);
 }
 
 export function getDb(): Database.Database {

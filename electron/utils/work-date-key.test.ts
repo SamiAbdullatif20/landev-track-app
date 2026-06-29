@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  clipRangeToWorkDay,
   formatWorkDateKeyAt,
   getWorkDayOverlapMs,
+  mergeIntervalsTotalMs,
   nextWorkDateKey,
   resolveWorkDayStartMs
 } from "./work-date-key";
@@ -40,5 +42,29 @@ describe("work-date-key overlap", () => {
 
   it("formats stable YYYY-MM-DD keys", () => {
     expect(formatWorkDateKeyAt(Date.parse("2026-05-20T12:00:00.000Z"), "UTC")).toBe("2026-05-20");
+  });
+
+  it("merges overlapping intervals without double counting", () => {
+    expect(
+      mergeIntervalsTotalMs([
+        { startMs: 0, endMs: 3_600_000 },
+        { startMs: 1_800_000, endMs: 5_400_000 }
+      ])
+    ).toBe(5_400_000);
+  });
+
+  it("clips ranges to a work day", () => {
+    const day = "2026-06-02";
+    const dayStart = resolveWorkDayStartMs(day, nz);
+    const clipped = clipRangeToWorkDay(
+      new Date(dayStart - 3_600_000).toISOString(),
+      new Date(dayStart + 2 * 3_600_000).toISOString(),
+      day,
+      nz
+    );
+    expect(clipped).toEqual({
+      startMs: dayStart,
+      endMs: dayStart + 2 * 3_600_000
+    });
   });
 });

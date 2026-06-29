@@ -9,6 +9,8 @@ import {
   markEventForRetry,
   markEventsDelivered
 } from "../db/queue-repo";
+import { getPendingScreenshotCount } from "../db/screenshot-queue";
+import { flushScreenshotQueue } from "./screenshot-queue-flush";
 import { refreshAuthSession, readAuthContext } from "./auth-session";
 import { buildBatchPayloadFromQueuedEvent } from "./batch-event-payload";
 import { notifyDesktop } from "./desktop-notifications";
@@ -30,6 +32,11 @@ export type SyncStatus = {
 
 /** Batch flush interval (30–60s target). */
 export const EVENT_BATCH_SYNC_INTERVAL_MS = 45_000;
+
+/** Events + offline screenshots awaiting upload. */
+function getCombinedPendingCount(): number {
+  return getPendingCount() + getPendingScreenshotCount();
+}
 
 const BATCH_SIZE = 100;
 
@@ -174,7 +181,7 @@ export class SyncWorker {
   constructor(options: SyncWorkerOptions) {
     this.window = options.window;
     this.onSyncResult = options.onSyncResult;
-    this.status.pendingCount = getPendingCount();
+    this.status.pendingCount = getCombinedPendingCount();
   }
 
   public start(): void {
@@ -199,7 +206,7 @@ export class SyncWorker {
   }
 
   public getStatus(): SyncStatus {
-    return { ...this.status, pendingCount: getPendingCount() };
+    return { ...this.status, pendingCount: getCombinedPendingCount() };
   }
 
   public async flush(): Promise<SyncStatus> {
@@ -209,7 +216,7 @@ export class SyncWorker {
 
     const ctx = readAuthContext();
     if (!ctx.token && !ctx.sessionCookie) {
-      this.status.pendingCount = getPendingCount();
+      this.status.pendingCount = getCombinedPendingCount();
       this.publishStatus();
       return this.getStatus();
     }
@@ -219,57 +226,63 @@ export class SyncWorker {
     this.publishStatus();
 
     try {
+      const requestOptions = {
+        ...ctx,
+        onAuthRefresh: refreshAuthSession
+      };
+
       const events = getPendingEventsByKinds(api.BATCH_TRACKING_EVENT_KINDS, BATCH_SIZE);
-      if (events.length === 0) {
-        this.status.pendingCount = getPendingCount();
-        return this.getStatus();
+      if (events.length > 0) {
+        const prepared = events.map(parseQueuedBatchEvent);
+        let nextRetryAt: string | null = null;
+
+        try {
+          logger.info("sync-batch-attempt", {
+            count: prepared.length,
+            kinds: Array.from(new Set(events.map((event) => event.eventKind)))
+          });
+          const result = await syncPreparedQueuedEvents(prepared, requestOptions);
+          nextRetryAt = result.nextRetryAt;
+          if (result.deliveredIds.length > 0) {
+            logger.info("sync-batch-delivered", { count: result.deliveredIds.length });
+            this.onSyncResult?.({ ok: true, statusCode: 200, message: "batch_delivered" });
+            this.status.online = true;
+            this.status.lastError = null;
+            this.status.lastSyncAt = new Date().toISOString();
+          }
+        } catch (error) {
+          this.onSyncResult?.({
+            ok: false,
+            statusCode: error instanceof api.ApiError ? error.statusCode ?? null : null,
+            message: error instanceof Error ? error.message : "sync_failed"
+          });
+          if (error instanceof api.ApiError && error.kind === "network") {
+            this.status.online = false;
+            this.status.lastError = "offline";
+          } else {
+            this.status.lastError = error instanceof Error ? error.message : "sync_failed";
+          }
+          const remaining = getCombinedPendingCount();
+          if (remaining > 0) {
+            this.maybeNotifySyncFailure(remaining);
+          }
+        }
+
+        this.status.nextRetryAt = nextRetryAt;
       }
 
-      const prepared = events.map(parseQueuedBatchEvent);
-      let nextRetryAt: string | null = null;
-
-      try {
-        logger.info("sync-batch-attempt", {
-          count: prepared.length,
-          kinds: Array.from(new Set(events.map((event) => event.eventKind)))
-        });
-        const result = await syncPreparedQueuedEvents(prepared, {
-          ...ctx,
-          onAuthRefresh: refreshAuthSession
-        });
-        nextRetryAt = result.nextRetryAt;
-        if (result.deliveredIds.length > 0) {
-          logger.info("sync-batch-delivered", { count: result.deliveredIds.length });
-          this.onSyncResult?.({ ok: true, statusCode: 200, message: "batch_delivered" });
-          this.status.online = true;
-          this.status.lastError = null;
-          this.status.lastSyncAt = new Date().toISOString();
-        }
-      } catch (error) {
-        this.onSyncResult?.({
-          ok: false,
-          statusCode: error instanceof api.ApiError ? error.statusCode ?? null : null,
-          message: error instanceof Error ? error.message : "sync_failed"
-        });
-        if (error instanceof api.ApiError && error.kind === "network") {
-          this.status.online = false;
-          this.status.lastError = "offline";
-        } else {
-          this.status.lastError = error instanceof Error ? error.message : "sync_failed";
-        }
-        const remaining = getPendingCount();
-        if (remaining > 0) {
-          this.maybeNotifySyncFailure(remaining);
-        }
+      const screenshotResult = await flushScreenshotQueue(requestOptions);
+      if (screenshotResult.uploaded > 0) {
+        this.status.online = true;
+        this.status.lastError = null;
+        this.status.lastSyncAt = new Date().toISOString();
       }
 
-      this.status.nextRetryAt = nextRetryAt;
-      this.status.pendingCount = getPendingCount();
       return this.getStatus();
     } finally {
       this.syncInProgress = false;
       this.status.syncing = false;
-      this.status.pendingCount = getPendingCount();
+      this.status.pendingCount = getCombinedPendingCount();
       this.publishStatus();
     }
   }

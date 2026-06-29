@@ -1,32 +1,52 @@
 import { randomUUID } from "node:crypto";
-import type { SessionStopInput } from "../api/client";
+import type { SessionLifecycleTrailingEvent, SessionStopInput, SessionStopReason } from "../api/client";
 import { getClientIanaTimeZone } from "../config/client-timezone";
 import type { SessionState } from "../db/index";
 import { getDeviceUuid } from "../security/device-identity";
 import { getWorkDateKey } from "../utils/work-date-key";
 
-export type SessionStopTrailingEvent = {
-  eventUuid: string;
+export type SessionStopTrailingEvent = SessionLifecycleTrailingEvent & {
   eventKind: "SESSION_STOP";
-  occurredAtIso: string;
-  workDateKey: string;
-  source: "DESKTOP_AGENT";
 };
+
+export function buildSessionStartTrailingEvent(
+  startedAt: string,
+  workDateKey: string
+): SessionLifecycleTrailingEvent {
+  return {
+    eventUuid: randomUUID(),
+    eventKind: "SESSION_START",
+    occurredAtIso: startedAt,
+    workDateKey,
+    source: "DESKTOP_AGENT"
+  };
+}
 
 export function buildSessionStopTrailingEvent(
   stoppedAt: string,
-  workDateKey: string
+  workDateKey: string,
+  metadata?: Record<string, unknown>
 ): SessionStopTrailingEvent {
   return {
     eventUuid: randomUUID(),
     eventKind: "SESSION_STOP",
     occurredAtIso: stoppedAt,
     workDateKey,
-    source: "DESKTOP_AGENT"
+    source: "DESKTOP_AGENT",
+    ...(metadata ? { metadata } : {})
   };
 }
 
-export function buildSessionStopInput(state: SessionState, stoppedAt: string): SessionStopInput {
+export type BuildSessionStopInputOptions = {
+  stopReason?: SessionStopReason;
+  inactivityWorkActivityPercent?: number;
+};
+
+export function buildSessionStopInput(
+  state: SessionState,
+  stoppedAt: string,
+  options: BuildSessionStopInputOptions = {}
+): SessionStopInput {
   const clientTimeZone = getClientIanaTimeZone();
   const startedAt = state.startedAt ?? undefined;
   const startedMs = startedAt ? Date.parse(startedAt) : Number.NaN;
@@ -36,6 +56,14 @@ export function buildSessionStopInput(state: SessionState, stoppedAt: string): S
       ? stoppedMs - startedMs
       : undefined;
   const workDateKey = getWorkDateKey(new Date(stoppedAt));
+  const stopReason = options.stopReason ?? "USER";
+  const trailingMetadata =
+    stopReason === "INACTIVITY_AUTO"
+      ? {
+          stopReason,
+          workActivityPercent: options.inactivityWorkActivityPercent ?? null
+        }
+      : { stopReason };
 
   return {
     sessionId: state.sessionId,
@@ -48,6 +76,7 @@ export function buildSessionStopInput(state: SessionState, stoppedAt: string): S
     clientTimeZone,
     timezone: clientTimeZone,
     deviceUuid: getDeviceUuid(),
-    trailingEvents: [buildSessionStopTrailingEvent(stoppedAt, workDateKey)]
+    stopReason,
+    trailingEvents: [buildSessionStopTrailingEvent(stoppedAt, workDateKey, trailingMetadata)]
   };
 }

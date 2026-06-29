@@ -17,12 +17,14 @@ if (!src || !fs.existsSync(src)) {
 const ICO_SIZES = [16, 32, 48, 256];
 const PNG_SIZE = 512;
 
+const ICON_BACKGROUND = { r: 237, g: 245, b: 252, alpha: 1 };
+
 const icoPngBuffers = await Promise.all(
   ICO_SIZES.map((size) =>
     sharp(src)
       .resize(size, size, {
         fit: "contain",
-        background: { r: 237, g: 245, b: 252, alpha: 1 }
+        background: ICON_BACKGROUND
       })
       .png()
       .toBuffer()
@@ -32,7 +34,7 @@ const icoPngBuffers = await Promise.all(
 const appPngBuffer = await sharp(src)
   .resize(PNG_SIZE, PNG_SIZE, {
     fit: "contain",
-    background: { r: 237, g: 245, b: 252, alpha: 1 }
+    background: ICON_BACKGROUND
   })
   .png()
   .toBuffer();

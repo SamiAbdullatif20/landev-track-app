@@ -47,7 +47,7 @@
       }
     ],
     "icon": "build/icons/icon.ico",
-    "artifactName": "${productName}-Windows-${version}-Setup.${ext}",
+    "artifactName": "LANDEV-Tracker-Windows-${version}-Setup.${ext}",
     "signAndEditExecutable": false
   },
   "nsis": {

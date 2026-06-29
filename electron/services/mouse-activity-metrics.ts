@@ -1,8 +1,8 @@
 /** Minimum cursor travel (px) between polls to count as intentional mouse use. */
 export const MOUSE_MOVE_THRESHOLD_PX = 12;
 
-/** Poll interval used by InputActivitySampler (must match). */
-export const MOUSE_POLL_INTERVAL_MS = 1_000;
+/** Poll interval used by InputActivitySampler (must match INPUT_ACTIVITY_POLL_MS). */
+export const MOUSE_POLL_INTERVAL_MS = 2_000;
 
 export type MouseActivityPollStats = {
   pollCount: number;

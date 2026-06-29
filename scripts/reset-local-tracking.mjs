@@ -91,6 +91,7 @@ function resetToday(dbPath) {
 
   runSql(dbPath, stopActiveSessionSql());
   runSql(dbPath, "DELETE FROM queued_events WHERE status IN ('pending', 'retry');");
+  runSql(dbPath, "DELETE FROM queued_screenshots WHERE status IN ('pending', 'retry');");
   runSql(dbPath, "DELETE FROM app_settings WHERE key = 'activeSessionProjectName';");
   runSql(dbPath, "DELETE FROM app_settings WHERE key = 'activeSessionIsNonChargeable';");
 
@@ -128,6 +129,7 @@ function resetAll(dbPath) {
     `
 ${stopActiveSessionSql()}
 DELETE FROM queued_events WHERE status IN ('pending', 'retry');
+DELETE FROM queued_screenshots WHERE status IN ('pending', 'retry');
 DELETE FROM app_settings
 WHERE key = 'workLogEntries'
    OR key = 'activeSessionProjectName'
@@ -166,6 +168,11 @@ for (const dir of userDataDirs) {
   if (result) {
     resetCount += 1;
     totalRemoved += result.removed ?? 0;
+    const screenshotQueueDir = path.join(dir, "screenshot-queue");
+    if (fs.existsSync(screenshotQueueDir)) {
+      fs.rmSync(screenshotQueueDir, { recursive: true, force: true });
+      console.log(`  Cleared screenshot queue: ${screenshotQueueDir}`);
+    }
   }
 }
 

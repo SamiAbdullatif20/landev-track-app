@@ -1,4 +1,4 @@
-import { BrowserWindow, screen } from "electron";
+import { BrowserWindow, screen, app } from "electron";
 import { getSessionState } from "../db/queue-repo";
 
 type TrackingOverlayOptions = {
@@ -35,6 +35,7 @@ export class TrackingOverlayManager {
 
   destroy(): void {
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+      void this.overlayWindow.webContents.session.clearCache();
       this.overlayWindow.destroy();
     }
     this.overlayWindow = null;
@@ -82,13 +83,19 @@ export class TrackingOverlayManager {
       skipTaskbar: true,
       show: false,
       focusable: false,
+      transparent: true,
+      backgroundColor: "#00000000",
       hasShadow: false,
       thickFrame: false,
       webPreferences: {
         preload: this.options.preloadPath,
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: true
+        sandbox: true,
+        backgroundThrottling: true,
+        spellcheck: false,
+        enableWebSQL: false,
+        devTools: !app.isPackaged
       }
     });
 

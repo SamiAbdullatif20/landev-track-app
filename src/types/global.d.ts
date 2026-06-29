@@ -120,6 +120,13 @@ declare global {
       syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
       onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
       onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;
+      onInactivityAutoStopPush: (
+        cb: (payload: {
+          stoppedAt: string;
+          workActivityPercent: number | null;
+          stopReason: string;
+        }) => void
+      ) => () => void;
     };
   }
 }

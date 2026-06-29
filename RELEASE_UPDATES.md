@@ -7,7 +7,9 @@ Employees **do not need GitHub accounts**. The installed app checks for updates 
 ## What is already in the app
 
 - `electron-updater` checks for new versions on launch and every 4 hours
-- In-app dialog when a newer version exists
+- Feed URL always points at **GitHub `releases/latest/download`** — employees jump straight to the newest version (not one release at a time)
+- Stale partial downloads are cleared before each check so an old pending installer cannot block the latest release
+- In-app dialog when a newer version exists; download starts automatically
 - `AUTO_UPDATE_ENABLED=true` in `.env.prod` (packaged builds)
 
 ---

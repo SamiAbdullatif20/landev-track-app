@@ -1,0 +1,188 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Idempotent tracking ingest — `eventUuid` (batch events) + `uploadUuid` (screenshots)
+
+Desktop tracker **v1.2.2+** retries the same payloads after offline periods, app restarts, and partial sync failures. The server must treat duplicates as **success**, not 400/409, so the desktop queue drains and reports stay accurate.
+
+**Fix server ingest + persistence only.** Do not change the Electron desktop app.
+
+Related prior prompt: `WEB_BATCH_SYNC_INGEST_FIX_PROMPT.txt` (batch validation fixes). This task is specifically **deduplication / idempotency**.
+
+---
+
+## Why this matters
+
+| Scenario | Desktop behavior | Server must |
+|----------|------------------|-------------|
+| Offline 1 min – overnight | Events + screenshots queue locally; same `eventUuid` / `uploadUuid` re-sent on flush | Return 200, no duplicate rows |
+| Network flapping | Batch fails → desktop retries one-by-one with same UUIDs | Accept re-posts |
+| App restart while offline | SQLite queue survives; flush resumes | Idempotent on UUID |
+| Partial batch failure | Some events delivered; failed ones retried with same `eventUuid` | Per-event idempotency |
+| Screenshot upload retry | Live upload fails → JPEG saved locally → flush re-uploads same `uploadUuid` | Dedup screenshot ingest |
+
+---
+
+## 1. Batch events — `POST /api/tracking/events/batch`
+
+### Request shape (desktop v1.2+)
+
+```json
+{
+  "events": [
+    {
+      "eventUuid": "550e8400-e29b-41d4-a716-446655440000",
+      "eventKind": "INPUT_ACTIVITY",
+      "type": "INPUT_ACTIVITY",
+      "startedAt": "2026-06-02T10:00:00.000Z",
+      "...": "other fields unchanged"
+    }
+  ]
+}
+```
+
+Every batched row includes a stable **`eventUuid`** (UUID v4) generated when the event was first queued locally. Retries send the **same** `eventUuid`.
+
+`SESSION_START` / `SESSION_STOP` may also appear as **trailing events** on session stop/start endpoints with the same `eventUuid` field — apply the same idempotency rules there.
+
+### Required server behavior
+
+1. **Unique constraint** on `(userId, eventUuid)` or global `eventUuid` if already globally unique in your schema.
+2. **Insert-or-ignore / upsert**: Re-ingesting the same `eventUuid` returns success without creating a second activity row or incrementing counters twice.
+3. **Per-event results** (recommended):
+
+```json
+{
+  "ok": true,
+  "ingested": 2,
+  "failed": 0,
+  "results": [
+    { "eventUuid": "…", "ok": true, "duplicate": false },
+    { "eventUuid": "…", "ok": true, "duplicate": true }
+  ]
+}
+```
+
+4. **Never fail the whole batch** because one `eventUuid` was already stored. Mark that row `{ "ok": true, "duplicate": true }`.
+5. **HTTP 200** for idempotent duplicates. Do not return 409 unless the same `eventUuid` arrives with **conflicting payload** (different `eventKind`, different `startedAt` by more than a few seconds, etc.). Desktop does not do that by design.
+
+### Pseudocode
+
+```ts
+for (const event of body.events) {
+  const existing = await db.trackingEvent.findUnique({ where: { eventUuid: event.eventUuid } });
+  if (existing) {
+    results.push({ eventUuid: event.eventUuid, ok: true, duplicate: true });
+    continue;
+  }
+  await persistTrackingEvent(event); // validate first
+  results.push({ eventUuid: event.eventUuid, ok: true, duplicate: false });
+}
+return { ok: true, ingested, failed, results };
+```
+
+### Event kinds that must be idempotent
+
+- `APP_FOCUS`
+- `INPUT_ACTIVITY`
+- `HEARTBEAT`
+- `ACTIVITY_INTERVAL`
+- Trailing `SESSION_START` / `SESSION_STOP` when sent with `eventUuid`
+
+---
+
+## 2. Screenshots — `POST /api/tracking/screenshots/ingest` (multipart)
+
+Desktop **v1.2.2+** sends a stable **`uploadUuid`** inside the `metadata` JSON field on every screenshot (live upload and offline queue flush).
+
+### Example metadata field (multipart form `metadata`)
+
+```json
+{
+  "width": 1280,
+  "height": 720,
+  "source": "electron-desktop",
+  "clientTimeZone": "Pacific/Auckland",
+  "intervalMinutes": 6,
+  "visibility": "superadmin",
+  "visibleToRoles": ["superadmin"],
+  "displayIndex": 0,
+  "displayCount": 2,
+  "displayId": "2528732444",
+  "uploadUuid": "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+}
+```
+
+### Required server behavior
+
+1. Parse `metadata.uploadUuid` (required for desktop v1.2.2+).
+2. **Unique constraint** on `(userId, uploadUuid)` or global `uploadUuid`.
+3. Re-posting the same screenshot bytes with the same `uploadUuid` → **200 OK**, no second screenshot record, no duplicate S3 object (or point to existing object).
+4. If `uploadUuid` is missing (legacy clients), fall back to existing behavior (e.g. dedupe by `sessionId + capturedAt` if you already do).
+
+### Pseudocode
+
+```ts
+const meta = JSON.parse(form.metadata ?? "{}");
+const uploadUuid = meta.uploadUuid as string | undefined;
+
+if (uploadUuid) {
+  const existing = await db.screenshot.findUnique({ where: { uploadUuid } });
+  if (existing) {
+    return res.status(200).json({ ok: true, duplicate: true, screenshotId: existing.id });
+  }
+}
+
+const screenshot = await storeScreenshot({ ...fields, uploadUuid });
+return res.status(200).json({ ok: true, duplicate: false, screenshotId: screenshot.id });
+```
+
+---
+
+## 3. Session start conflict (related)
+
+Desktop may call session start while an orphan remote session exists. Server returns validation like:
+
+`Work session already started with a different start time today.`
+
+Desktop v1.2.1+ closes the orphan remote session and retries. Ensure:
+
+- `POST /api/tracking/session/stop` (or equivalent) can close the stale open session for the same user/day.
+- Idempotent session stop by `sessionId` does not error if already stopped.
+
+---
+
+## 4. Acceptance tests (add on web/backend)
+
+| Test | Steps | Expected |
+|------|-------|----------|
+| Duplicate batch event | POST same `eventUuid` twice | Both 200; one DB row |
+| Mixed batch with duplicate | Batch of 3, one duplicate | 200; 3 ok results |
+| Offline screenshot retry | POST same multipart twice (same `uploadUuid`) | 200; one screenshot row |
+| Conflicting duplicate | Same `eventUuid`, different `eventKind` | 409 or per-event `ok: false` (document choice) |
+| Legacy screenshot | No `uploadUuid` in metadata | Still ingests (backward compatible) |
+
+---
+
+## 5. DB migration checklist
+
+- [ ] `tracking_events.event_uuid` TEXT UNIQUE (or composite unique with `user_id`)
+- [ ] `screenshots.upload_uuid` TEXT UNIQUE nullable (legacy rows NULL)
+- [ ] Index on `event_uuid` and `upload_uuid` for fast duplicate lookups
+
+---
+
+## 6. Desktop reference (do not modify)
+
+- Batch flush: `electron/services/sync-worker.ts` — retries with same `eventUuid` from SQLite `queued_events`
+- Screenshot queue: `electron/db/screenshot-queue.ts` — persists JPEG + `uploadUuid`; `electron/services/screenshot-queue-flush.ts` re-uploads on sync interval
+- Live screenshot upload: `electron/services/screenshot-upload-or-queue.ts` — assigns `uploadUuid` before first attempt
+
+---
+
+## Success criteria
+
+- Employees coming back online after hours/days do not see stuck “pending sync” toasts caused by 409 on duplicates.
+- Session reports show each activity interval and screenshot once, not N times after retries.
+- No regression for web-only tracking clients that do not send UUIDs yet.

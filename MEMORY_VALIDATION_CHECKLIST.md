@@ -18,8 +18,10 @@ Record **total MB across all processes** with the same app name (main + renderer
 | Screenshot spike | During 6-min capture window while tracking | Brief spike OK; should settle after upload |
 
 **Pass criteria:**
-- Post-stop memory drops **meaningfully** vs active tracking (expect 300–500 MB+ reduction after first session).
+- Post-stop memory drops **meaningfully** vs active tracking (expect 300–600 MB+ reduction after first session).
 - Post-stop memory **near baseline**, not stuck at active-session levels.
+- **Target totals (all LANDEV Tracker processes summed):** idle ≤ 500 MB, active tracking ≤ 900 MB, post-stop ≤ 550 MB.
+- **Process count while tracking:** ≤ 4 (main + renderer + overlay + one unified PowerShell probe).
 
 ---
 

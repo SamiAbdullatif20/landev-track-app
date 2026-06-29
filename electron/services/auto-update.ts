@@ -4,6 +4,7 @@ import { ipcMain } from "electron";
 import { logger } from "../config/logger";
 import { readEnv } from "../config/env";
 import { IPC_CHANNELS } from "../ipc/channels";
+import { clearPendingUpdaterCache } from "./updater-cache";
 
 export type AppUpdateStatus =
   | { phase: "idle" }
@@ -48,6 +49,7 @@ function configureUpdateFeed(): void {
     url: updateFeedUrl
   });
   autoUpdater.disableDifferentialDownload = true;
+  autoUpdater.allowPrerelease = false;
   feedConfigured = true;
   logger.info("auto-update-feed-configured", { updateFeedUrl });
 }
@@ -62,6 +64,7 @@ export async function checkForAppUpdates(): Promise<void> {
     return;
   }
   configureUpdateFeed();
+  clearPendingUpdaterCache();
   pushUpdateStatus({ phase: "checking" });
 
   for (let attempt = 1; attempt <= UPDATE_CHECK_MAX_ATTEMPTS; attempt++) {
@@ -124,8 +127,9 @@ export function setupAutoUpdate(window: BrowserWindow): void {
 
   configureUpdateFeed();
   autoUpdater.logger = logger;
-  autoUpdater.autoDownload = false;
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.allowPrerelease = false;
 
   autoUpdater.on("checking-for-update", () => {
     pushUpdateStatus({ phase: "checking" });

@@ -1,0 +1,417 @@
+Copy everything below this line into your Landev **web/backend** Cursor chat.
+
+---
+
+You are my senior full-stack engineer on the Landev web project.
+
+The **LANDEV Tracker desktop app (v1.1.5+)** has been updated. Implement the web/backend and employee dashboard changes below so timers, session reports, and admin views match desktop behavior.
+
+**Do NOT change the desktop Electron app in this task — web/backend + admin UI only.**
+
+---
+
+## What changed on desktop (summary)
+
+| Area | Desktop behavior now |
+|------|----------------------|
+| **Session / billable time** | Wall-clock Start → Stop per WorkSession segment; sum all segments per day |
+| **Live timer** | Client-side `Date.now() - startedAt`; desktop sends exact `startedAt` on start |
+| **Start/Stop sync** | Desktop polls web every 5s; sends `SESSION_START` / `SESSION_STOP` trailing events |
+| **Actual / engaged work** | `validEngagedSeconds` per 15s window; **zero if engagement ≤ 5%** of window |
+| **Meeting attributed time** | **Removed** — no `meetingAttributedSeconds` on new events; Zoom/Teams = normal apps |
+| **Apps used** | `APP_FOCUS` events with `appName`, `applicationDisplayName`, `processName`, `windowTitle` |
+
+---
+
+# 1. Live session timer (fix counter stuck at 0:00)
+
+Employees report the web dashboard timer does **not tick every second** while tracking.
+
+### Rule
+
+The live counter is **not** server-pushed. Compute it in the browser:
+
+```ts
+elapsedMs = Date.now() - Date.parse(startedAt)
+```
+
+Use `setInterval(tick, 1000)` while `active === true`. Polling alone (every 5s) is not enough.
+
+### `GET /api/tracking/session/active` (and fallbacks `/api/tracking/session/status`, `/api/attendance/today`)
+
+**While tracking:**
+
+```json
+{
+  "active": true,
+  "workSession": {
+    "id": "clx...",
+    "sessionId": "clx...",
+    "projectId": "1604",
+    "projectName": "Admin - General",
+    "description": "Site drawings",
+    "startedAt": "2026-06-02T08:00:00.000Z",
+    "startTime": "2026-06-02T08:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+**While stopped:**
+
+```json
+{ "active": false, "workSession": null }
+```
+
+Accept start-time field aliases: `startedAt`, `startTime`, `startTimeUtc`, `clockInAt`.
+
+### React hook (copy into dashboard)
+
+```tsx
+function useLiveSessionTimer(active: boolean, startedAt: string | null): string {
+  const [label, setLabel] = useState("0:00");
+
+  useEffect(() => {
+    if (!active || !startedAt) {
+      setLabel("0:00");
+      return;
+    }
+    const startedMs = Date.parse(startedAt);
+    if (!Number.isFinite(startedMs)) {
+      setLabel("0:00");
+      return;
+    }
+    const tick = () => setLabel(formatDuration(Date.now() - startedMs));
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [active, startedAt]);
+
+  return label;
+}
+```
+
+Poll active session every 3–5s to resync `active` + `startedAt`; the 1s interval handles ticking.
+
+### Live segment vs “worked today”
+
+| UI label | Source |
+|----------|--------|
+| **Live timer** (current segment) | `Date.now() - startedAt` while `active` |
+| **Worked today** total | Sum **completed** WorkSession durations for `workDateKey` + live segment overlap |
+
+---
+
+# 2. Session Start / Stop APIs and sync
+
+Desktop calls these on every user Start/Stop. Web Start/Stop must use the **same** endpoints.
+
+### `POST /api/tracking/session/start`
+
+```json
+{
+  "projectId": "uuid-or-omit-for-catalog",
+  "projectName": "Admin - General",
+  "description": "Flood report review",
+  "clientTimeZone": "Pacific/Auckland",
+  "workDateKey": "2026-06-02",
+  "startedAt": "2026-06-02T08:00:00.000Z",
+  "startTime": "2026-06-02T08:00:00.000Z",
+  "startTimeUtc": "2026-06-02T08:00:00.000Z",
+  "occurredAt": "2026-06-02T08:00:00.000Z",
+  "isNonChargeable": true,
+  "trailingEvents": [{
+    "eventUuid": "...",
+    "eventKind": "SESSION_START",
+    "occurredAtIso": "2026-06-02T08:00:00.000Z",
+    "workDateKey": "2026-06-02",
+    "source": "DESKTOP_AGENT"
+  }]
+}
+```
+
+**Ingest rules:**
+- Persist `startedAt` / `startTime` **exactly as sent** (client clock at Start press) — do not replace with server `now()`.
+- Catalog/admin rows: `projectName` + `isNonChargeable: true` (may have no API `projectId`).
+- Process `trailingEvents` where `eventKind === "SESSION_START"` → mark user active immediately, push UI update (SSE/WebSocket or cache invalidation).
+
+**Response must include:**
+
+```json
+{
+  "sessionId": "clx-new-id",
+  "workSessionId": "clx-new-id",
+  "active": true,
+  "workSession": {
+    "id": "clx-new-id",
+    "startedAt": "2026-06-02T08:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+Each Stop → Start same day = **new** `workSessionId` (new segment).
+
+### `POST /api/tracking/session/stop`
+
+```json
+{
+  "sessionId": "clx...",
+  "workSessionId": "clx...",
+  "startedAt": "2026-06-02T08:00:00.000Z",
+  "stoppedAt": "2026-06-02T10:30:00.000Z",
+  "stopTimeUtc": "2026-06-02T10:30:00.000Z",
+  "durationMs": 9000000,
+  "trackedDurationMs": 9000000,
+  "workDateKey": "2026-06-02",
+  "clientTimeZone": "Pacific/Auckland",
+  "trailingEvents": [{
+    "eventUuid": "...",
+    "eventKind": "SESSION_STOP",
+    "occurredAtIso": "2026-06-02T10:30:00.000Z",
+    "workDateKey": "2026-06-02",
+    "source": "DESKTOP_AGENT"
+  }]
+}
+```
+
+**Ingest rules:**
+
+```ts
+const durationMs =
+  typeof body.durationMs === "number" && body.durationMs > 0
+    ? body.durationMs
+    : Math.max(0, Date.parse(body.stoppedAt) - Date.parse(body.startedAt));
+
+workSession.startTime = body.startedAt;
+workSession.stopTime = body.stoppedAt;
+workSession.durationMs = durationMs;
+workSession.active = false;
+```
+
+Process `SESSION_STOP` trailing → stop live timer immediately on all open dashboard tabs.
+
+### Desktop ↔ web sync
+
+Desktop polls `GET /api/tracking/session/active` every **5 seconds**. After web Start/Stop, next poll must reflect correct `active` + `startedAt` within 5s.
+
+---
+
+# 3. Total tracked time (hours worked)
+
+**Headline “time tracked” / timesheet hours** = sum of **WorkSession wall-clock** per `userId + workDateKey`.
+
+```ts
+function totalTrackedMsForDay(sessions, userId, workDateKey, clientTimeZone): number {
+  let total = 0;
+  for (const session of sessions.filter((s) => s.userId === userId)) {
+    if (!session.startTime || !session.stopTime) continue;
+    total += overlapLocalWorkDayMs(session.startTime, session.stopTime, workDateKey, clientTimeZone);
+  }
+  return total;
+}
+```
+
+### WRONG (do not use for billable hours)
+
+- Sum of `APP_FOCUS.activeSeconds`
+- Sum of `INPUT_ACTIVITY.trackerElapsedMs`
+- Latest WorkSession only
+- Activity engagement totals
+
+### RIGHT
+
+- Sum all WorkSession `stopTime - startTime` rows overlapping the day (split at midnight using `clientTimeZone`).
+
+Multi-segment example: 3h + 5h same day = **8h** total.
+
+---
+
+# 4. Activity / engagement metrics (session report)
+
+Desktop sends `INPUT_ACTIVITY` every **15 seconds** and `ACTIVITY_INTERVAL` every **15 minutes**.
+
+### Engagement (timeline score source)
+
+```json
+{
+  "eventKind": "INPUT_ACTIVITY",
+  "trackerElapsedMs": 15000,
+  "activeSeconds": 15,
+  "idleSeconds": 0,
+  "validEngagedSeconds": 12,
+  "engagementActivityPercent": 80,
+  "activityScore": 80,
+  "activityLevel": "high",
+  "timelineColor": "green"
+}
+```
+
+**Desktop rule:** `validEngagedSeconds = 0` when engagement is **≤ 5%** of the 15s window (`validEngagedSeconds / 15 ≤ 0.05`). Mirror this when aggregating if you recompute from raw polls.
+
+**Aggregate for session/day headline activity %:**
+
+```ts
+function aggregateEngagementPercent(events: TrackingEvent[]): number | null {
+  let engagedSeconds = 0;
+  let windowSeconds = 0;
+  for (const event of events) {
+    if (event.eventKind !== "INPUT_ACTIVITY" && event.eventKind !== "ACTIVITY_INTERVAL") continue;
+    const winSec = (event.trackerElapsedMs ?? 15_000) / 1000;
+    windowSeconds += winSec;
+    engagedSeconds += event.validEngagedSeconds ?? event.metadata?.validEngagedSeconds ?? 0;
+  }
+  if (windowSeconds <= 0) return null;
+  return Math.round((engagedSeconds / windowSeconds) * 1000) / 10;
+}
+```
+
+Prefer `validEngagedSeconds` / `engagementActivityPercent` over averaging keyboard + mouse breakdown rows.
+
+### Click activity
+
+Fields: `clickActivityPercent`, `validClickSeconds`, `clickActiveSeconds`, `clickCount`, `clickSamples`
+
+```ts
+// Sum seconds, then divide — do NOT average per-event percents
+clickActivityPercent = (sum(validClickSeconds) / sum(windowSeconds)) * 100
+```
+
+### Keyboard / mouse breakdown (secondary rows)
+
+`keyboardActivityPercent`, `mouseActivityPercent`, `validKeyboardSeconds`, `validMouseSeconds` — show as breakdown only; do not use as headline score when union fields exist.
+
+### Meeting attributed time — REMOVED
+
+- Desktop **v1.1.5+ no longer sends** `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`.
+- **Hide or remove** the “Meeting attributed time” row on session reports for new sessions.
+- Legacy events may still have these fields — show **—** or ignore; do not break ingest if present on old data.
+
+Time in Zoom/Teams counts as **normal session time** (wall-clock) and Zoom/Teams appear under **Apps used**.
+
+---
+
+# 5. Apps used (APP_FOCUS)
+
+Desktop emits `APP_FOCUS` on foreground app change (~3s) and every 15s tick.
+
+```json
+{
+  "eventKind": "APP_FOCUS",
+  "appName": "AutoCAD",
+  "applicationDisplayName": "AutoCAD",
+  "application": "autodesk",
+  "processName": "acad.exe",
+  "windowTitle": "Drawing1.dwg - AutoCAD 2024",
+  "activeSeconds": 15,
+  "idleSeconds": 0,
+  "workSessionId": "clx...",
+  "workDateKey": "2026-06-02"
+}
+```
+
+**Aggregate apps used for session report:**
+
+```ts
+function aggregateAppsUsed(appFocusEvents): Array<{ name: string; seconds: number }> {
+  const byApp = new Map<string, number>();
+  for (const event of appFocusEvents) {
+    const name = event.appName ?? event.applicationDisplayName ?? event.processName ?? "Unknown";
+    byApp.set(name, (byApp.get(name) ?? 0) + (event.activeSeconds ?? 0));
+  }
+  return [...byApp.entries()]
+    .map(([name, seconds]) => ({ name, seconds }))
+    .sort((a, b) => b.seconds - a.seconds);
+}
+```
+
+Use **`appName` / `applicationDisplayName`** for display (e.g. “Chrome”, “AutoCAD”, “Zoom”, “Teams”) — not raw `application` slug alone.
+
+Do not collapse distinct apps that share a slug. Show all apps with ≥1s credited time.
+
+---
+
+# 6. Batch event ingest
+
+`POST /api/tracking/events/batch` must accept optional v1.1 fields without **400**.
+
+### INPUT_ACTIVITY / ACTIVITY_INTERVAL — persist (top-level + metadata)
+
+`mouseMoveCount`, `keyPressCount`, `clickCount`, `scrollCount`, `mouseMovePercent`, `mouseActiveSeconds`, `trackerElapsedMs`, `activeSeconds`, `idleSeconds`, `validEngagedSeconds`, `engagementActivityPercent`, `validKeyboardSeconds`, `validMouseSeconds`, `validClickSeconds`, `clickActiveSeconds`, `keyboardActivityPercent`, `mouseActivityPercent`, `clickActivityPercent`, `activityScore`, `estimatedEfficiencyPercent`, `activityLevel`, `timelineColor`, `application`, `processName`, `windowTitle`, `workSessionId`, `workDateKey`, `sessionSegmentStartedAt`, `clientTimeZone`
+
+Legacy optional (ignore on new sessions): `meetingAttributedSeconds`, `isMeetingActive`, `meetingPresenceReason`, `meetingDetectionSource`
+
+### APP_FOCUS — persist
+
+`appName`, `application`, `applicationDisplayName`, `processName`, `windowTitle`, `activeSeconds`, `idleSeconds`, `workSessionId`, `workDateKey`
+
+---
+
+# 7. Session report API shape (target)
+
+```ts
+{
+  totalTrackedMs: number,              // wall-clock WorkSession sum
+  totalTrackedFormatted: string,       // e.g. "8h 15m"
+  engagementActivityPercent: number,     // from validEngagedSeconds
+  clickActivityPercent: number | null,
+  keyboardActivityPercent: number,
+  mouseActivityPercent: number,
+  appsUsed: Array<{ name: string; seconds: number; formatted: string }>,
+  // meetingAttributedMs: REMOVED for new sessions
+}
+```
+
+---
+
+# 8. Acceptance tests
+
+1. **Live timer:** Start on desktop → web shows `0:01`, `0:02`, … every second; Stop → timer freezes.
+2. **Refresh:** Reload page mid-session → correct elapsed (not `0:00`).
+3. **Sync:** Desktop Start/Stop ↔ web within 5s; repeat 5 cycles same day.
+4. **curl:** `GET /api/tracking/session/active` while tracking → `active: true` + non-null `startedAt`.
+5. **Day total:** Segments 3h + 5h → report **8h** (not 5h).
+6. **Engagement:** Low-input 15s windows → `validEngagedSeconds: 0` on events; report score reflects this.
+7. **Apps used:** Session using AutoCAD + Chrome + Zoom → all three appear with time > 0.
+8. **No meeting row:** New sessions have no meeting attributed time on report.
+9. **Batch ingest:** Events with `validEngagedSeconds`, `clickActivityPercent` → **200**.
+
+---
+
+# 9. Files to search (web repo)
+
+```
+useSessionTimer
+useLiveSessionTimer
+session/active
+tracking/session/start
+tracking/session/stop
+trailingEvents
+SESSION_START
+SESSION_STOP
+startedAt
+workSession
+validEngagedSeconds
+engagementActivityPercent
+APP_FOCUS
+appName
+applicationDisplayName
+apps used
+events/batch
+totalTracked
+meetingAttributed
+```
+
+---
+
+# 10. Do not break
+
+- Login / session cookie auth used by desktop
+- Screenshot upload and storage
+- Chargeable project start/stop from dropdown
+- Multi-user admin views
+- Legacy sessions with old `meetingAttributedSeconds` fields (ingest may still accept; UI hides row)
+
+---
+
+EOF

@@ -35,6 +35,7 @@ export class ProjectSyncService {
   private readonly fetchRoles: ProjectSyncServiceOptions["fetchRoles"];
   private interval: NodeJS.Timeout | null = null;
   private syncInProgress = false;
+  private lastPublishedKey = "";
 
   constructor(options: ProjectSyncServiceOptions) {
     this.window = options.window;
@@ -151,6 +152,11 @@ export class ProjectSyncService {
   }
 
   private publish(projects: RoleProject[], roles: string[], fetchedAt: string): void {
+    const publishKey = `${roles.join(",")}|${projects.map((project) => project.id).join(",")}`;
+    if (publishKey === this.lastPublishedKey) {
+      return;
+    }
+    this.lastPublishedKey = publishKey;
     this.window.webContents.send("tracking:projects-push", {
       projects,
       roles,

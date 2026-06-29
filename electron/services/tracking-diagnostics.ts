@@ -29,7 +29,7 @@ export type TrackingDiagnosticsSnapshot = {
   events: TrackingDebugEvent[];
 };
 
-const MAX_EVENTS = 200;
+const MAX_EVENTS = 80;
 
 class TrackingDiagnosticsStore {
   private events: TrackingDebugEvent[] = [];

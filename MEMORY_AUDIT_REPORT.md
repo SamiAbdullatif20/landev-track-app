@@ -164,8 +164,8 @@ See git diff for:
 
 | Scenario | Before (approx.) | After (target) |
 |----------|------------------|----------------|
-| App open, not tracking | 400–700 MB | 350–550 MB |
-| Tracking active | 1.2–1.7 GB | 900 MB–1.3 GB |
-| Paused after 1+ sessions | ~1.2 GB (overlay hidden) | 400–700 MB |
+| App open, not tracking | 400–700 MB | **≤ 500 MB** |
+| Tracking active | 1.2–2.5 GB | **≤ 900 MB** |
+| Paused after 1+ sessions | ~1.2 GB (overlay hidden) | **≤ 550 MB** |
 
 Validate with `MEMORY_VALIDATION_CHECKLIST.md`.

@@ -16,15 +16,11 @@ import {
   isMicroMouseEngagementPoll
 } from "./activity-engagement";
 import { probeWindowsInputSnapshot } from "./input-probe-windows";
-import {
-  consumeMeetingAttributionWindow,
-  recordMeetingAttributionPoll,
-  refreshBackgroundMeetingPresence
-} from "./meeting-attribution-state";
 import { recordInputActivityEvent } from "./tracking-input-activity";
 
 export const INPUT_ACTIVITY_SAMPLE_MS = 15_000;
-export const INPUT_ACTIVITY_POLL_MS = 1_000;
+/** Poll every 2s — halves CPU vs 1s while keeping 15s windows accurate. */
+export const INPUT_ACTIVITY_POLL_MS = 2_000;
 
 export class InputActivitySampler {
   private pollTimer: NodeJS.Timeout | null = null;
@@ -84,6 +80,14 @@ export class InputActivitySampler {
     logger.info("input-activity-sampler-stopped");
   }
 
+  /** Emit a final partial sample so stop/auto-stop does not drop the current window. */
+  async flushPendingSample(): Promise<void> {
+    if (!this.sampleTimer) {
+      return;
+    }
+    await this.emitSample("session_end");
+  }
+
   private isRunActive(runId: number): boolean {
     return runId === this.runGeneration && getSessionState().active === 1;
   }
@@ -131,7 +135,6 @@ export class InputActivitySampler {
     this.lastSampleY = snapshot.y;
     this.lastIdleMs = snapshot.idleMs;
     this.counter.ingest(snapshot);
-    recordMeetingAttributionPoll();
   }
 
   private async emitSample(triggerType: string): Promise<void> {
@@ -145,16 +148,10 @@ export class InputActivitySampler {
       return;
     }
 
-    await refreshBackgroundMeetingPresence();
-
     const drained = this.counter.drain();
     const windowMs = INPUT_ACTIVITY_SAMPLE_MS;
     const idleMs = Math.min(windowMs, this.maxIdleMsInWindow);
-    let activeMs = Math.max(0, windowMs - idleMs);
-    const meetingAttribution = consumeMeetingAttributionWindow(windowMs, INPUT_ACTIVITY_POLL_MS);
-    if (meetingAttribution.meetingAttributedSeconds > 0) {
-      activeMs = Math.max(activeMs, Math.round(meetingAttribution.meetingAttributedSeconds * 1000));
-    }
+    const activeMs = Math.max(0, windowMs - idleMs);
     const activeSeconds = Number((Math.min(windowMs, activeMs) / 1000).toFixed(3));
     const idleSeconds = Number(((windowMs - Math.min(windowMs, activeMs)) / 1000).toFixed(3));
 
@@ -164,14 +161,16 @@ export class InputActivitySampler {
           pollCount: this.pollCount,
           pollsWithSignificantMovement: this.pollsWithSignificantMovement
         },
-        windowMs
+        windowMs,
+        INPUT_ACTIVITY_POLL_MS
       );
     const { clickActivityPercent, clickSamples, clickActiveSeconds } = computeClickActivityPercent(
       {
         pollCount: this.pollCount,
         pollsWithClicks: this.pollsWithClicks
       },
-      windowMs
+      windowMs,
+      INPUT_ACTIVITY_POLL_MS
     );
     const savedPollCount = this.pollCount;
     const savedFullEngagement = this.pollsWithFullEngagement;
@@ -199,18 +198,12 @@ export class InputActivitySampler {
       windowMs,
       INPUT_ACTIVITY_POLL_MS
     );
-    let validEngagedSeconds = applyEngagementPersistence(
+    const validEngagedSeconds = applyEngagementPersistence(
       engagedFromPolls.validEngagedSeconds,
       windowSeconds,
       activeSeconds,
       Date.now()
     );
-    if (meetingAttribution.meetingAttributedSeconds > 0) {
-      validEngagedSeconds = Math.max(
-        validEngagedSeconds,
-        Math.min(windowSeconds, meetingAttribution.meetingAttributedSeconds)
-      );
-    }
 
     await recordInputActivityEvent({
       mouseMoveCount: drained.mouseMoveCount,
@@ -228,11 +221,6 @@ export class InputActivitySampler {
       clickActiveSeconds,
       clickSamples,
       pollTravelPx,
-      meetingAttributedSeconds: meetingAttribution.meetingAttributedSeconds,
-      meetingPollSamples: meetingAttribution.meetingPollSamples,
-      isMeetingActive: meetingAttribution.isMeetingActive,
-      meetingPresenceReason: meetingAttribution.meetingPresenceReason,
-      meetingDetectionSource: meetingAttribution.meetingDetectionSource,
       validEngagedSeconds,
       fullEngagementPolls: engagedFromPolls.fullEngagementPolls,
       microEngagementPolls: engagedFromPolls.microEngagementPolls,

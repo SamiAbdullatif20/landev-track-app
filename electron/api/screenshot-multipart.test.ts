@@ -10,13 +10,14 @@ describe("buildScreenshotMultipartBody", () => {
       mimeType: "image/jpeg",
       projectId: "proj-1",
       sessionId: "sess-1",
-      metadata: { width: 1280, height: 720 }
+      metadata: { width: 1280, height: 720, uploadUuid: "shot-uuid-1" }
     });
 
     expect(contentType).toMatch(/^multipart\/form-data; boundary=/);
     expect(body.includes(imageBytes)).toBe(true);
     expect(body.toString("utf8")).toContain('name="capturedAt"');
     expect(body.toString("utf8")).toContain('filename="screenshot.jpg"');
+    expect(body.toString("utf8")).toContain('"uploadUuid":"shot-uuid-1"');
     expect(body.length).toBeGreaterThan(imageBytes.length);
   });
 });

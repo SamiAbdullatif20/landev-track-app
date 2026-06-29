@@ -1,0 +1,222 @@
+Copy everything below into your Landev **web/backend** Cursor chat.
+
+---
+
+You are my senior full-stack engineer on the Landev web project.
+
+The **desktop tracker (v1.1.5+)** has been updated. Fix the web/backend and employee dashboard so tracking, timers, and session reports match desktop behavior.
+
+**Do NOT change the desktop app in this task — web/backend + admin UI only.**
+
+---
+
+# Priority 1 — Live session timer (counter stuck at 0:00)
+
+Employees report the **live timer on the web dashboard does not tick** while tracking.
+
+## Fix
+
+The live counter is **client-side only**:
+
+```ts
+elapsedMs = Date.now() - Date.parse(startedAt)
+```
+
+Use a **1-second `setInterval`** while `active === true`. Do **not** only refresh on API poll (5s) or sum activity events.
+
+### `GET /api/tracking/session/active` must return (while running)
+
+```json
+{
+  "active": true,
+  "workSession": {
+    "id": "clx...",
+    "sessionId": "clx...",
+    "projectId": "...",
+    "projectName": "Admin - General",
+    "description": "Site drawings",
+    "startedAt": "2026-06-02T08:00:00.000Z",
+    "startTime": "2026-06-02T08:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+While stopped: `{ "active": false, "workSession": null }`.
+
+Accept start-time aliases: `startedAt`, `startTime`, `startTimeUtc`, `clockInAt`.
+
+### Desktop start payload (persist `startedAt` exactly)
+
+```json
+{
+  "startedAt": "2026-06-02T08:00:00.000Z",
+  "startTime": "2026-06-02T08:00:00.000Z",
+  "startTimeUtc": "2026-06-02T08:00:00.000Z",
+  "workDateKey": "2026-06-02",
+  "clientTimeZone": "Pacific/Auckland",
+  "trailingEvents": [{
+    "eventKind": "SESSION_START",
+    "occurredAtIso": "2026-06-02T08:00:00.000Z",
+    "workDateKey": "2026-06-02",
+    "source": "DESKTOP_AGENT"
+  }]
+}
+```
+
+On start/stop ingest, process `trailingEvents`:
+- `SESSION_START` → set active + `startedAt`, push UI update immediately
+- `SESSION_STOP` → set inactive + `stoppedAt`, stop timer immediately
+
+### React hook (mirror desktop `useSessionTimer`)
+
+```tsx
+function useLiveSessionTimer(active: boolean, startedAt: string | null): string {
+  const [label, setLabel] = useState("0:00");
+  useEffect(() => {
+    if (!active || !startedAt) { setLabel("0:00"); return; }
+    const startedMs = Date.parse(startedAt);
+    if (!Number.isFinite(startedMs)) { setLabel("0:00"); return; }
+    const tick = () => setLabel(formatDuration(Date.now() - startedMs));
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [active, startedAt]);
+  return label;
+}
+```
+
+### Live segment vs “worked today”
+
+| UI label | Source |
+|----------|--------|
+| **Live timer** (while tracking) | `Date.now() - startedAt` for current segment |
+| **Worked today** total | Sum all WorkSession segments for `workDateKey` (see Priority 3) |
+
+---
+
+# Priority 2 — Desktop ↔ web Start/Stop sync
+
+Desktop polls every **5 seconds**: `GET /api/tracking/session/active` (fallback: `/api/tracking/session/status`, `/api/attendance/today`).
+
+| Action | Web must |
+|--------|----------|
+| Desktop **Start** | `POST /api/tracking/session/start` creates new WorkSession; active endpoint returns `active: true` within 5s |
+| Desktop **Stop** | `POST /api/tracking/session/stop` sets `stopTime`; active returns `active: false` within 5s |
+| Web **Start** | Same API; desktop mirrors within 5s |
+| Web **Stop** | Same API; desktop mirrors within 5s |
+| 2nd+ Start/Stop same day | **New** `workSessionId` each segment — do not reuse stopped session as active |
+
+Stop body includes `durationMs`, `startedAt`, `stoppedAt`, `workDateKey`, and `trailingEvents` with `SESSION_STOP`.
+
+Catalog/admin starts send `projectName` + `isNonChargeable: true` (no API `projectId`) — accept and store display name.
+
+---
+
+# Priority 3 — Tracked time / day totals (under-counting)
+
+**Total hours** = sum of **WorkSession wall-clock** segments for `userId + workDateKey`.  
+**NOT** sum of `APP_FOCUS.activeSeconds` or `INPUT_ACTIVITY.trackerElapsedMs`.
+
+On stop ingest:
+
+```ts
+const durationMs = body.durationMs ?? Math.max(0, Date.parse(body.stoppedAt) - Date.parse(body.startedAt));
+workSession.startTime = body.startedAt;
+workSession.stopTime = body.stoppedAt;
+workSession.durationMs = durationMs;
+```
+
+Multi-segment day: 3h + 5h = **8h**, not latest segment only.
+
+---
+
+# Priority 4 — Session report metrics (desktop v1.1 fields)
+
+Ingest and show on session/day reports:
+
+### Click activity
+- Fields: `clickActivityPercent`, `validClickSeconds`, `clickActiveSeconds`, `clickCount`, `clickSamples`
+- Aggregate: **sum seconds**, then `clickSeconds / windowSeconds × 100` — do not average per-event percents
+
+### Activity timeline / engagement
+- Prefer `validEngagedSeconds` and `engagementActivityPercent` (union engagement model)
+- Desktop only counts engaged time when **>5%** of a 15s window (`MIN_ENGAGEMENT_RATIO = 0.05`)
+- Do not use keyboard-only score when union fields exist
+- **Meeting attributed time removed** — desktop no longer sends `meetingAttributedSeconds`; hide that report row for new sessions (legacy fields may still exist on old events)
+
+### Batch ingest
+- `POST /api/tracking/events/batch` must accept all v1.1 optional fields without 400
+- See `WEB_BATCH_SYNC_INGEST_FIX_PROMPT.txt` in desktop repo for full field list
+
+---
+
+# API checklist
+
+| Endpoint | Requirement |
+|----------|-------------|
+| `POST /api/tracking/session/start` | Persist `startedAt`, `workDateKey`, `clientTimeZone`, `projectName` (catalog); return `sessionId`; process `SESSION_START` trailing |
+| `POST /api/tracking/session/stop` | Persist `stoppedAt`, `durationMs`, `startedAt`; process `SESSION_STOP` trailing |
+| `GET /api/tracking/session/active` | `active` + `workSession.startedAt` when running |
+| `POST /api/tracking/events/batch` | Accept new optional metric fields |
+| Session report API | `totalTrackedMs`, click %, engagement % |
+
+---
+
+# Acceptance tests (must pass)
+
+1. **Live timer:** Start tracking → web shows `0:01`, `0:02`, … every second; Stop → timer freezes.
+2. **Refresh:** Mid-session page reload → correct elapsed time (not `0:00`).
+3. **Sync:** Desktop Start/Stop ↔ web within 5s; repeat 5 cycles same day.
+4. **curl:** `GET /api/tracking/session/active` → `active: true` + `startedAt` while tracking.
+5. **Day total:** Two segments (3h + 5h) → report shows **8h**.
+6. **Engagement:** Windows with &lt;5% keyboard/mouse engagement → `validEngagedSeconds = 0` on desktop events.
+7. **Batch:** Events with `validEngagedSeconds`, `clickActivityPercent` → **200** ingest.
+
+---
+
+# Files to search (web repo)
+
+```
+useSessionTimer
+live timer
+session/active
+tracking/session/start
+tracking/session/stop
+trailingEvents
+SESSION_START
+SESSION_STOP
+startedAt
+workSession
+validEngagedSeconds
+clickActivityPercent
+events/batch
+totalTracked
+```
+
+---
+
+# Detailed reference prompts (desktop repo)
+
+| Topic | File |
+|-------|------|
+| Live timer only | `WEB_LIVE_COUNTER_FIX_PROMPT.txt` |
+| Desktop ↔ web sync | `WEB_DESKTOP_SESSION_SYNC_PROMPT.txt` |
+| Tracked time / day totals | `WEB_TRACKED_TIME_FIX_PROMPT.txt` |
+| Session report fields | `WEB_SESSION_REPORT_DESKTOP_SYNC_PROMPT.txt` |
+| Batch ingest 400 fix | `WEB_BATCH_SYNC_INGEST_FIX_PROMPT.txt` |
+| Activity timeline scoring | `WEB_ACTIVITY_TIMELINE_SCORING_PROMPT.txt` |
+| Click activity | `WEB_CLICK_ACTIVITY_PROMPT.txt` |
+
+---
+
+# Do not break
+
+- Login / session cookie auth used by desktop
+- Screenshot upload and storage
+- Existing chargeable project start/stop
+- Multi-user admin views
+
+---
+
+EOF

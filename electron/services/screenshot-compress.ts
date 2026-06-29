@@ -1,16 +1,19 @@
 import { nativeImage, type NativeImage } from "electron";
 import { releaseNativeImage } from "../utils/native-image";
 
-/** Target max bytes after JPEG compression (before upload). */
-export const TARGET_SCREENSHOT_BYTES = 520 * 1024;
+/** Target max bytes after JPEG compression (before upload). Kept small for low RAM. */
+export const TARGET_SCREENSHOT_BYTES = 150 * 1024;
 
-/** Prefer this JPEG quality when it still fits the byte budget. */
-export const PREFERRED_JPEG_QUALITY = 88;
+/** Prefer lower quality — sufficient for admin time review at 480px-wide captures. */
+export const PREFERRED_JPEG_QUALITY = 55;
+
+/** Max width after downscale before JPEG encode during capture. */
+export const SCREENSHOT_CAPTURE_MAX_WIDTH = 480;
 
 /** Max upload width — downscale larger captures (better than crushing JPEG quality). */
-export const SCREENSHOT_MAX_UPLOAD_WIDTH = 1600;
+export const SCREENSHOT_MAX_UPLOAD_WIDTH = 800;
 
-const FALLBACK_MAX_UPLOAD_WIDTH = 1280;
+const FALLBACK_MAX_UPLOAD_WIDTH = 640;
 
 export type CompressedScreenshot = {
   buffer: Buffer;
@@ -63,13 +66,13 @@ function scaleImageToMaxWidth(
   const resized = image.resize({
     width: target.width,
     height: target.height,
-    quality: "best"
+    quality: "good"
   });
   return trackImage(images, resized);
 }
 
-/** JPEG quality steps — preferred first, then fallbacks if over byte budget. */
-export const JPEG_ENCODE_QUALITIES = [PREFERRED_JPEG_QUALITY, 76, 64] as const;
+/** JPEG quality steps — low memory (fewer large buffer attempts). */
+export const JPEG_ENCODE_QUALITIES = [PREFERRED_JPEG_QUALITY, 45] as const;
 
 export function encodeNativeImageToJpeg(
   image: NativeImage,

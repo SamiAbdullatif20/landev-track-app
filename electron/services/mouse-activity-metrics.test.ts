@@ -28,17 +28,19 @@ describe("mouse-activity-metrics", () => {
 
   it("computes click percent from polls with clicks", () => {
     const result = computeClickActivityPercent(
-      { pollCount: 15, pollsWithClicks: 4 },
-      15_000
+      { pollCount: 8, pollsWithClicks: 4 },
+      15_000,
+      2_000
     );
-    expect(result.clickActivityPercent).toBeCloseTo(26.67, 1);
-    expect(result.clickActiveSeconds).toBe(4);
+    expect(result.clickActivityPercent).toBeCloseTo(53.33, 1);
+    expect(result.clickActiveSeconds).toBe(8);
   });
 
   it("returns 0% when no mouse polls in the window", () => {
     const result = computeMouseMovePercent(
-      { pollCount: 15, pollsWithSignificantMovement: 0 },
-      15_000
+      { pollCount: 8, pollsWithSignificantMovement: 0 },
+      15_000,
+      2_000
     );
     expect(result.mouseMovePercent).toBe(0);
     expect(result.mouseActiveSeconds).toBe(0);
@@ -46,18 +48,19 @@ describe("mouse-activity-metrics", () => {
 
   it("measures against full window time, not keyboard-only engaged ticks", () => {
     const result = computeMouseMovePercent(
-      { pollCount: 15, pollsWithSignificantMovement: 3 },
-      15_000
+      { pollCount: 8, pollsWithSignificantMovement: 3 },
+      15_000,
+      2_000
     );
-    expect(result.mouseMovePercent).toBe(20);
-    expect(result.mouseActiveSeconds).toBe(3);
+    expect(result.mouseMovePercent).toBe(40);
+    expect(result.mouseActiveSeconds).toBe(6);
   });
 
   it("matches ~1 min mouse in 18 min session when windows are mostly idle", () => {
     const windows = 72;
     const activeWindows = 4;
-    const pollsPerWindow = 15;
-    const mousePollsPerActiveWindow = 15;
+    const pollsPerWindow = 8;
+    const mousePollsPerActiveWindow = 8;
 
     let totalMouseSeconds = 0;
     let totalWindowSeconds = 0;
@@ -65,7 +68,8 @@ describe("mouse-activity-metrics", () => {
       const movement = i < activeWindows ? mousePollsPerActiveWindow : 0;
       const sample = computeMouseMovePercent(
         { pollCount: pollsPerWindow, pollsWithSignificantMovement: movement },
-        15_000
+        15_000,
+        2_000
       );
       totalMouseSeconds += sample.mouseActiveSeconds;
       totalWindowSeconds += 15;
@@ -78,11 +82,12 @@ describe("mouse-activity-metrics", () => {
 
   it("does not exceed 100%", () => {
     const result = computeMouseMovePercent(
-      { pollCount: 10, pollsWithSignificantMovement: 20 },
-      10_000
+      { pollCount: 8, pollsWithSignificantMovement: 20 },
+      15_000,
+      2_000
     );
     expect(result.mouseMovePercent).toBe(100);
-    expect(result.mouseMoveSamples).toBe(10);
+    expect(result.mouseMoveSamples).toBe(8);
   });
 
   it("computes cursor travel with hypot", () => {

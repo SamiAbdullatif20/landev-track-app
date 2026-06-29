@@ -33,6 +33,14 @@ function loadEnvFiles(): void {
 
 loadEnvFiles();
 
+if (app.isPackaged) {
+  app.commandLine.appendSwitch("disable-http-cache");
+  app.commandLine.appendSwitch("disk-cache-size", "2097152");
+  app.commandLine.appendSwitch("js-flags", "--max-old-space-size=256 --expose-gc");
+  app.commandLine.appendSwitch("disable-features", "SpareRendererForSitePerProcess");
+  app.commandLine.appendSwitch("renderer-process-limit", "2");
+}
+
 /** Windows toast AUMID — required for Notification sounds/toasts on Windows 10/11. */
 if (process.platform === "win32") {
   app.setAppUserModelId(app.isPackaged ? "com.landev.track" : "com.landev.track.dev");
@@ -78,7 +86,7 @@ if (!gotSingleInstanceLock) {
 function setupDisplayMediaHandler(): void {
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer
-      .getSources({ types: ["screen"], thumbnailSize: { width: 1280, height: 720 } })
+      .getSources({ types: ["screen"], thumbnailSize: { width: 480, height: 270 } })
       .then((sources) => {
         const screen = sources.find((source) => source.id.toLowerCase().startsWith("screen")) ?? sources[0];
         for (const source of sources) {
@@ -143,7 +151,9 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       backgroundThrottling: true,
-      devTools: !app.isPackaged
+      devTools: !app.isPackaged,
+      spellcheck: false,
+      enableWebSQL: false
     }
   });
 

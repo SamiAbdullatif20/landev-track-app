@@ -120,13 +120,21 @@ export function resolveApplicationDisplayName(
     edge: "Edge",
     code: "VS Code",
     vscode: "VS Code",
+    cursor: "Cursor",
+    devenv: "Visual Studio",
+    olk: "Outlook",
+    zoom: "Zoom",
+    "ms-teams": "Teams",
+    msteams: "Teams",
     explorer: "File Explorer",
     winword: "Word",
     excel: "Excel",
     powerpnt: "PowerPoint",
     outlook: "Outlook",
     teams: "Teams",
-    slack: "Slack"
+    slack: "Slack",
+    notepad: "Notepad",
+    "notepad++": "Notepad++"
   };
   if (processLabels[processKey]) {
     return processLabels[processKey];
@@ -157,6 +165,9 @@ export function normalizeAppName(input: string | null | undefined): string {
   if (noExe === "powerpnt" || noExe === "powerpoint") return "powerpoint";
   if (noExe === "outlook") return "outlook";
   if (noExe === "teams") return "teams";
+  if (noExe === "ms-teams" || noExe === "msteams") return "teams";
+  if (noExe === "zoom") return "zoom";
+  if (noExe === "cursor") return "cursor";
   if (noExe === "slack") return "slack";
   if (noExe === "notepad") return "notepad";
   if (isAutodeskProcessName(noExe)) return "autodesk";

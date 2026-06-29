@@ -16,6 +16,9 @@ export const PERSISTENCE_FLOOR_RATIO = 0.55;
 /** System must be at least this active (non-idle) for persistence carry. */
 export const PERSISTENCE_MIN_ACTIVE_RATIO = 0.5;
 
+/** Windows below this engaged share do not count as actual work time. */
+export const MIN_ENGAGEMENT_RATIO = 0.05;
+
 export type EngagementPollStats = {
   pollCount: number;
   pollsWithFullEngagement: number;
@@ -119,6 +122,19 @@ export function applyEngagementPersistence(
   }
 
   return unionSeconds;
+}
+
+export function applyMinimumEngagementThreshold(
+  validEngagedSeconds: number,
+  windowSeconds: number
+): number {
+  if (windowSeconds <= 0 || validEngagedSeconds <= 0) {
+    return 0;
+  }
+  if (validEngagedSeconds / windowSeconds <= MIN_ENGAGEMENT_RATIO) {
+    return 0;
+  }
+  return validEngagedSeconds;
 }
 
 export function adjustEngagedSecondsForAntiCheat(

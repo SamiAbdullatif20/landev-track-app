@@ -1,11 +1,10 @@
-import { stopWindowsForegroundProbeSession } from "./activity-metadata";
 import { probeWindowsForegroundContext } from "./foreground-probe-windows";
-import { probeWindowsInputSnapshot, stopWindowsInputProbeSession } from "./input-probe-windows";
+import { probeWindowsInputSnapshot } from "./input-probe-windows";
+import { stopWindowsUnifiedProbeSession } from "./windows-unified-probe";
 import { clearAppFocusDedupeState } from "./tracking-app-focus";
 
 export function stopAllWindowsProbeSessions(): void {
-  stopWindowsForegroundProbeSession();
-  stopWindowsInputProbeSession();
+  stopWindowsUnifiedProbeSession();
 }
 
 export async function resetAndWarmUpWindowsProbes(): Promise<void> {

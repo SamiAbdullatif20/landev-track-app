@@ -159,6 +159,16 @@ contextBridge.exposeInMainWorld("desktopAPI", {
     ipcRenderer.on("tracking:sync-status-push", listener);
     return () => ipcRenderer.removeListener("tracking:sync-status-push", listener);
   },
+  onInactivityAutoStopPush: (
+    cb: (payload: { stoppedAt: string; workActivityPercent: number | null; stopReason: string }) => void
+  ) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      payload: { stoppedAt: string; workActivityPercent: number | null; stopReason: string }
+    ) => cb(payload);
+    ipcRenderer.on("tracking:inactivity-auto-stop-push", listener);
+    return () => ipcRenderer.removeListener("tracking:inactivity-auto-stop-push", listener);
+  },
   onProjectsPush: (cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: { projects: Project[]; roles: string[]; fetchedAt: string }) =>
       cb(payload);

@@ -246,12 +246,21 @@ function App() {
       setProjectsError(null);
     });
 
+    const unsubscribeInactivity = window.desktopAPI.onInactivityAutoStopPush(() => {
+      pushToast(
+        "info",
+        "Tracking stopped automatically — work activity stayed below 5% for the past hour."
+      );
+      void loadWorkSummary({ showLoading: false });
+    });
+
     window.desktopAPI.getSyncStatus().then((status) => setSyncStatus(status)).catch(() => undefined);
 
     return () => {
       unsubscribe();
       unsubscribeSync();
       unsubscribeProjects();
+      unsubscribeInactivity();
     };
   }, [applyProjectsPayload, fetchProjectsWithRetry, loadWorkSummary, setAuthError, setAuthLoading, setAuthStatus, setRoles, setSession]);
 
@@ -575,7 +584,6 @@ function App() {
           <>
             <header className="compact-header">
               <div className="compact-header-left">
-                <LandevLogo className="header-logo-img" />
                 <div className="compact-header-main">
                 <p className="compact-kicker">Worked today</p>
                 <p className="daily-total">{formatClockDuration(workSummary.todayTotalMs)}</p>

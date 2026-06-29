@@ -1,6 +1,7 @@
 import { logger } from "../config/logger";
 import { getClientIanaTimeZone } from "../config/client-timezone";
 import { getSessionState } from "../db/queue-repo";
+import { trimWorkingSetAfterHeavyWork } from "../utils/memory-trim";
 import {
   delayMsUntilEarlierTarget,
   designerIntervalMs,
@@ -13,7 +14,8 @@ import {
 } from "./screenshot-schedules";
 import {
   CAPTURE_SIZES,
-  capturePrimaryScreenJpeg
+  capturePrimaryScreenJpeg,
+  type ScreenCaptureJpegResult
 } from "./screenshot-capture";
 import { TARGET_SCREENSHOT_BYTES } from "./screenshot-compress";
 import { shouldSkipScreenshotCapture } from "./capture-guard-windows";
@@ -44,6 +46,9 @@ export type ScreenshotUploadInput = {
     compressedBytes?: number;
     screenSourceId?: string;
     screenSourceName?: string;
+    displayIndex?: number;
+    displayCount?: number;
+    displayId?: string;
     /** Mouse % for this screenshot's interval only (not session cumulative). */
     mouseMovePercent?: number;
     mouseActiveSeconds?: number;
@@ -51,11 +56,18 @@ export type ScreenshotUploadInput = {
     activityPeriodStartAt?: string;
     activityPeriodEndAt?: string;
     activitySampleCount?: number;
+    /** Stable id for server-side dedup on retry / offline queue flush. */
+    uploadUuid?: string;
   };
 };
 
 type ScreenshotWorkerOptions = {
   uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
+};
+
+type DueScheduleCapture = {
+  schedule: ScreenshotSchedule;
+  cadenceTargetMs: number;
 };
 
 /**
@@ -89,7 +101,8 @@ export class ScreenshotWorker {
       designerEveryMinutes: 10,
       firstSuperadminTargetMs: this.nextSuperadminTargetMs,
       firstDesignerTargetMs: this.nextDesignerTargetMs,
-      runsInMainProcess: true
+      runsInMainProcess: true,
+      captureMode: "primary-display-gdi"
     });
   }
 
@@ -126,6 +139,12 @@ export class ScreenshotWorker {
     } else if (schedule.visibility === "admin_and_employee") {
       this.nextDesignerTargetMs += designerIntervalMs();
     }
+  }
+
+  private cadenceTargetMsFor(schedule: ScreenshotSchedule): number {
+    return schedule.visibility === "superadmin_only"
+      ? this.nextSuperadminTargetMs
+      : this.nextDesignerTargetMs;
   }
 
   private scheduleNextCapture(): void {
@@ -175,32 +194,31 @@ export class ScreenshotWorker {
       return;
     }
 
-    for (const schedule of due) {
-      const targetMs =
-        schedule.visibility === "superadmin_only"
-          ? this.nextSuperadminTargetMs
-          : this.nextDesignerTargetMs;
+    const dueCaptures: DueScheduleCapture[] = due.map((schedule) => ({
+      schedule,
+      cadenceTargetMs: this.cadenceTargetMsFor(schedule)
+    }));
 
-      try {
-        await this.captureAndUpload(schedule, targetMs);
-      } catch (error) {
-        logger.warn("screenshot-capture-failed", {
-          visibility: schedule.visibility,
-          cadenceTargetMs: targetMs,
-          error: error instanceof Error ? error.message : "unknown"
-        });
-      } finally {
-        if (overlapBothDue) {
-          const superadminSchedule = scheduleForVisibility("superadmin_only");
-          const employeeSchedule = scheduleForVisibility("admin_and_employee");
-          if (superadminSchedule) {
-            this.advanceTargetsAfterCapture(superadminSchedule);
-          }
-          if (employeeSchedule) {
-            this.advanceTargetsAfterCapture(employeeSchedule);
-          }
-        } else {
-          this.advanceTargetsAfterCapture(schedule);
+    try {
+      await this.captureAndUploadSchedules(dueCaptures);
+    } catch (error) {
+      logger.warn("screenshot-capture-failed", {
+        scheduleCount: dueCaptures.length,
+        error: error instanceof Error ? error.message : "unknown"
+      });
+    } finally {
+      if (overlapBothDue) {
+        const superadminSchedule = scheduleForVisibility("superadmin_only");
+        const employeeSchedule = scheduleForVisibility("admin_and_employee");
+        if (superadminSchedule) {
+          this.advanceTargetsAfterCapture(superadminSchedule);
+        }
+        if (employeeSchedule) {
+          this.advanceTargetsAfterCapture(employeeSchedule);
+        }
+      } else {
+        for (const entry of dueCaptures) {
+          this.advanceTargetsAfterCapture(entry.schedule);
         }
       }
     }
@@ -210,15 +228,14 @@ export class ScreenshotWorker {
     }
   }
 
-  private async captureAndUpload(schedule: ScreenshotSchedule, cadenceTargetMs: number): Promise<void> {
-    if (!this.running) {
+  private async captureAndUploadSchedules(dueCaptures: DueScheduleCapture[]): Promise<void> {
+    if (!this.running || dueCaptures.length === 0) {
       return;
     }
 
     if (this.captureInFlight) {
       logger.info("screenshot-skip-capture-in-flight", {
-        visibility: schedule.visibility,
-        cadenceTargetMs
+        scheduleCount: dueCaptures.length
       });
       return;
     }
@@ -228,8 +245,7 @@ export class ScreenshotWorker {
       const guard = await shouldSkipScreenshotCapture();
       if (guard.shouldSkipCapture) {
         logger.info("screenshot-skipped-non-interference-guard", {
-          visibility: schedule.visibility,
-          cadenceTargetMs,
+          scheduleCount: dueCaptures.length,
           reason: guard.reason,
           processName: guard.processName,
           windowTitle: guard.windowTitle
@@ -237,95 +253,100 @@ export class ScreenshotWorker {
         return;
       }
 
-      let lastUploadError: unknown = null;
+      let capture: ScreenCaptureJpegResult | null = null;
 
       for (const size of CAPTURE_SIZES) {
-        const capture = await capturePrimaryScreenJpeg(size, TARGET_SCREENSHOT_BYTES);
+        capture = await capturePrimaryScreenJpeg(size, TARGET_SCREENSHOT_BYTES);
         if (!capture) {
           continue;
         }
 
-        const {
-          buffer: imageBytes,
-          width,
-          height,
-          quality,
-          compressedBytes,
-          sourceId,
-          sourceName
-        } = capture;
-
         const capturedAt = new Date().toISOString();
         const captureMs = Date.parse(capturedAt);
-        const periodMs = schedule.intervalMinutes * 60 * 1000;
-        const periodMouse = getMouseStatsForPeriod(captureMs, periodMs);
+
         try {
-          await this.uploadScreenshot({
-            capturedAt,
-            imageBytes,
-            mimeType: "image/jpeg",
-            projectId: this.context.projectId,
-            ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
-            metadata: {
-              width,
-              height,
-              source: "desktop-agent",
-              clientTimeZone: getClientIanaTimeZone(),
-              intervalMinutes: schedule.intervalMinutes,
+          for (const entry of dueCaptures) {
+            const { schedule, cadenceTargetMs } = entry;
+            const periodMs = schedule.intervalMinutes * 60 * 1000;
+            const periodMouse = getMouseStatsForPeriod(captureMs, periodMs);
+            const imageBytes = capture.buffer;
+
+            await this.uploadScreenshot({
+              capturedAt,
+              imageBytes,
+              mimeType: "image/jpeg",
+              projectId: this.context.projectId,
+              ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+              metadata: {
+                width: capture.width,
+                height: capture.height,
+                source: "desktop-agent",
+                clientTimeZone: getClientIanaTimeZone(),
+                intervalMinutes: schedule.intervalMinutes,
+                visibility: schedule.visibility,
+                visibleToRoles: [...schedule.visibleToRoles],
+                cadenceTargetMs,
+                mouseMovePercent: periodMouse.mouseMovePercent,
+                mouseActiveSeconds: periodMouse.mouseActiveSeconds,
+                activityPeriodSeconds: periodMouse.activityPeriodSeconds,
+                activityPeriodStartAt: periodMouse.activityPeriodStartAt,
+                activityPeriodEndAt: periodMouse.activityPeriodEndAt,
+                activitySampleCount: periodMouse.sampleCount,
+                jpegQuality: capture.quality,
+                compressedBytes: capture.compressedBytes,
+                screenSourceId: capture.sourceId,
+                screenSourceName: capture.sourceName,
+                displayIndex: 0,
+                displayCount: 1,
+                ...(capture.displayId ? { displayId: capture.displayId } : {})
+              }
+            });
+            logger.info("screenshot-uploaded", {
+              capturedAt,
               visibility: schedule.visibility,
-              visibleToRoles: [...schedule.visibleToRoles],
+              intervalMinutes: schedule.intervalMinutes,
               cadenceTargetMs,
-              mouseMovePercent: periodMouse.mouseMovePercent,
-              mouseActiveSeconds: periodMouse.mouseActiveSeconds,
-              activityPeriodSeconds: periodMouse.activityPeriodSeconds,
-              activityPeriodStartAt: periodMouse.activityPeriodStartAt,
-              activityPeriodEndAt: periodMouse.activityPeriodEndAt,
-              activitySampleCount: periodMouse.sampleCount,
-              jpegQuality: quality,
-              compressedBytes,
-              screenSourceId: sourceId,
-              screenSourceName: sourceName
-            }
-          });
-          logger.info("screenshot-uploaded", {
-            capturedAt,
-            visibility: schedule.visibility,
-            intervalMinutes: schedule.intervalMinutes,
-            cadenceTargetMs,
-            periodMousePercent: periodMouse.mouseMovePercent,
-            periodMouseSeconds: periodMouse.mouseActiveSeconds,
-            projectId: this.context.projectId,
-            hasSessionId: Boolean(this.context.sessionId),
-            compressedBytes,
-            jpegQuality: quality,
-            screenSourceId: sourceId
-          });
+              periodMousePercent: periodMouse.mouseMovePercent,
+              periodMouseSeconds: periodMouse.mouseActiveSeconds,
+              projectId: this.context.projectId,
+              hasSessionId: Boolean(this.context.sessionId),
+              compressedBytes: capture.compressedBytes,
+              jpegQuality: capture.quality,
+              screenSourceId: capture.sourceId,
+              displayIndex: 0,
+              displayCount: 1,
+              sharedCapture: dueCaptures.length > 1
+            });
+          }
+
+          capture = null;
           return;
         } catch (error) {
-          lastUploadError = error;
           const status = (error as { response?: { status?: number } }).response?.status;
           if (status === 413) {
             logger.warn("screenshot-upload-413-retrying-lower-resolution", {
-              visibility: schedule.visibility,
-              cadenceTargetMs,
+              scheduleCount: dueCaptures.length,
               width: size.width,
               height: size.height
             });
+            capture = null;
             continue;
           }
           throw error;
         }
       }
 
-      if (lastUploadError) {
-        throw lastUploadError;
-      }
       logger.warn("screenshot-skipped-capture-failed", {
-        visibility: schedule.visibility,
-        cadenceTargetMs
+        scheduleCount: dueCaptures.length
       });
     } finally {
       this.captureInFlight = false;
+      void trimWorkingSetAfterHeavyWork();
     }
+  }
+
+  /** @internal Test hook for single-schedule capture. */
+  async captureAndUpload(schedule: ScreenshotSchedule, cadenceTargetMs: number): Promise<void> {
+    await this.captureAndUploadSchedules([{ schedule, cadenceTargetMs }]);
   }
 }

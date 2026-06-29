@@ -3,31 +3,41 @@ export type InputActivitySampleRecord = {
   mouseActiveSeconds: number;
   keyboardActiveSeconds: number;
   activeSeconds: number;
+  validEngagedSeconds: number;
   windowSeconds: number;
 };
 
 const samples: InputActivitySampleRecord[] = [];
-const MAX_SAMPLES = 2000;
+const MAX_SAMPLES = 480;
 const RETENTION_MS = 24 * 60 * 60 * 1000;
 
 export function clearInputActivityRollup(): void {
   samples.length = 0;
 }
 
+import { percentFromSeconds } from "./activity-score";
+
 export function recordInputActivityRollupSample(input: {
   endedAtMs?: number;
   mouseActiveSeconds: number;
   keyboardActiveSeconds?: number;
   activeSeconds?: number;
+  validEngagedSeconds?: number;
   trackerElapsedMs: number;
 }): void {
   const endedAtMs = input.endedAtMs ?? Date.now();
+  const windowSeconds = Math.max(0.001, input.trackerElapsedMs / 1000);
+  const activeSeconds = Math.max(0, input.activeSeconds ?? 0);
   samples.push({
     endedAtMs,
     mouseActiveSeconds: Math.max(0, input.mouseActiveSeconds),
     keyboardActiveSeconds: Math.max(0, input.keyboardActiveSeconds ?? 0),
-    activeSeconds: Math.max(0, input.activeSeconds ?? 0),
-    windowSeconds: Math.max(0.001, input.trackerElapsedMs / 1000)
+    activeSeconds,
+    validEngagedSeconds: Math.max(
+      0,
+      input.validEngagedSeconds ?? activeSeconds
+    ),
+    windowSeconds
   });
 
   const cutoff = endedAtMs - RETENTION_MS;
@@ -74,5 +84,52 @@ export function getMouseStatsForPeriod(periodEndMs: number, periodMs: number): P
     activityPeriodStartAt: new Date(periodStartMs).toISOString(),
     activityPeriodEndAt: new Date(periodEndMs).toISOString(),
     sampleCount
+  };
+}
+
+export type WorkActivityPeriodStats = {
+  workActivityPercent: number;
+  validEngagedSeconds: number;
+  trackedSeconds: number;
+  sampleCount: number;
+  periodStartAt: string;
+  periodEndAt: string;
+};
+
+/** Engagement % (valid engaged ÷ tracked window) for inactivity auto-stop and reporting. */
+export function getWorkActivityStatsForPeriod(
+  periodEndMs: number,
+  periodMs: number,
+  sessionStartedAtMs?: number | null
+): WorkActivityPeriodStats {
+  const periodSeconds = Math.max(0.001, periodMs / 1000);
+  const periodStartMs = Math.max(
+    periodEndMs - periodMs,
+    sessionStartedAtMs != null && Number.isFinite(sessionStartedAtMs)
+      ? sessionStartedAtMs
+      : periodEndMs - periodMs
+  );
+
+  let validEngagedSeconds = 0;
+  let trackedSeconds = 0;
+  let sampleCount = 0;
+  for (const sample of samples) {
+    if (sample.endedAtMs > periodStartMs && sample.endedAtMs <= periodEndMs + 1000) {
+      validEngagedSeconds += sample.validEngagedSeconds;
+      trackedSeconds += sample.windowSeconds;
+      sampleCount += 1;
+    }
+  }
+
+  const cappedEngaged = Math.min(trackedSeconds, validEngagedSeconds);
+  const workActivityPercent = percentFromSeconds(cappedEngaged, trackedSeconds);
+
+  return {
+    workActivityPercent,
+    validEngagedSeconds: Number(cappedEngaged.toFixed(3)),
+    trackedSeconds: Number(trackedSeconds.toFixed(3)),
+    sampleCount,
+    periodStartAt: new Date(periodStartMs).toISOString(),
+    periodEndAt: new Date(periodEndMs).toISOString()
   };
 }

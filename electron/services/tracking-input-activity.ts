@@ -6,7 +6,10 @@ import { collectActivityContext } from "./activity-metadata";
 import { buildWorkSessionEventFields } from "./session-event-fields";
 import { buildTrackingMetadata } from "./tracking-event-utils";
 import { applyAntiCheatFilter } from "./activity-anti-cheat";
-import { adjustEngagedSecondsForAntiCheat } from "./activity-engagement";
+import {
+  adjustEngagedSecondsForAntiCheat,
+  applyMinimumEngagementThreshold
+} from "./activity-engagement";
 import {
   computeEngagementActivityScore,
   computeSampleActivityScore,
@@ -38,20 +41,12 @@ export type InputActivitySample = {
   totalSamples?: number;
   triggerType?: string;
   pollTravelPx?: number[];
-  meetingAttributedSeconds?: number;
-  meetingPollSamples?: number;
-  isMeetingActive?: boolean;
-  meetingPresenceReason?: string | null;
-  meetingDetectionSource?: "foreground" | "background" | null;
   validEngagedSeconds?: number;
   fullEngagementPolls?: number;
   microEngagementPolls?: number;
 };
 
 function shouldSkipAllZero(sample: InputActivitySample, eventKind: "INPUT_ACTIVITY" | "HEARTBEAT"): boolean {
-  if ((sample.meetingAttributedSeconds ?? 0) > 0 || sample.isMeetingActive) {
-    return false;
-  }
   if ((sample.validEngagedSeconds ?? 0) > 0) {
     return false;
   }
@@ -86,13 +81,8 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
   const totalSamples = Math.max(1, sample.totalSamples ?? 1);
   const mouseMoveSamples = Math.min(totalSamples, Math.max(0, sample.mouseMoveSamples ?? 0));
   const windowSeconds = Math.max(0.001, sample.trackerElapsedMs / 1000);
-  let activeSeconds = Math.max(0, sample.activeSeconds);
-  let idleSeconds = Math.max(0, sample.idleSeconds);
-  const meetingAttributedSeconds = Math.max(0, sample.meetingAttributedSeconds ?? 0);
-  if (meetingAttributedSeconds > 0) {
-    activeSeconds = Math.max(activeSeconds, Math.min(windowSeconds, meetingAttributedSeconds));
-    idleSeconds = Math.max(0, Number((windowSeconds - activeSeconds).toFixed(3)));
-  }
+  const activeSeconds = Math.max(0, sample.activeSeconds);
+  const idleSeconds = Math.max(0, sample.idleSeconds);
   const mouseActiveSeconds =
     typeof sample.mouseActiveSeconds === "number"
       ? Math.min(windowSeconds, Math.max(0, sample.mouseActiveSeconds))
@@ -128,6 +118,7 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     antiCheat.flags,
     windowSeconds
   );
+  validEngagedSeconds = applyMinimumEngagementThreshold(validEngagedSeconds, windowSeconds);
 
   const breakdownMetrics = computeSampleActivityScore({
     validKeyboardSeconds: antiCheat.validKeyboardSeconds,
@@ -173,10 +164,6 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     mouseMovePercent: built.metadata.mouseMovePercent,
     mouseActiveSeconds,
     clickActiveSeconds: antiCheat.validClickSeconds,
-    meetingAttributedSeconds,
-    isMeetingActive: Boolean(sample.isMeetingActive ?? meetingAttributedSeconds > 0),
-    meetingPresenceReason: sample.meetingPresenceReason ?? null,
-    meetingDetectionSource: sample.meetingDetectionSource ?? null,
     activeSeconds,
     idleSeconds,
     validEngagedSeconds,
@@ -203,11 +190,6 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
       mouseActiveSeconds,
       clickActiveSeconds: antiCheat.validClickSeconds,
       clickSamples,
-      meetingAttributedSeconds,
-      meetingPollSamples: sample.meetingPollSamples ?? 0,
-      isMeetingActive: Boolean(sample.isMeetingActive ?? meetingAttributedSeconds > 0),
-      meetingPresenceReason: sample.meetingPresenceReason ?? null,
-      meetingDetectionSource: sample.meetingDetectionSource ?? null,
       activeSeconds,
       idleSeconds,
       validEngagedSeconds,
@@ -238,6 +220,7 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     mouseActiveSeconds: antiCheat.validMouseSeconds,
     keyboardActiveSeconds: antiCheat.validKeyboardSeconds,
     activeSeconds: sample.activeSeconds,
+    validEngagedSeconds,
     trackerElapsedMs: sample.trackerElapsedMs
   });
 
