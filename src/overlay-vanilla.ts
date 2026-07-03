@@ -1,6 +1,5 @@
 import "./overlay.css";
-
-const OVERLAY_POLL_MS = 5000;
+import { computeLiveAnchoredMs, UI_LIVE_TICK_MS } from "./utils/liveAnchoredTotal";
 
 function formatClockDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -32,38 +31,58 @@ function render(active: boolean, todayTotalMs: number): void {
   `;
 }
 
-let pollHandle: number | null = null;
+let tickHandle: number | null = null;
+let anchorTodayMs = 0;
+let anchorFetchedAtMs: number | null = null;
+let overlayActive = false;
 
-function stopPolling(): void {
-  if (pollHandle != null) {
-    window.clearInterval(pollHandle);
-    pollHandle = null;
+function stopLiveTick(): void {
+  if (tickHandle != null) {
+    window.clearInterval(tickHandle);
+    tickHandle = null;
   }
 }
 
-function startPolling(): void {
-  stopPolling();
-  const refreshTodayTotal = () => {
-    window.desktopAPI
-      .getWorkSummary()
-      .then((summary) => {
-        render(true, summary.todayTotalMs);
-      })
-      .catch(() => undefined);
-  };
-  refreshTodayTotal();
-  pollHandle = window.setInterval(refreshTodayTotal, OVERLAY_POLL_MS);
+function liveTodayMs(): number {
+  return computeLiveAnchoredMs(anchorTodayMs, anchorFetchedAtMs, overlayActive);
+}
+
+function paintLiveToday(): void {
+  render(overlayActive, liveTodayMs());
+}
+
+function startLiveTick(): void {
+  stopLiveTick();
+  tickHandle = window.setInterval(() => {
+    paintLiveToday();
+  }, UI_LIVE_TICK_MS);
+}
+
+async function refreshAnchor(): Promise<void> {
+  const summary = await window.desktopAPI.getWorkSummary();
+  anchorTodayMs = summary.todayTotalMs;
+  anchorFetchedAtMs = Date.now();
+  paintLiveToday();
 }
 
 function applyStatus(status: { active: boolean }): void {
+  overlayActive = status.active;
   if (!status.active) {
-    stopPolling();
+    stopLiveTick();
+    anchorTodayMs = 0;
+    anchorFetchedAtMs = null;
     render(false, 0);
     return;
   }
-  render(true, 0);
-  startPolling();
+  void refreshAnchor().then(() => {
+    startLiveTick();
+  });
 }
 
 window.desktopAPI.getStatus().then(applyStatus).catch(() => undefined);
-window.desktopAPI.onStatusPush(applyStatus);
+window.desktopAPI.onStatusPush((status) => {
+  applyStatus(status);
+  if (status.active) {
+    void refreshAnchor();
+  }
+});

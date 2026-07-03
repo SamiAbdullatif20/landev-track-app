@@ -1,0 +1,51 @@
+# Web + Backend — Event-Driven Desktop Tracking (v1.3)
+
+The desktop agent no longer sends duration samples every 15 seconds. It emits **timestamped transitions** only. **All durations, timelines, and timesheets must be computed server-side** from ordered events.
+
+## Event kinds (batch: `POST /api/tracking/events/batch`)
+
+| eventKind | When emitted | Required fields | Do NOT expect from desktop |
+|-----------|--------------|-----------------|----------------------------|
+| `ACTIVITY_START` | Session tracking begins | `occurredAt`, `sessionId`, `projectId`, `workDateKey` | `activeSeconds`, scores |
+| `ACTIVITY_STOP` | Session tracking ends | `occurredAt`, `metadata.stopReason?` | duration totals |
+| `APP_CHANGE` | Foreground app/window changes | `occurredAt`, `processName`, `windowTitle`, `application` | `activeSeconds` |
+| `IDLE_START` | System idle ≥ 5 min | `occurredAt`, `systemIdleMs` | local idle seconds |
+| `IDLE_END` | User input resumes after idle | `occurredAt`, `systemIdleMs` | |
+| `HEARTBEAT` | Every ~45s while active | `occurredAt`, `systemIdleMs`, optional `processName` | activity scores |
+| `SCREENSHOT_CAPTURED` | After scheduled capture | `occurredAt`, `capturedAt`, `width`, `height`, `visibility` | mouse % (removed) |
+
+Legacy kinds (`INPUT_ACTIVITY`, `APP_FOCUS`, `ACTIVITY_INTERVAL`) may still exist in old queues — treat as deprecated.
+
+Screenshots still upload via multipart ingest; `SCREENSHOT_CAPTURED` is a timeline marker only.
+
+## Server-side duration rules
+
+```
+session_tracked = ACTIVITY_STOP.occurredAt - ACTIVITY_START.occurredAt
+app_segment_duration = next(APP_CHANGE or ACTIVITY_STOP).occurredAt - this(APP_CHANGE).occurredAt
+idle_segment = IDLE_END.occurredAt - IDLE_START.occurredAt
+```
+
+Use `HEARTBEAT` only for liveness / gap detection (e.g. no heartbeat for 3× interval ⇒ offline).
+
+## Desktop cadence (no per-second work)
+
+| Mechanism | Interval |
+|-----------|----------|
+| Foreground hook | Event-driven (Win32); fallback poll 30s |
+| Idle transition check | 30s |
+| Heartbeat | 45s |
+| Event batch sync | 60s |
+| Screenshots | 6m / 10m schedules (unchanged) |
+| Web session mirror poll | 30s |
+
+## UI note
+
+Desktop **display** timer updates every 10s from `startedAt` for UX only — not sent to API.
+
+## Migration checklist
+
+1. Accept new `eventKind` values in batch ingest (idempotent on `eventUuid`).
+2. Build timeline projector: events → app segments, idle segments, session totals.
+3. Stop relying on `INPUT_ACTIVITY.activeSeconds` / `APP_FOCUS.activeSeconds` for new sessions.
+4. Session stop API unchanged; `ACTIVITY_STOP` complements it for analytics.

@@ -3,6 +3,14 @@ import { isActiveSessionStartConflictError } from "./session-start-reconcile";
 import { ApiError } from "../api/client";
 
 describe("isActiveSessionStartConflictError", () => {
+  it("detects another-project-in-progress validation from the server", () => {
+    const error = new ApiError(
+      "validation",
+      "Work session already in progress for another project today."
+    );
+    expect(isActiveSessionStartConflictError(error)).toBe(true);
+  });
+
   it("detects server validation text from the screenshot", () => {
     const error = new ApiError(
       "validation",

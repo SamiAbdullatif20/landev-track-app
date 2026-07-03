@@ -9,7 +9,8 @@ import {
 } from "./tracking-app-focus";
 
 export const APP_FOCUS_CHECK_MS = 5_000;
-export const APP_FOCUS_TICK_MS = 15_000;
+/** App-switch detection stays at CHECK_MS (5s); this only paces the periodic "still here" tick. */
+export const APP_FOCUS_TICK_MS = 30_000;
 
 /** Minimum seconds credited when switching away from a brief foreground app. */
 const MIN_BRIEF_SWITCH_SECONDS = 1;

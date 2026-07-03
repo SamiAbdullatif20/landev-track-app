@@ -1,4 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("../db/queue-repo", () => ({
+  getSessionState: vi.fn(() => ({
+    active: 1,
+    sessionId: "ws-123",
+    projectId: "proj-9",
+    description: "test",
+    startedAt: "2026-06-22T15:44:26.282Z"
+  }))
+}));
+
 import {
   buildBatchPayloadFromQueuedEvent,
   effectiveActivityIntervalStartMs,
@@ -59,5 +70,21 @@ describe("batch-event-payload", () => {
     expect((payload as Record<string, unknown>).intervalStartAt).toBe(
       "2026-06-22T15:44:26.282Z"
     );
+  });
+
+  it("patches missing work session id from the active session at sync time", () => {
+    const payload = buildBatchPayloadFromQueuedEvent(
+      {
+        type: "INPUT_ACTIVITY",
+        mouseMovePercent: 42,
+        occurredAt: "2026-06-22T15:45:00.000Z"
+      },
+      "uuid-2",
+      "INPUT_ACTIVITY"
+    );
+    const built = payload as Record<string, unknown>;
+    expect(built.sessionId).toBe("ws-123");
+    expect(built.workSessionId).toBe("ws-123");
+    expect(built.projectId).toBe("proj-9");
   });
 });

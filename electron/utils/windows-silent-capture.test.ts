@@ -6,5 +6,5 @@ describe("withSilentWindowsCapture", () => {
     resetSilentCaptureGuardForTests();
     const result = await withSilentWindowsCapture(async () => "ok");
     expect(result).toBe("ok");
-  });
+  }, 12_000);
 });

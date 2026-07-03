@@ -3,7 +3,7 @@ import { getClientIanaTimeZone } from "../config/client-timezone";
 import { getSessionState, saveSessionState } from "../db/queue-repo";
 import { logger } from "../config/logger";
 import { hasUsableWorkSessionId } from "./session-event-fields";
-import { closeOrphanRemoteSession } from "./session-start-reconcile";
+import { resolveAndCloseStaleRemoteSession } from "./session-start-reconcile";
 
 /** Register a desktop session on the server when start was deferred (offline/conflict recovery). */
 export async function syncPendingRemoteSessionStart(
@@ -20,7 +20,7 @@ export async function syncPendingRemoteSessionStart(
   }
 
   try {
-    await closeOrphanRemoteSession(options);
+    await resolveAndCloseStaleRemoteSession(options);
   } catch (error) {
     logger.warn("pending-remote-start-orphan-close-failed", { error });
   }

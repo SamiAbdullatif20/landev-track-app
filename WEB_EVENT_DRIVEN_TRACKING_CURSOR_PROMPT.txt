@@ -1,0 +1,396 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Event-driven desktop tracking ingest + server-side duration projection (desktop v1.3.0+)
+
+The Electron desktop agent (v1.3+) uses a **hybrid** model:
+
+1. **Transition events** (`APP_CHANGE`, `IDLE_*`, `ACTIVITY_START`/`STOP`, `HEARTBEAT`) — timestamps only; server projects per-app time.
+2. **`INPUT_ACTIVITY` every 15s** — still includes mouse move %, keyboard %, click counts, `mouseMoveCount`, `keyPressCount`, `activityScore`, `validEngagedSeconds`, etc. **Keep existing activity breakdown UI for this.**
+3. **`ACTIVITY_INTERVAL` every 15 min** — unchanged rollup blocks.
+
+The web app must:
+
+1. **Accept** the new `eventKind` values on batch ingest.
+2. **Keep** `INPUT_ACTIVITY` aggregation for mouse/keyboard/click breakdown (do not remove).
+3. **Compute per-app durations** server-side from `APP_CHANGE` (not `APP_FOCUS.activeSeconds`).
+4. **Keep** legacy event handling for older desktop builds.
+5. **Apply** `eventUuid` idempotency (see `WEB_TRACKING_IDEMPOTENCY_PROMPT.txt` if not done yet).
+
+**Fix server ingest, persistence, projection, and UI read paths.** Do not change the Electron desktop app for this task.
+
+---
+
+## Why this changed
+
+| Old desktop (pre-v1.3) | New desktop (v1.3+) |
+|------------------------|---------------------|
+| Poll input every 2s, emit `INPUT_ACTIVITY` every 15s | **Still** — full mouse/keyboard/click metrics in `INPUT_ACTIVITY` |
+| `APP_FOCUS` with `activeSeconds` credited locally | `APP_CHANGE` with timestamp only (no `activeSeconds`) |
+| Web sums `APP_FOCUS.activeSeconds` for apps used | Web diffs `APP_CHANGE` timestamps for app time |
+| Activity % from `INPUT_ACTIVITY` | **Unchanged** — still use `INPUT_ACTIVITY` / `ACTIVITY_INTERVAL` |
+
+Desktop batch sync runs every **~60s**. Events may arrive slightly out of order within a batch; sort by `occurredAt` before projection.
+
+---
+
+## API: `POST /api/tracking/events/batch`
+
+### Endpoint (unchanged)
+
+```
+POST /api/tracking/events/batch
+Authorization: session cookie / bearer (existing)
+Body: { "events": [ ... ] }
+```
+
+### New `eventKind` values to accept
+
+```
+ACTIVITY_START
+ACTIVITY_STOP
+APP_CHANGE
+IDLE_START
+IDLE_END
+HEARTBEAT
+SCREENSHOT_CAPTURED
+```
+
+### Legacy kinds (still accept — do not remove)
+
+```
+INPUT_ACTIVITY
+APP_FOCUS
+HEARTBEAT          (old shape may include activeSeconds)
+ACTIVITY_INTERVAL
+```
+
+### Validation rules
+
+1. Every event has stable **`eventUuid`** (UUID v4). Idempotent re-ingest → `{ ok: true, duplicate: true }`.
+2. **`occurredAt`** (ISO 8601 UTC) is the authoritative timestamp for projection. Do not use server receive time for duration math.
+3. **Do not require** `activeSeconds`, `trackerElapsedMs`, `activityScore`, or mouse/keyboard percents on new kinds.
+4. **Do require** session linkage fields when present on desktop payload:
+   - `workDateKey` (YYYY-MM-DD in user/client TZ)
+   - `sessionId` / `workSessionId` (when server session exists)
+   - `projectId` (nullable for catalog/non-chargeable tasks)
+   - `sessionSegmentStartedAt` (ISO — desktop segment start)
+   - `clientTimeZone` (IANA, e.g. `America/New_York`)
+5. Extend Zod/OpenAPI/Prisma enums to include new kinds without rejecting the batch.
+
+---
+
+## Payload reference (desktop v1.3)
+
+### Common fields (all new kinds)
+
+```json
+{
+  "eventUuid": "550e8400-e29b-41d4-a716-446655440000",
+  "eventKind": "APP_CHANGE",
+  "type": "APP_CHANGE",
+  "occurredAt": "2026-06-02T14:32:01.123Z",
+  "occurredAtIso": "2026-06-02T14:32:01.123Z",
+  "workDateKey": "2026-06-02",
+  "sessionId": "ws_abc123",
+  "workSessionId": "ws_abc123",
+  "projectId": "proj_456",
+  "sessionSegmentStartedAt": "2026-06-02T14:00:00.000Z",
+  "clientTimeZone": "America/New_York",
+  "metadata": {
+    "workDateKey": "2026-06-02",
+    "sessionId": "ws_abc123",
+    "clientTimeZone": "America/New_York",
+    "agentVersion": "event-driven-v1",
+    "triggerType": "foreground_change"
+  }
+}
+```
+
+### `ACTIVITY_START`
+
+Emitted when desktop local capture starts (same moment as session start flow).
+
+```json
+{
+  "eventKind": "ACTIVITY_START",
+  "metadata": { "triggerType": "session_start", "agentVersion": "event-driven-v1" }
+}
+```
+
+### `ACTIVITY_STOP`
+
+Emitted when desktop local capture stops (before/around session stop API).
+
+```json
+{
+  "eventKind": "ACTIVITY_STOP",
+  "metadata": {
+    "triggerType": "session_stop",
+    "stopReason": "INACTIVITY_AUTO"
+  }
+}
+```
+
+`stopReason` optional: `INACTIVITY_AUTO`, user stop, mirror stop from web, etc.
+
+### `APP_CHANGE`
+
+Foreground app/window changed. **No `activeSeconds`.**
+
+```json
+{
+  "eventKind": "APP_CHANGE",
+  "appName": "AutoCAD",
+  "application": "acad",
+  "applicationDisplayName": "AutoCAD",
+  "processName": "acad.exe",
+  "windowTitle": "Drawing1.dwg - AutoCAD",
+  "metadata": {
+    "triggerType": "foreground_change",
+    "executablePath": "C:\\Program Files\\Autodesk\\AutoCAD\\acad.exe",
+    "processId": 12345,
+    "hasForegroundWindowHandle": true
+  }
+}
+```
+
+### `IDLE_START` / `IDLE_END`
+
+System idle transitions (desktop threshold: **5 minutes** via `GetLastInputInfo`).
+
+```json
+{
+  "eventKind": "IDLE_START",
+  "systemIdleMs": 310000,
+  "metadata": { "triggerType": "idle_transition" }
+}
+```
+
+```json
+{
+  "eventKind": "IDLE_END",
+  "systemIdleMs": 12000,
+  "metadata": { "triggerType": "idle_transition" }
+}
+```
+
+### `HEARTBEAT`
+
+Every **~45s** while session active. Liveness + optional foreground snapshot. **Not** a duration sample.
+
+```json
+{
+  "eventKind": "HEARTBEAT",
+  "systemIdleMs": 45000,
+  "processName": "chrome.exe",
+  "windowTitle": "Jira - Google Chrome",
+  "application": "chrome",
+  "metadata": { "triggerType": "heartbeat" }
+}
+```
+
+### `SCREENSHOT_CAPTURED`
+
+Timeline marker only. **Image bytes** still arrive via existing multipart screenshot ingest (`POST` screenshot endpoint). Link by `sessionId` + `capturedAt` + time proximity.
+
+```json
+{
+  "eventKind": "SCREENSHOT_CAPTURED",
+  "capturedAt": "2026-06-02T14:36:00.000Z",
+  "width": 480,
+  "height": 270,
+  "compressedBytes": 142000,
+  "visibility": "admin_and_employee",
+  "intervalMinutes": 10,
+  "screenSourceId": "gdi:primary",
+  "metadata": {
+    "triggerType": "scheduled_capture",
+    "visibility": "admin_and_employee",
+    "intervalMinutes": 10
+  }
+}
+```
+
+---
+
+## Server-side projection (required)
+
+Persist raw events, then project into read models used by reports / session detail / timeline UI.
+
+### Sort order
+
+```ts
+events.sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt));
+```
+
+### Session tracked time
+
+For v1.3 sessions prefer:
+
+```
+trackedMs = ACTIVITY_STOP.occurredAt - ACTIVITY_START.occurredAt
+```
+
+Fallback if `ACTIVITY_*` missing: existing session stop API `startedAt` / `stoppedAt`.
+
+Subtract explicit idle segments if your product defines “active time” vs “clock time”:
+
+```
+activeMs = trackedMs - sum(idle_segment_ms)
+idle_segment_ms = IDLE_END.occurredAt - IDLE_START.occurredAt  (paired in order)
+```
+
+### Per-app time (replaces summing `APP_FOCUS.activeSeconds`)
+
+Walk `APP_CHANGE` events in order within a session segment:
+
+```ts
+for each APP_CHANGE at time T:
+  duration until next APP_CHANGE or ACTIVITY_STOP or session end
+  credit to (processName, applicationDisplayName, windowTitle at T)
+```
+
+Pseudocode:
+
+```ts
+function projectAppSegments(events: TrackingEvent[]): AppSegment[] {
+  const changes = events.filter(e => e.eventKind === 'APP_CHANGE');
+  const stopAt = findStopTime(events); // ACTIVITY_STOP or session stop
+  const segments: AppSegment[] = [];
+
+  for (let i = 0; i < changes.length; i++) {
+    const start = Date.parse(changes[i].occurredAt);
+    const end = i + 1 < changes.length
+      ? Date.parse(changes[i + 1].occurredAt)
+      : stopAt;
+    if (end > start) {
+      segments.push({
+        processName: changes[i].processName,
+        application: changes[i].applicationDisplayName ?? changes[i].appName,
+        windowTitle: changes[i].windowTitle,
+        startedAt: new Date(start).toISOString(),
+        endedAt: new Date(end).toISOString(),
+        durationMs: end - start
+      });
+    }
+  }
+  return segments;
+}
+```
+
+### Idle segments
+
+Pair `IDLE_START` → `IDLE_END` in order. Unclosed `IDLE_START` at session stop → close at `ACTIVITY_STOP.occurredAt`.
+
+### Heartbeat usage
+
+- **Liveness**: if no `HEARTBEAT` for > 3× 45s (~135s) during an open session, flag gap / offline (do not invent events).
+- **Do not** treat heartbeat as 45s of active time.
+
+### Legacy sessions
+
+If session has `INPUT_ACTIVITY` / `APP_FOCUS` / `ACTIVITY_INTERVAL` events, keep existing aggregation for that session. Detect v1.3 by presence of `ACTIVITY_START` or `metadata.agentVersion === "event-driven-v1"`.
+
+```ts
+function isEventDrivenSession(events: TrackingEvent[]): boolean {
+  return events.some(e =>
+    e.eventKind === 'ACTIVITY_START' ||
+    e.metadata?.agentVersion === 'event-driven-v1'
+  );
+}
+```
+
+---
+
+## Web UI changes
+
+### Session detail / timeline
+
+| UI element | Old source | New source (v1.3) |
+|------------|------------|-------------------|
+| Total tracked | Sum `INPUT_ACTIVITY` windows or session API | `ACTIVITY_STOP - ACTIVITY_START` (or session API) |
+| Apps used | Sum `APP_FOCUS.activeSeconds` | Projected `APP_CHANGE` segments |
+| Idle blocks | `idleSeconds` on samples | `IDLE_START` / `IDLE_END` pairs |
+| Activity % / mouse % | Per-sample desktop metrics | **Not available** from v1.3 agent unless you add server-side inference later |
+| Screenshots | Screenshot ingest | Same ingest + optional `SCREENSHOT_CAPTURED` marker on timeline |
+
+### Live session timer on web
+
+Web can compute display time from `session.startedAt` → `now` client-side (same as desktop UI). No need for per-second desktop events.
+
+### Desktop ↔ web session mirror
+
+Desktop polls remote session every **30s**. Start/stop API behavior unchanged. `ACTIVITY_START` / `ACTIVITY_STOP` are **additional** analytics events, not a replacement for session start/stop endpoints.
+
+---
+
+## Database suggestions
+
+### Raw event store (if not already)
+
+```sql
+-- tracking_events: event_uuid UNIQUE, user_id, session_id, event_kind, occurred_at, payload_json
+CREATE UNIQUE INDEX tracking_events_event_uuid ON tracking_events (event_uuid);
+```
+
+### Projected tables (optional but recommended)
+
+- `tracking_app_segments` (session_id, process_name, app_name, window_title, started_at, ended_at, duration_ms)
+- `tracking_idle_segments` (session_id, started_at, ended_at, duration_ms)
+
+Rebuild projections idempotently from raw events when new events arrive.
+
+---
+
+## Idempotency (required)
+
+Same as `WEB_TRACKING_IDEMPOTENCY_PROMPT.txt`:
+
+- Re-posting same `eventUuid` → HTTP 200, no duplicate rows.
+- Never double-count durations when desktop retries after offline queue flush.
+
+---
+
+## Test plan (web)
+
+1. **Ingest**: POST batch with one of each new `eventKind` → 200, all persisted.
+2. **Idempotency**: Re-post same `eventUuid` → duplicate=true, row count unchanged.
+3. **App segments**: 3× `APP_CHANGE` + `ACTIVITY_STOP` → 3 segments with correct durations summing to stop−first change (or stop−start if you credit from ACTIVITY_START).
+4. **Idle pair**: `IDLE_START` then `IDLE_END` → one idle block; active time excludes it if you implement activeMs.
+5. **Legacy**: Batch with `APP_FOCUS` + `activeSeconds` still works for old desktop.
+6. **Mixed queue**: Batch containing both legacy and v1.3 events in one flush → no 400; each kind handled.
+7. **UI**: Session started on v1.3 desktop shows app breakdown from `APP_CHANGE`, not empty / zero.
+
+---
+
+## Desktop cadence reference (for expectations, not server polling)
+
+| Mechanism | Interval |
+|-----------|----------|
+| Foreground change | Win32 hook (event-driven); fallback poll 30s |
+| Idle transition check | 30s |
+| Heartbeat | 45s |
+| Event batch upload | 60s |
+| Screenshots | 6 min (admin) / 10 min (employee-visible) |
+| Web session mirror (desktop) | 30s |
+
+---
+
+## Out of scope for this task
+
+- Re-adding mouse/keyboard activity % from desktop (not sent in v1.3).
+- Changing Electron desktop agent code.
+- Screenshot multipart upload format (unchanged).
+
+---
+
+## Definition of done
+
+- [ ] Batch ingest accepts all 7 new `eventKind` values without validation errors.
+- [ ] `eventUuid` idempotency works for new kinds.
+- [ ] Session reports use projected segments for v1.3 sessions.
+- [ ] Legacy sessions still render correctly.
+- [ ] Timeline UI shows `APP_CHANGE`, idle blocks, screenshots markers where applicable.
+- [ ] No dependency on `activeSeconds` for new desktop sessions.

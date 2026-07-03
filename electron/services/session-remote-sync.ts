@@ -4,9 +4,14 @@ import { logger } from "../config/logger";
 import { readAuthContext, refreshAuthSession } from "./auth-session";
 import type { RemoteSessionStatus } from "./session-remote-status";
 
-/** Poll web session state so desktop mirrors web Start/Stop. */
-export const SESSION_REMOTE_SYNC_INTERVAL_MS = 5_000;
-const LOCAL_ACTION_GRACE_MS = 12_000;
+/**
+ * Poll web session state so desktop mirrors a web Start and backfills the
+ * server session id. Kept infrequent: most teams start/stop from the desktop,
+ * so this is only a low-cost fallback (also reduces Vercel function calls).
+ */
+export const SESSION_REMOTE_SYNC_INTERVAL_MS = 300_000;
+/** Ignore remote mirror actions briefly after a local Start/Stop click. */
+export const LOCAL_ACTION_GRACE_MS = 60_000;
 
 export type SessionRemoteSyncCallbacks = {
   getLocalState: () => {
@@ -15,7 +20,6 @@ export type SessionRemoteSyncCallbacks = {
     startedAt: string | null;
   };
   mirrorStart: (remote: RemoteSessionStatus) => Promise<void>;
-  mirrorStop: (stoppedAt: string) => Promise<void>;
   updateSessionId: (sessionId: string) => void;
   notifyStatus: () => void;
 };
@@ -54,8 +58,8 @@ export class SessionRemoteSyncService {
   }
 
   /** Call when the user starts/stops from the desktop UI (not a mirror). */
-  markLocalUserAction(): void {
-    this.localActionGraceUntilMs = Date.now() + LOCAL_ACTION_GRACE_MS;
+  markLocalUserAction(graceMs: number = LOCAL_ACTION_GRACE_MS): void {
+    this.localActionGraceUntilMs = Date.now() + graceMs;
   }
 
   async syncNow(): Promise<void> {
@@ -81,8 +85,8 @@ export class SessionRemoteSyncService {
       const local = this.callbacks.getLocalState();
       const inGrace = Date.now() < this.localActionGraceUntilMs;
 
-      if (local.active && remote.active && remote.sessionId) {
-        if (!local.sessionId || local.sessionId !== remote.sessionId) {
+      if (local.active && remote.active) {
+        if (remote.sessionId && (!local.sessionId || local.sessionId !== remote.sessionId)) {
           this.callbacks.updateSessionId(remote.sessionId);
           this.callbacks.notifyStatus();
         }
@@ -104,13 +108,10 @@ export class SessionRemoteSyncService {
         return;
       }
 
-      if (local.active && !remote.active) {
-        logger.info("session-remote-sync-mirror-stop", {
-          sessionId: local.sessionId
-        });
-        await this.callbacks.mirrorStop(new Date().toISOString());
-        this.callbacks.notifyStatus();
-      }
+      // Intentionally never mirror a remote "stop". A running local session may
+      // only be ended by the user's Stop button or by the app closing. Remote
+      // status endpoints can transiently report inactive, which previously
+      // caused sessions to stop unexpectedly.
     } catch (error) {
       logger.warn("session-remote-sync-failed", { error });
     } finally {

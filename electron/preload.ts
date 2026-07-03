@@ -70,9 +70,16 @@ type AppUpdateStatus =
   | { phase: "idle" }
   | { phase: "checking" }
   | { phase: "available"; version: string; currentVersion: string }
-  | { phase: "downloading"; percent: number }
+  | {
+      phase: "downloading";
+      percent: number;
+      version: string;
+      transferred: number;
+      total: number;
+      bytesPerSecond: number;
+    }
   | { phase: "ready"; version: string }
-  | { phase: "error"; message: string };
+  | { phase: "error"; message: string; version: string | null };
 
 type TrackingDebugSnapshot = {
   counters: {
@@ -133,15 +140,9 @@ contextBridge.exposeInMainWorld("desktopAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_GET) as Promise<{ enabled: boolean }>,
   setNotificationSoundEnabled: (enabled: boolean) =>
     ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_SET, enabled) as Promise<{ enabled: boolean }>,
-  getWebNotificationsStatus: () =>
-    ipcRenderer.invoke(IPC_CHANNELS.WEB_NOTIFICATIONS_STATUS) as Promise<{ unreadCount: number }>,
-  onNotificationCountPush: (cb: (status: { unreadCount: number }) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: { unreadCount: number }) => cb(payload);
-    ipcRenderer.on("app:notification-count-push", listener);
-    return () => ipcRenderer.removeListener("app:notification-count-push", listener);
-  },
   getAppUpdateStatus: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_STATUS) as Promise<AppUpdateStatus>,
   checkForAppUpdates: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_CHECK) as Promise<AppUpdateStatus>,
+  retryAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_RETRY) as Promise<AppUpdateStatus>,
   downloadAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_DOWNLOAD) as Promise<AppUpdateStatus>,
   installAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_INSTALL) as Promise<{ ok: true }>,
   onAppUpdateStatusPush: (cb: (status: AppUpdateStatus) => void) => {
@@ -158,16 +159,6 @@ contextBridge.exposeInMainWorld("desktopAPI", {
     const listener = (_event: Electron.IpcRendererEvent, payload: SyncStatus) => cb(payload);
     ipcRenderer.on("tracking:sync-status-push", listener);
     return () => ipcRenderer.removeListener("tracking:sync-status-push", listener);
-  },
-  onInactivityAutoStopPush: (
-    cb: (payload: { stoppedAt: string; workActivityPercent: number | null; stopReason: string }) => void
-  ) => {
-    const listener = (
-      _event: Electron.IpcRendererEvent,
-      payload: { stoppedAt: string; workActivityPercent: number | null; stopReason: string }
-    ) => cb(payload);
-    ipcRenderer.on("tracking:inactivity-auto-stop-push", listener);
-    return () => ipcRenderer.removeListener("tracking:inactivity-auto-stop-push", listener);
   },
   onProjectsPush: (cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: { projects: Project[]; roles: string[]; fetchedAt: string }) =>

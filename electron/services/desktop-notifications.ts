@@ -5,7 +5,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { logger } from "../config/logger";
 import { isNotificationSoundEnabled } from "./notification-settings";
-import { incrementLocalNotificationUnreadCount } from "./notification-badge";
 
 const execFileAsync = promisify(execFile);
 
@@ -121,8 +120,6 @@ function showWindowsToast(options: NotifyOptions, playSound: boolean): void {
 export async function notifyDesktop(options: NotifyOptions): Promise<void> {
   const soundEnabled = isNotificationSoundEnabled();
   const soundKind: NotificationSoundKind = options.event;
-
-  incrementLocalNotificationUnreadCount(options.event);
 
   logger.info("notification-trigger", {
     event: options.event,

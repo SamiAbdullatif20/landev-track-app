@@ -1,5 +1,6 @@
 import { logger } from "../config/logger";
 import { getClientIanaTimeZone } from "../config/client-timezone";
+import { isCatalogProjectId } from "../config/role-project-catalog";
 import { getSessionState } from "../db/queue-repo";
 import { trimWorkingSetAfterHeavyWork } from "../utils/memory-trim";
 import {
@@ -9,6 +10,7 @@ import {
   initialSuperadminTargetMs,
   scheduleForVisibility,
   schedulesDueAtElapsed,
+  SCREENSHOT_BOOTSTRAP_CAPTURE_MS,
   superadminIntervalMs,
   type ScreenshotSchedule
 } from "./screenshot-schedules";
@@ -63,6 +65,7 @@ export type ScreenshotUploadInput = {
 
 type ScreenshotWorkerOptions = {
   uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
+  onUploadComplete?: () => void;
 };
 
 type DueScheduleCapture = {
@@ -76,7 +79,9 @@ type DueScheduleCapture = {
  */
 export class ScreenshotWorker {
   private readonly uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
+  private readonly onUploadComplete?: () => void;
   private timeoutHandle: NodeJS.Timeout | null = null;
+  private bootstrapHandle: NodeJS.Timeout | null = null;
   private context: SessionContext = { projectId: null, sessionId: null };
   private running = false;
   private captureInFlight = false;
@@ -86,6 +91,7 @@ export class ScreenshotWorker {
 
   constructor(options: ScreenshotWorkerOptions) {
     this.uploadScreenshot = options.uploadScreenshot;
+    this.onUploadComplete = options.onUploadComplete;
   }
 
   public async start(context: SessionContext): Promise<void> {
@@ -96,6 +102,9 @@ export class ScreenshotWorker {
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
     this.scheduleNextCapture();
+    this.bootstrapHandle = setTimeout(() => {
+      void this.runBootstrapCapture();
+    }, SCREENSHOT_BOOTSTRAP_CAPTURE_MS);
     logger.info("screenshot-cadence-started", {
       superadminEveryMinutes: 6,
       designerEveryMinutes: 10,
@@ -109,6 +118,10 @@ export class ScreenshotWorker {
   public stop(): void {
     this.running = false;
     this.clearScheduledCapture();
+    if (this.bootstrapHandle) {
+      clearTimeout(this.bootstrapHandle);
+      this.bootstrapHandle = null;
+    }
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
     logger.info("screenshot-worker-stopped");
@@ -145,6 +158,33 @@ export class ScreenshotWorker {
     return schedule.visibility === "superadmin_only"
       ? this.nextSuperadminTargetMs
       : this.nextDesignerTargetMs;
+  }
+
+  private resolveLiveContext(): SessionContext {
+    const state = getSessionState();
+    const projectId =
+      state.projectId && !isCatalogProjectId(state.projectId)
+        ? state.projectId
+        : this.context.projectId;
+    return {
+      projectId,
+      sessionId: state.sessionId ?? this.context.sessionId
+    };
+  }
+
+  private async runBootstrapCapture(): Promise<void> {
+    if (!this.running || !getSessionState().active) {
+      return;
+    }
+    const schedule =
+      scheduleForVisibility("admin_and_employee") ?? scheduleForVisibility("superadmin_only");
+    if (!schedule) {
+      return;
+    }
+    logger.info("screenshot-bootstrap-capture", { delayMs: SCREENSHOT_BOOTSTRAP_CAPTURE_MS });
+    await this.captureAndUploadSchedules([
+      { schedule, cadenceTargetMs: SCREENSHOT_BOOTSTRAP_CAPTURE_MS }
+    ]);
   }
 
   private scheduleNextCapture(): void {
@@ -265,6 +305,7 @@ export class ScreenshotWorker {
         const captureMs = Date.parse(capturedAt);
 
         try {
+          const liveContext = this.resolveLiveContext();
           for (const entry of dueCaptures) {
             const { schedule, cadenceTargetMs } = entry;
             const periodMs = schedule.intervalMinutes * 60 * 1000;
@@ -275,8 +316,8 @@ export class ScreenshotWorker {
               capturedAt,
               imageBytes,
               mimeType: "image/jpeg",
-              projectId: this.context.projectId,
-              ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+              projectId: liveContext.projectId,
+              ...(liveContext.sessionId ? { sessionId: liveContext.sessionId } : {}),
               metadata: {
                 width: capture.width,
                 height: capture.height,
@@ -308,8 +349,8 @@ export class ScreenshotWorker {
               cadenceTargetMs,
               periodMousePercent: periodMouse.mouseMovePercent,
               periodMouseSeconds: periodMouse.mouseActiveSeconds,
-              projectId: this.context.projectId,
-              hasSessionId: Boolean(this.context.sessionId),
+              projectId: liveContext.projectId,
+              hasSessionId: Boolean(liveContext.sessionId),
               compressedBytes: capture.compressedBytes,
               jpegQuality: capture.quality,
               screenSourceId: capture.sourceId,
@@ -320,6 +361,7 @@ export class ScreenshotWorker {
           }
 
           capture = null;
+          this.onUploadComplete?.();
           return;
         } catch (error) {
           const status = (error as { response?: { status?: number } }).response?.status;

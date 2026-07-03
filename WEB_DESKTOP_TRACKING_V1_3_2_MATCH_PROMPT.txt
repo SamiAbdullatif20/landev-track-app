@@ -1,0 +1,104 @@
+Copy everything below into your web/backend Cursor chat (Landev web repo).
+
+---
+
+## Task: Match desktop tracker v1.3.2 (ingest + reports + screenshots)
+
+Fix **server ingest, aggregation, and UI** so session reports match the Electron app. **Do not change the desktop app.**
+
+**Symptoms:** Activity shows ~**100%** with no mouse/keyboard/click detail; **screenshots** missing on reports.
+
+Also apply idempotency from `WEB_TRACKING_IDEMPOTENCY_PROMPT.txt` (`eventUuid`, `uploadUuid`).
+
+---
+
+## What desktop sends TODAY (v1.3.2)
+
+| Kind | Cadence | Use for reports |
+|------|---------|-----------------|
+| `INPUT_ACTIVITY` | every 15s | **Mouse / keyboard / click / engagement %** |
+| `APP_FOCUS` | 5–15s | **Per-app time** — sum `activeSeconds` by `processName` |
+| `ACTIVITY_INTERVAL` | every 15 min | Timeline rollup blocks |
+
+**Not synced yet** (ignore for reports): `APP_CHANGE`, `IDLE_*`, `ACTIVITY_START/STOP`, `SCREENSHOT_CAPTURED`.
+
+Batch: `POST /api/tracking/events/batch` every ~20–30s. Sort by `occurredAt`.
+
+---
+
+## Fix the “100% only” bug
+
+`INPUT_ACTIVITY` includes both:
+
+- **Show in UI:** `mouseActivityPercent`, `keyboardActivityPercent`, `clickActivityPercent`, `engagementActivityPercent` / `activityScore` (also in `metadata`)
+- **Do NOT use as primary score:** `estimatedEfficiencyPercent` (= non-idle time, often ~100% even when input counts are 0)
+
+Aggregate session breakdown weighted by `trackerElapsedMs` (usually 15000).
+
+---
+
+## Key `INPUT_ACTIVITY` fields
+
+```
+mouseMoveCount, keyPressCount, clickCount, scrollCount
+mouseMovePercent, mouseActivityPercent, mouseActiveSeconds
+keyboardActivityPercent, clickActivityPercent, clickActiveSeconds
+validEngagedSeconds, engagementActivityPercent, activityScore
+activeSeconds, idleSeconds, estimatedEfficiencyPercent
+application, processName, windowTitle
+sessionId / workSessionId, workDateKey, projectId, clientTimeZone, occurredAt, eventUuid
+```
+
+---
+
+## `APP_FOCUS`
+
+Credits `activeSeconds` per foreground app. Group by `processName` / `applicationDisplayName`, sum `activeSeconds`. Do not wait for `APP_CHANGE`.
+
+---
+
+## Screenshots — `POST /api/tracking/screenshots/ingest`
+
+Multipart: `image` (JPEG), `capturedAt`, `mimeType`, `sessionId` + `workSessionId`, optional `projectId`, `metadata` (JSON).
+
+**Metadata must store:** `uploadUuid` (idempotent), `visibility`, `visibleToRoles`.
+
+| Tier | Interval | Roles |
+|------|----------|-------|
+| `superadmin_only` | 6 min | SUPER_ADMIN |
+| `admin_and_employee` | 10 min | SUPER_ADMIN, DESIGNER, MODERATOR |
+
+First shot ~**60s** after session start, then cadence above. Link by `sessionId` + user; enforce role visibility on read.
+
+---
+
+## Session flow
+
+1. Desktop starts capture locally, then `POST /api/tracking/session/start` → needs **`sessionId`** in response.
+2. Events/screenshots may lack `sessionId` for a few seconds; desktop backfills then syncs — **accept and link by session id**.
+3. Stop: `POST /api/tracking/session/stop` with `stoppedAt`, `startedAt`, `workDateKey`, `clientTimeZone`, `trailingEvents`.
+
+---
+
+## Ingest rules
+
+1. **`eventUuid`** unique — retries return 200, no duplicate rows.
+2. **`uploadUuid`** unique for screenshots — same.
+3. Accept `INPUT_ACTIVITY`, `APP_FOCUS`, `ACTIVITY_INTERVAL` without failing batch on optional/future kinds.
+4. Persist full activity metrics, not only efficiency percent.
+
+---
+
+## Quick acceptance tests
+
+- [ ] 4× `INPUT_ACTIVITY` with different mouse/keyboard % → report shows breakdown, not flat 100%
+- [ ] `APP_FOCUS` sums → apps-used table correct
+- [ ] Screenshot with `sessionId` + `uploadUuid` → visible on session (role-filtered)
+- [ ] Duplicate `eventUuid` / `uploadUuid` → 200, one row each
+- [ ] Screenshot ~60s after session start appears for SUPER_ADMIN
+
+---
+
+## Later (not live)
+
+When desktop enables transition-event sync, see `WEB_EVENT_DRIVEN_TRACKING_CURSOR_PROMPT.txt`. Until then: **`INPUT_ACTIVITY` + `APP_FOCUS` only.**

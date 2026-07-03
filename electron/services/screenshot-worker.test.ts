@@ -4,7 +4,12 @@ const mockCapturePrimaryScreenJpeg = vi.fn();
 const mockShouldSkipScreenshotCapture = vi.fn();
 
 vi.mock("../db/queue-repo", () => ({
-  getSessionState: () => ({ active: 1 })
+  getSessionState: () => ({ active: 1 }),
+  enqueueEvent: vi.fn()
+}));
+
+vi.mock("./tracking-agent-events", () => ({
+  emitScreenshotCaptured: vi.fn()
 }));
 
 vi.mock("./capture-guard-windows", () => ({

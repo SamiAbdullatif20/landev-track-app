@@ -4,6 +4,7 @@ import path from "node:path";
 import { app } from "electron";
 import { getDb } from "./index";
 import { logger } from "../config/logger";
+import { hasUsableWorkSessionId } from "../services/session-event-fields";
 
 export type QueuedScreenshotRow = {
   id: number;
@@ -109,6 +110,32 @@ export function enqueueScreenshot(input: ScreenshotQueueInput): string {
     bytes: input.imageBytes.length
   });
   return uploadUuid;
+}
+
+export function backfillWorkSessionIdOnPendingScreenshots(workSessionId: string, limit = 200): number {
+  if (!hasUsableWorkSessionId(workSessionId)) {
+    return 0;
+  }
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT id, sessionId FROM queued_screenshots
+       WHERE status IN ('pending', 'retry')
+         AND (sessionId IS NULL OR sessionId = '')
+       ORDER BY id ASC
+       LIMIT @limit`
+    )
+    .all({ limit }) as Array<{ id: number; sessionId: string | null }>;
+
+  if (rows.length === 0) {
+    return 0;
+  }
+
+  const stmt = db.prepare(`UPDATE queued_screenshots SET sessionId = @sessionId WHERE id = @id`);
+  for (const row of rows) {
+    stmt.run({ id: row.id, sessionId: workSessionId });
+  }
+  return rows.length;
 }
 
 export function getPendingScreenshotCount(): number {

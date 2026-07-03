@@ -4,18 +4,20 @@ import { ipcMain } from "electron";
 import { logger } from "../config/logger";
 import { readEnv } from "../config/env";
 import { IPC_CHANNELS } from "../ipc/channels";
+import { stopActiveSessionIfRunning } from "../ipc/handlers";
 import { clearPendingUpdaterCache } from "./updater-cache";
 
 export type AppUpdateStatus =
   | { phase: "idle" }
   | { phase: "checking" }
   | { phase: "available"; version: string; currentVersion: string }
-  | { phase: "downloading"; percent: number }
+  | { phase: "downloading"; percent: number; version: string; transferred: number; total: number; bytesPerSecond: number }
   | { phase: "ready"; version: string }
-  | { phase: "error"; message: string };
+  | { phase: "error"; message: string; version: string | null };
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const UPDATE_CHECK_MAX_ATTEMPTS = 3;
+const INSTALL_STOP_SESSION_TIMEOUT_MS = 30_000;
 const RETRYABLE_UPDATE_ERROR =
   /ERR_NETWORK|ECONNRESET|ETIMEDOUT|ERR_NETWORK_IO_SUSPENDED|ENOTFOUND|Cannot parse releases feed|Unable to find latest version/i;
 
@@ -23,7 +25,19 @@ let mainWindow: BrowserWindow | null = null;
 let checkTimer: NodeJS.Timeout | null = null;
 let ipcRegistered = false;
 let feedConfigured = false;
+let pendingUpdateVersion: string | null = null;
+let cachedDownloadVersion: string | null = null;
+let downloadInProgress = false;
 let lastStatus: AppUpdateStatus = { phase: "idle" };
+
+function isUpdateFlowActive(): boolean {
+  return (
+    downloadInProgress
+    || lastStatus.phase === "downloading"
+    || lastStatus.phase === "ready"
+    || lastStatus.phase === "available"
+  );
+}
 
 function pushUpdateStatus(status: AppUpdateStatus): void {
   lastStatus = status;
@@ -44,11 +58,19 @@ function configureUpdateFeed(): void {
     return;
   }
   const { updateFeedUrl } = readEnv();
-  autoUpdater.setFeedURL({
-    provider: "generic",
-    url: updateFeedUrl
-  });
-  autoUpdater.disableDifferentialDownload = true;
+  if (updateFeedUrl.includes("github.com")) {
+    autoUpdater.setFeedURL({
+      provider: "github",
+      owner: "SamiAbdullatif20",
+      repo: "landev-track-app"
+    });
+  } else {
+    autoUpdater.setFeedURL({
+      provider: "generic",
+      url: updateFeedUrl
+    });
+  }
+  autoUpdater.disableDifferentialDownload = false;
   autoUpdater.allowPrerelease = false;
   feedConfigured = true;
   logger.info("auto-update-feed-configured", { updateFeedUrl });
@@ -58,13 +80,18 @@ export function getLastUpdateStatus(): AppUpdateStatus {
   return lastStatus;
 }
 
-export async function checkForAppUpdates(): Promise<void> {
+export async function checkForAppUpdates(options: { force?: boolean } = {}): Promise<void> {
   const env = readEnv();
   if (!env.autoUpdateEnabled || !app.isPackaged) {
     return;
   }
+
+  if (!options.force && isUpdateFlowActive()) {
+    logger.info("updater-check-skipped-active-download");
+    return;
+  }
+
   configureUpdateFeed();
-  clearPendingUpdaterCache();
   pushUpdateStatus({ phase: "checking" });
 
   for (let attempt = 1; attempt <= UPDATE_CHECK_MAX_ATTEMPTS; attempt++) {
@@ -76,7 +103,11 @@ export async function checkForAppUpdates(): Promise<void> {
       logger.warn("updater-check-failed", { attempt, error: message });
       const shouldRetry = attempt < UPDATE_CHECK_MAX_ATTEMPTS && RETRYABLE_UPDATE_ERROR.test(message);
       if (!shouldRetry) {
-        pushUpdateStatus({ phase: "idle" });
+        pushUpdateStatus({
+          phase: "error",
+          message: "Could not check for updates. Check your internet connection and try again.",
+          version: pendingUpdateVersion
+        });
         return;
       }
       await delay(2000 * attempt);
@@ -85,12 +116,29 @@ export async function checkForAppUpdates(): Promise<void> {
   }
 }
 
+export async function retryAppUpdate(): Promise<void> {
+  downloadInProgress = false;
+  pendingUpdateVersion = null;
+  clearPendingUpdaterCache();
+  await checkForAppUpdates({ force: true });
+}
+
 export async function downloadAppUpdate(): Promise<void> {
   configureUpdateFeed();
   await autoUpdater.downloadUpdate();
 }
 
-export function installAppUpdate(): void {
+export async function installAppUpdate(): Promise<void> {
+  try {
+    await Promise.race([
+      stopActiveSessionIfRunning({ awaitBackgroundSync: true }),
+      delay(INSTALL_STOP_SESSION_TIMEOUT_MS)
+    ]);
+    await delay(500);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn("updater-stop-session-before-install-failed", { error: message });
+  }
   autoUpdater.quitAndInstall(false, true);
 }
 
@@ -105,12 +153,16 @@ function registerAutoUpdateIpc(): void {
     await checkForAppUpdates();
     return getLastUpdateStatus();
   });
+  ipcMain.handle(IPC_CHANNELS.APP_UPDATE_RETRY, async () => {
+    await retryAppUpdate();
+    return getLastUpdateStatus();
+  });
   ipcMain.handle(IPC_CHANNELS.APP_UPDATE_DOWNLOAD, async () => {
     await downloadAppUpdate();
     return getLastUpdateStatus();
   });
-  ipcMain.handle(IPC_CHANNELS.APP_UPDATE_INSTALL, () => {
-    installAppUpdate();
+  ipcMain.handle(IPC_CHANNELS.APP_UPDATE_INSTALL, async () => {
+    await installAppUpdate();
     return { ok: true as const };
   });
 }
@@ -128,7 +180,7 @@ export function setupAutoUpdate(window: BrowserWindow): void {
   configureUpdateFeed();
   autoUpdater.logger = logger;
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.allowPrerelease = false;
 
   autoUpdater.on("checking-for-update", () => {
@@ -137,6 +189,11 @@ export function setupAutoUpdate(window: BrowserWindow): void {
   });
 
   autoUpdater.on("update-available", (info) => {
+    if (cachedDownloadVersion && cachedDownloadVersion !== info.version) {
+      clearPendingUpdaterCache();
+    }
+    cachedDownloadVersion = info.version;
+    pendingUpdateVersion = info.version;
     logger.info("updater-available", { version: info.version });
     pushUpdateStatus({
       phase: "available",
@@ -146,26 +203,41 @@ export function setupAutoUpdate(window: BrowserWindow): void {
   });
 
   autoUpdater.on("update-not-available", () => {
+    pendingUpdateVersion = null;
+    downloadInProgress = false;
     logger.info("updater-none");
     pushUpdateStatus({ phase: "idle" });
   });
 
   autoUpdater.on("download-progress", (progress) => {
+    downloadInProgress = true;
+    const version = pendingUpdateVersion ?? app.getVersion();
     pushUpdateStatus({
       phase: "downloading",
-      percent: Math.max(0, Math.min(100, progress.percent))
+      percent: Math.max(0, Math.min(100, progress.percent)),
+      version,
+      transferred: progress.transferred,
+      total: progress.total,
+      bytesPerSecond: progress.bytesPerSecond
     });
   });
 
   autoUpdater.on("update-downloaded", (info) => {
+    downloadInProgress = false;
+    pendingUpdateVersion = info.version;
     logger.info("updater-downloaded", { version: info.version });
     pushUpdateStatus({ phase: "ready", version: info.version });
   });
 
   autoUpdater.on("error", (error) => {
+    downloadInProgress = false;
     const message = error instanceof Error ? error.message : String(error);
     logger.warn("updater-error", { error: message });
-    pushUpdateStatus({ phase: "idle" });
+    pushUpdateStatus({
+      phase: "error",
+      message: "Update download failed. Check your internet connection and try again.",
+      version: pendingUpdateVersion
+    });
   });
 
   void checkForAppUpdates();

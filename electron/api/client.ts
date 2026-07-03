@@ -146,9 +146,15 @@ export type AuthAwareRequestOptions = RequestOptions & {
 };
 
 export const BATCH_TRACKING_EVENT_KINDS = [
+  "ACTIVITY_START",
+  "ACTIVITY_STOP",
+  "APP_CHANGE",
+  "IDLE_START",
+  "IDLE_END",
+  "SCREENSHOT_CAPTURED",
+  "HEARTBEAT",
   "INPUT_ACTIVITY",
   "APP_FOCUS",
-  "HEARTBEAT",
   "ACTIVITY_INTERVAL"
 ] as const;
 
@@ -499,6 +505,11 @@ function isAlreadyStoppedError(error: unknown): boolean {
   return /already\s+(ended|stopped)|already\s+clocked\s*out|no\s+active\s+session/i.test(message);
 }
 
+/** Idempotent stop responses — no open session left to close. */
+export function isWorkSessionAlreadyStoppedError(error: unknown): boolean {
+  return isAlreadyStoppedError(error);
+}
+
 function toPreview(data: unknown): string | null {
   if (data == null) return null;
   if (typeof data === "string") return data.slice(0, 220);
@@ -575,9 +586,23 @@ export async function fetchActiveWorkSessionId(options: RequestOptions): Promise
     try {
       const response = await client.get(path, { headers });
       persistCookieIfPresent(response, options);
+      const parsed = parseRemoteSessionStatus(response.data);
+      if (
+        parsed
+        && parsed.sessionId
+        && shouldSendSessionId(parsed.sessionId)
+        && (parsed.active || (parsed.startedAt && !parsed.stoppedAt))
+      ) {
+        logger.info("active-work-session-resolved", {
+          path,
+          hasSessionId: true,
+          active: parsed.active
+        });
+        return parsed.sessionId;
+      }
       const sessionId = extractWorkSessionId(response.data);
-      if (sessionId) {
-        logger.info("active-work-session-resolved", { path, hasSessionId: true });
+      if (sessionId && parsed?.active) {
+        logger.info("active-work-session-resolved", { path, hasSessionId: true, active: true });
         return sessionId;
       }
     } catch (error) {
@@ -1409,107 +1434,3 @@ export async function stopSession(
   }, options);
 }
 
-export type WebNotificationsStatus = {
-  unreadCount: number;
-};
-
-function parseUnreadNotificationCount(payload: unknown): number {
-  if (typeof payload === "number" && Number.isFinite(payload)) {
-    return Math.max(0, Math.floor(payload));
-  }
-  if (typeof payload === "string") {
-    const parsed = Number(payload.trim());
-    if (Number.isFinite(parsed)) {
-      return Math.max(0, Math.floor(parsed));
-    }
-    return 0;
-  }
-  if (!payload || typeof payload !== "object") {
-    return 0;
-  }
-  const record = payload as Record<string, unknown>;
-  for (const key of [
-    "unreadCount",
-    "unread",
-    "count",
-    "total",
-    "unreadTotal",
-    "unread_count",
-    "unreadNotifications"
-  ]) {
-    const value = record[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return Math.max(0, Math.floor(value));
-    }
-    if (typeof value === "string") {
-      const parsed = Number(value.trim());
-      if (Number.isFinite(parsed)) {
-        return Math.max(0, Math.floor(parsed));
-      }
-    }
-  }
-  for (const key of ["data", "result", "payload"]) {
-    const nested = record[key];
-    if (nested && typeof nested === "object") {
-      const nestedCount = parseUnreadNotificationCount(nested);
-      if (nestedCount > 0) {
-        return nestedCount;
-      }
-    }
-  }
-  if (Array.isArray(record.notifications)) {
-    return record.notifications.filter((item) => {
-      if (!item || typeof item !== "object") {
-        return false;
-      }
-      const row = item as Record<string, unknown>;
-      return row.read !== true && row.isRead !== true && row.seen !== true && row.readAt == null;
-    }).length;
-  }
-  if (Array.isArray(record.items)) {
-    return parseUnreadNotificationCount({ notifications: record.items });
-  }
-  return 0;
-}
-
-function isHtmlResponse(data: unknown): boolean {
-  return typeof data === "string" && data.trimStart().startsWith("<!DOCTYPE html");
-}
-
-/** Remote web inbox unread count only (desktop local alerts merged in main process). */
-export async function fetchWebNotificationRemoteCount(
-  options: AuthAwareRequestOptions
-): Promise<number> {
-  if (!options.token && !options.sessionCookie) {
-    return 0;
-  }
-
-  try {
-    return await withAuthRetry(async (requestOptions) => {
-      const client = getClient();
-      const response = await firstSuccess(API_ENDPOINTS.notifications.unreadCount, (path) =>
-        client.get(path, { headers: authHeader(requestOptions) })
-      );
-      persistCookieIfPresent(response, requestOptions);
-      if (isHtmlResponse(response.data)) {
-        throw new ApiError("validation", "notifications_endpoint_returned_html");
-      }
-      const count = parseUnreadNotificationCount(response.data);
-      logger.info("web-notifications-remote-count", { count, path: response.config.url ?? null });
-      return count;
-    }, options);
-  } catch (error) {
-    logger.warn("web-notifications-unread-fetch-failed", {
-      error: error instanceof Error ? error.message : "unknown"
-    });
-    return 0;
-  }
-}
-
-/** @deprecated Use fetchWebNotificationRemoteCount + notification-badge merge. */
-export async function fetchWebNotificationsStatus(
-  options: AuthAwareRequestOptions
-): Promise<WebNotificationsStatus> {
-  const unreadCount = await fetchWebNotificationRemoteCount(options);
-  return { unreadCount };
-}

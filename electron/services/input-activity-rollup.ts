@@ -96,7 +96,7 @@ export type WorkActivityPeriodStats = {
   periodEndAt: string;
 };
 
-/** Engagement % (valid engaged ÷ tracked window) for inactivity auto-stop and reporting. */
+/** Engagement % (valid engaged ÷ tracked window) for reporting. */
 export function getWorkActivityStatsForPeriod(
   periodEndMs: number,
   periodMs: number,

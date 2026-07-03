@@ -10,5 +10,14 @@ export function stopAllWindowsProbeSessions(): void {
 export async function resetAndWarmUpWindowsProbes(): Promise<void> {
   stopAllWindowsProbeSessions();
   clearAppFocusDedupeState();
-  await Promise.all([probeWindowsForegroundContext(), probeWindowsInputSnapshot()]);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const [foreground, input] = await Promise.all([
+      probeWindowsForegroundContext(),
+      probeWindowsInputSnapshot()
+    ]);
+    if (input && foreground) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
 }

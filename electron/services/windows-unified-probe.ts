@@ -4,6 +4,8 @@ import type { ActivityContext } from "./activity-metadata";
 import type { WindowsInputSnapshot } from "./input-probe-windows";
 
 const SAMPLE_TIMEOUT_MS = 4000;
+const PROBE_STARTUP_TIMEOUT_MS = 12_000;
+const PROBE_WARMUP_INTERVAL_MS = 400;
 
 const windowsUnifiedBootstrap = [
   "Add-Type @\"",
@@ -188,6 +190,22 @@ class WindowsUnifiedProbeSession {
     return result && typeof result === "object" ? (result as ForegroundProbeJson) : null;
   }
 
+  private async waitUntilReady(): Promise<boolean> {
+    const deadlineMs = Date.now() + PROBE_STARTUP_TIMEOUT_MS;
+    while (Date.now() < deadlineMs) {
+      if (!this.isChildHealthy()) {
+        return false;
+      }
+      const sample = await this.request("input");
+      if (sample && typeof sample === "object" && "x" in sample && "y" in sample) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, PROBE_WARMUP_INTERVAL_MS));
+    }
+    logger.warn("unified-probe-warmup-timeout");
+    return false;
+  }
+
   private request(command: ProbeCommand): Promise<WindowsInputSnapshot | ForegroundProbeJson | null> {
     return new Promise((resolve) => {
       this.sampleQueue.push({ command, resolve });
@@ -285,10 +303,16 @@ class WindowsUnifiedProbeSession {
         this.rejectPending();
         this.resetChild();
       });
-      setTimeout(() => {
-        this.starting = null;
-        resolve();
-      }, 500);
+      void this.waitUntilReady()
+        .then((ready) => {
+          if (!ready) {
+            logger.warn("unified-probe-startup-incomplete");
+          }
+        })
+        .finally(() => {
+          this.starting = null;
+          resolve();
+        });
     });
     await this.starting;
   }

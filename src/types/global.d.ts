@@ -95,10 +95,9 @@ declare global {
       ) => () => void;
       getNotificationSoundEnabled: () => Promise<{ enabled: boolean }>;
       setNotificationSoundEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>;
-      getWebNotificationsStatus: () => Promise<{ unreadCount: number }>;
-      onNotificationCountPush: (cb: (status: { unreadCount: number }) => void) => () => void;
       getAppUpdateStatus: () => Promise<import("./app-update").AppUpdateStatus>;
       checkForAppUpdates: () => Promise<import("./app-update").AppUpdateStatus>;
+      retryAppUpdate: () => Promise<import("./app-update").AppUpdateStatus>;
       downloadAppUpdate: () => Promise<import("./app-update").AppUpdateStatus>;
       installAppUpdate: () => Promise<{ ok: true }>;
       onAppUpdateStatusPush: (cb: (status: import("./app-update").AppUpdateStatus) => void) => () => void;
@@ -120,13 +119,6 @@ declare global {
       syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
       onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
       onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;
-      onInactivityAutoStopPush: (
-        cb: (payload: {
-          stoppedAt: string;
-          workActivityPercent: number | null;
-          stopReason: string;
-        }) => void
-      ) => () => void;
     };
   }
 }

@@ -18,7 +18,7 @@ import {
 import { probeWindowsInputSnapshot } from "./input-probe-windows";
 import { recordInputActivityEvent } from "./tracking-input-activity";
 
-export const INPUT_ACTIVITY_SAMPLE_MS = 15_000;
+export const INPUT_ACTIVITY_SAMPLE_MS = 30_000;
 /** Poll every 2s — halves CPU vs 1s while keeping 15s windows accurate. */
 export const INPUT_ACTIVITY_POLL_MS = 2_000;
 

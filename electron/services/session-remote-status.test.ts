@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseRemoteSessionStatus } from "./session-remote-status";
+import { isOpenRemoteWorkSession, parseRemoteSessionStatus } from "./session-remote-status";
 
 describe("parseRemoteSessionStatus", () => {
   it("detects active workSession", () => {
@@ -30,5 +30,30 @@ describe("parseRemoteSessionStatus", () => {
 
   it("handles empty payload", () => {
     expect(parseRemoteSessionStatus({ active: false })?.active).toBe(false);
+  });
+});
+
+describe("isOpenRemoteWorkSession", () => {
+  it("treats started session without stoppedAt as open", () => {
+    const status = parseRemoteSessionStatus({
+      workSession: {
+        id: "ws-1",
+        startedAt: "2026-06-18T10:00:00.000Z"
+      }
+    });
+    expect(status).not.toBeNull();
+    expect(isOpenRemoteWorkSession(status!)).toBe(true);
+  });
+
+  it("treats stopped session as closed", () => {
+    const status = parseRemoteSessionStatus({
+      workSession: {
+        id: "ws-1",
+        startedAt: "2026-06-18T10:00:00.000Z",
+        stoppedAt: "2026-06-18T11:00:00.000Z"
+      }
+    });
+    expect(status).not.toBeNull();
+    expect(isOpenRemoteWorkSession(status!)).toBe(false);
   });
 });

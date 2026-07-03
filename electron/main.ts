@@ -186,7 +186,7 @@ app.on("before-quit", (event) => {
   }
   event.preventDefault();
   isQuitting = true;
-  void stopActiveSessionIfRunning()
+  void stopActiveSessionIfRunning({ awaitBackgroundSync: true })
     .catch((error) => {
       logger.warn("stop-on-app-quit-failed", { error });
     })

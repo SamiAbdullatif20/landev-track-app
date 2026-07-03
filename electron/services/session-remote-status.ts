@@ -94,3 +94,11 @@ export function parseRemoteSessionStatus(data: unknown): RemoteSessionStatus | n
     source: readString(root, ["source", "startedBy", "client", "origin"])
   };
 }
+
+/** True when the server payload describes a session that has not been stopped yet. */
+export function isOpenRemoteWorkSession(status: RemoteSessionStatus): boolean {
+  if (status.active) {
+    return true;
+  }
+  return Boolean(status.sessionId && status.startedAt && !status.stoppedAt);
+}

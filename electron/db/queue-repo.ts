@@ -1,5 +1,6 @@
 import { getDb, type QueuedEvent, type SessionState } from "./index";
 import { randomUUID } from "node:crypto";
+import { hasUsableWorkSessionId } from "../services/session-event-fields";
 
 export function enqueueEvent(eventType: string, payload: unknown): void {
   const db = getDb();
@@ -73,6 +74,59 @@ export function markEventForRetry(id: number, attempts: number): string {
     WHERE id = @id
   `).run({ id, attempts, nextRetry });
   return nextRetry;
+}
+
+/** Attach work session id to events queued before remote /start returned. */
+export function backfillWorkSessionIdOnPendingEvents(workSessionId: string, limit = 500): number {
+  if (!hasUsableWorkSessionId(workSessionId)) {
+    return 0;
+  }
+  const db = getDb();
+  const events = db
+    .prepare(
+      `SELECT * FROM queued_events
+       WHERE status IN ('pending', 'retry')
+       ORDER BY id ASC
+       LIMIT @limit`
+    )
+    .all({ limit }) as QueuedEvent[];
+
+  let updated = 0;
+  const stmt = db.prepare(
+    `UPDATE queued_events SET payloadJson = @payloadJson WHERE id = @id`
+  );
+
+  for (const event of events) {
+    try {
+      const payload = JSON.parse(event.payloadJson) as Record<string, unknown>;
+      if (hasUsableWorkSessionId(payload.sessionId as string | undefined)) {
+        continue;
+      }
+      if (hasUsableWorkSessionId(payload.workSessionId as string | undefined)) {
+        continue;
+      }
+      const metadata =
+        payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+          ? { ...(payload.metadata as Record<string, unknown>) }
+          : {};
+      const nextPayload: Record<string, unknown> = {
+        ...payload,
+        sessionId: workSessionId,
+        workSessionId,
+        metadata: {
+          ...metadata,
+          sessionId: workSessionId,
+          workSessionId
+        }
+      };
+      stmt.run({ id: event.id, payloadJson: JSON.stringify(nextPayload) });
+      updated += 1;
+    } catch {
+      // Skip malformed rows.
+    }
+  }
+
+  return updated;
 }
 
 export function getPendingCount(): number {

@@ -1,0 +1,97 @@
+TASK FOR THE WEB / BACKEND TEAM
+================================
+Add a lightweight "projects version" endpoint so the desktop tracker can stop
+re-downloading the entire project list on a timer. Today the desktop calls
+GET /api/projects (paginated, up to 200/page) repeatedly just to notice if any
+project was added / removed / renamed. That is a large, constant source of
+Vercel function invocations and bandwidth for data that rarely changes.
+
+GOAL
+----
+Give the desktop a CHEAP way to ask "did anything about my visible projects
+change?" so it only performs the expensive full fetch when the answer is yes.
+
+
+WHAT TO BUILD
+-------------
+New endpoint:
+
+    GET /api/projects/version
+
+Auth: identical to GET /api/projects (same session cookie / bearer token /
+role scoping). It MUST be scoped to the SAME set of projects that the calling
+user would see from GET /api/projects (respect role/assignment filtering).
+
+Response (200), JSON:
+
+    {
+      "count": 42,                       // number of visible projects for this user
+      "hash": "a1b2c3d4e5f6...",         // stable fingerprint of the visible set
+      "updatedAt": "2026-07-03T10:15:00Z" // most recent change timestamp in the set (optional but nice)
+    }
+
+HASH REQUIREMENTS (important)
+-----------------------------
+The hash must change if ANY of the following changes for the user's visible set:
+  - a project is ADDED or REMOVED (assignment/unassignment/deletion)
+  - a project is RENAMED
+  - a project's chargeable / non-chargeable flag changes
+  - any other field the desktop displays or relies on
+
+Recommended implementation:
+  1. Load the user's visible projects (same query as /api/projects).
+  2. Sort by project id (stable order).
+  3. For each project build a small canonical string, e.g.:
+        `${id}:${name}:${isNonChargeable ? 1 : 0}:${updatedAt}`
+  4. Join with "\n" and SHA-256 the result. Return the hex digest as "hash".
+
+The exact formula does not matter to the desktop — it treats the hash as an
+opaque token. It only needs to be:
+  - DETERMINISTIC (same inputs => same hash), and
+  - SENSITIVE to the changes listed above.
+
+This endpoint must be cheap: ideally a single indexed query returning only the
+fields needed for the hash (id, name, chargeable flag, updatedAt) — no heavy
+joins, no pagination, no large payload.
+
+
+DESKTOP BEHAVIOR AFTER THIS SHIPS (for context)
+-----------------------------------------------
+  - On its slow safety timer (and on focus/login), the desktop calls
+    GET /api/projects/version (tiny response).
+  - It stores the last seen hash locally.
+  - If the hash is UNCHANGED => it does nothing (no full fetch). This is the
+    common case and saves the expensive call.
+  - If the hash CHANGED (or on first run / explicit user refresh) => it calls
+    GET /api/projects (existing paginated endpoint) and updates its cache.
+
+BACKWARD COMPATIBILITY
+----------------------
+  - Do NOT change or remove GET /api/projects; it stays the source of truth for
+    the full list.
+  - If GET /api/projects/version returns 404 / not implemented, the desktop
+    falls back to its current behavior (periodic full fetch). So this can ship
+    independently and the desktop upgrade can follow.
+
+
+ACCEPTANCE TESTS
+----------------
+  1. Two consecutive calls with no data change return the SAME hash and count.
+  2. Adding a project to the user's visible set changes the hash and increments count.
+  3. Removing / unassigning a project changes the hash and decrements count.
+  4. Renaming a visible project changes the hash (count unchanged).
+  5. Toggling a visible project's chargeable flag changes the hash.
+  6. Two different users with different visible sets get different hashes.
+  7. The endpoint enforces the same auth as GET /api/projects (401/403 when
+     unauthenticated) and never leaks projects the user cannot see.
+  8. Response size is small (a few hundred bytes) regardless of project count.
+
+
+NOTES
+-----
+  - No websockets or push required — a cheap polled fingerprint is enough.
+  - If you already emit an ETag on GET /api/projects, an alternative is to
+    honor If-None-Match and return 304 Not Modified. The version endpoint is
+    preferred because a 304 still requires the desktop to issue the (heavier)
+    projects request each poll, whereas the version endpoint is a dedicated
+    tiny query.

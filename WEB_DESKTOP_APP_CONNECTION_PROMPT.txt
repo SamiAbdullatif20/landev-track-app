@@ -1,0 +1,228 @@
+Copy everything below into your Landev **web/backend** Cursor chat.
+Desktop app v1.3.8 — wire ingest + reports to match what the Electron tracker sends.
+
+Do **not** change the desktop app in this task.
+
+---
+
+## Goal
+
+Connect the web system so these work on session reports / live dashboard:
+
+1. **Live session timer** ticks while tracking (desktop or web start)
+2. **Activity breakdown** — mouse / keyboard / click / engagement % (not flat 100%)
+3. **Apps used** — per-app time from foreground focus
+4. **Screenshots** — role-filtered, linked to session
+
+Also apply idempotency from `WEB_TRACKING_IDEMPOTENCY_PROMPT.txt` (`eventUuid`, `uploadUuid`).
+
+---
+
+## What desktop sends TODAY (authoritative)
+
+Only these event kinds are **queued and synced** to the API:
+
+| Kind | Cadence | Web use |
+|------|---------|---------|
+| `INPUT_ACTIVITY` | ~every 15s | Activity metrics, engagement %, mouse/keyboard/click |
+| `APP_FOCUS` | check 5s, emit ~15s | **Apps used** — sum `activeSeconds` by app |
+| `ACTIVITY_INTERVAL` | every 15 wall-clock min | Timeline rollup blocks |
+
+**Not synced yet** (ignore for reports until a later desktop release):
+`ACTIVITY_START`, `ACTIVITY_STOP`, `APP_CHANGE`, `IDLE_START`, `IDLE_END`, `HEARTBEAT`, `SCREENSHOT_CAPTURED`.
+
+Batch upload: `POST /api/tracking/events/batch` body `{ events: [...] }` every **~20–30s** while session active.
+Sort/process by `occurredAt`. Never reject the whole batch because of unknown/future kinds.
+
+---
+
+## 1. Live counter (session timer)
+
+### Desktop behavior
+
+- UI timer is **renderer-only** (`Date.now() - startedAt`) — **not** streamed per second to API.
+- Authoritative clock for reports: **session start/stop** + optional trailing lifecycle events.
+
+### POST `/api/tracking/session/start`
+
+Persist and return **`sessionId`** + **`startedAt`** (ISO UTC, client clock at Start).
+
+Also sent: `projectId`, `projectName`, `description`, `clientTimeZone`, `workDateKey`, `startTimeUtc`, `deviceUuid`.
+
+Optional immediate signal (if desktop sends it): `trailingEvents[]` with `eventKind: "SESSION_START"`.
+
+### POST `/api/tracking/session/stop`
+
+Persist: `stoppedAt`, `startedAt`, `durationMs`, `workDateKey`, `clientTimeZone`, `projectId`, `deviceUuid`.
+
+Includes `trailingEvents[]` with `eventKind: "SESSION_STOP"` for **immediate** timer cutoff on web.
+
+### GET active session
+
+`GET /api/tracking/session/active` (fallbacks: `/api/tracking/session/status`, `/api/attendance/today`):
+
+```json
+{
+  "active": true,
+  "sessionId": "ws-uuid",
+  "workSessionId": "ws-uuid",
+  "startedAt": "2026-07-01T08:00:00.000Z",
+  "projectId": "...",
+  "projectName": "...",
+  "description": "..."
+}
+```
+
+When `active: true`, **`startedAt` is required** for live timer.
+
+### Web dashboard timer (client-side)
+
+```ts
+elapsedMs = Date.now() - Date.parse(startedAt)
+```
+
+Use `setInterval(1000)` in the browser while `active === true`.
+
+**Do NOT:**
+- Poll the server every second for duration
+- Use sum of `INPUT_ACTIVITY.trackerElapsedMs` as the live session timer (lags, gaps)
+
+**Do:**
+- Process `SESSION_START` / `SESSION_STOP` trailing events immediately when ingesting start/stop
+- Poll active session every **5–30s** only to detect start/stop from other clients (not for per-second ticks)
+- On stop: freeze timer at `stoppedAt - startedAt`
+
+See also: `WEB_LIVE_COUNTER_FIX_PROMPT.txt`, `WEB_DESKTOP_SESSION_SYNC_PROMPT.txt`.
+
+---
+
+## 2. Activity metrics (`INPUT_ACTIVITY`)
+
+Emitted ~every **15s** while tracking. Fields web must persist and show:
+
+```
+mouseMoveCount, keyPressCount, clickCount, scrollCount
+mouseMovePercent, mouseActivityPercent, mouseActiveSeconds
+keyboardActivityPercent, clickActivityPercent, clickActiveSeconds
+validEngagedSeconds, engagementActivityPercent, activityScore
+activeSeconds, idleSeconds, trackerElapsedMs (usually 15000)
+application, processName, windowTitle, windowReasonCode
+sessionId / workSessionId, workDateKey, projectId, clientTimeZone
+occurredAt, eventUuid, eventKind: "INPUT_ACTIVITY"
+metadata: { ...same breakdown fields... }
+```
+
+### Fix “100% activity only” bug
+
+- **Show in UI:** `mouseActivityPercent`, `keyboardActivityPercent`, `clickActivityPercent`, `engagementActivityPercent` / `activityScore`
+- **Do NOT use as primary score:** `estimatedEfficiencyPercent` (non-idle time — often ~100% even when input counts are 0)
+
+Aggregate session breakdown **weighted by `trackerElapsedMs`**.
+
+---
+
+## 3. Apps used (`APP_FOCUS`)
+
+Foreground app check every **5s**; duration credited every **~15s**.
+
+```
+eventKind: "APP_FOCUS"
+activeSeconds          ← sum this per app for “apps used”
+application, processName, applicationDisplayName
+windowTitle, windowReasonCode
+sessionId, workSessionId, workDateKey, projectId, occurredAt, eventUuid
+```
+
+**Group by** `processName` or `applicationDisplayName`, **sum `activeSeconds`**.
+
+Do **not** wait for `APP_CHANGE` (not synced yet).
+
+---
+
+## 4. Screenshots
+
+`POST /api/tracking/screenshots/ingest` — **multipart**
+
+| Field | Value |
+|-------|--------|
+| `image` | JPEG (~480px wide, quality ~55) |
+| `capturedAt` | ISO UTC |
+| `mimeType` | `image/jpeg` |
+| `sessionId` / `workSessionId` | from active session |
+| `projectId` | optional |
+| `metadata` | JSON — must store `uploadUuid`, `visibility`, `visibleToRoles` |
+
+### Cadence
+
+| Tier | Interval | `metadata.visibility` | Roles who can view |
+|------|----------|----------------------|-------------------|
+| Superadmin | **6 min** | `superadmin_only` | SUPER_ADMIN |
+| Designer/employee | **10 min** | `admin_and_employee` | SUPER_ADMIN, DESIGNER, MODERATOR |
+
+- **First screenshot ~60s** after session start (bootstrap), then cadence above.
+- On upload failure (offline): desktop queues locally; sync worker retries on next flush.
+- Link screenshots to session by `sessionId` + user; enforce role visibility on **read**.
+
+Screenshots do **not** arrive via batch events — only multipart ingest.
+
+---
+
+## 5. Session lifecycle + sync order
+
+1. Desktop starts **local** capture, then `POST /api/tracking/session/start`.
+2. Response must include **`sessionId`**. Desktop backfills pending events/screenshots missing id.
+3. Events may arrive **without** `sessionId` for a few seconds — accept and link when id is known.
+4. `POST /api/tracking/events/batch` every ~20–30s with priority: `INPUT_ACTIVITY`, `APP_FOCUS`, `ACTIVITY_INTERVAL`.
+5. Stop: local stop first, then `POST /api/tracking/session/stop` in background with `trailingEvents`.
+
+### Idempotency (required)
+
+- **`eventUuid`** — unique per event; retries return 200, no duplicate rows
+- **`uploadUuid`** — unique per screenshot; same
+
+---
+
+## 6. API endpoints (desktop)
+
+| Purpose | Method | Path |
+|---------|--------|------|
+| Login | POST | `/api/auth/login` |
+| Session start | POST | `/api/tracking/session/start` |
+| Session stop | POST | `/api/tracking/session/stop` |
+| Active session | GET | `/api/tracking/session/active` |
+| Batch events | POST | `/api/tracking/events/batch` |
+| Screenshot | POST | `/api/tracking/screenshots/ingest` |
+| Projects | GET | `/api/projects` |
+| Attendance fallback | GET/POST | `/api/attendance/today` |
+
+---
+
+## 7. Acceptance tests
+
+- [ ] Start session → web live timer ticks within 5s; uses `startedAt` from active endpoint
+- [ ] Stop session → timer freezes; `durationMs` matches desktop stop payload
+- [ ] 4× `INPUT_ACTIVITY` with different mouse/keyboard % → report shows breakdown, not flat 100%
+- [ ] `APP_FOCUS` events → apps-used table sums `activeSeconds` correctly
+- [ ] Screenshot ~60s after start → visible on session report (role-filtered)
+- [ ] 6/10 min cadence screenshots continue for SUPER_ADMIN / employee tiers
+- [ ] Duplicate `eventUuid` / `uploadUuid` → 200, one row each
+- [ ] Batch with only `INPUT_ACTIVITY` + `APP_FOCUS` + `ACTIVITY_INTERVAL` never fails whole batch
+
+---
+
+## 8. Related prompts (deeper detail)
+
+- `WEB_LIVE_COUNTER_FIX_PROMPT.txt` — live timer UI
+- `WEB_TRACKING_IDEMPOTENCY_PROMPT.txt` — dedupe rules
+- `WEB_MOUSE_ACTIVITY_FIX_PROMPT.txt` — mouse metric fields
+- `WEB_BATCH_SYNC_INGEST_FIX_PROMPT.txt` — batch ingest errors
+- `WEB_EVENT_DRIVEN_TRACKING_CURSOR_PROMPT.txt` — future transition events (not live yet)
+
+---
+
+## Desktop architecture note (for context)
+
+- **Removed:** renderer `useActivityTracker` + `tracking:event` IPC (caused 500MB+ memory from renderer polling).
+- **Now:** all sampling in main process → SQLite queue → batch sync.
+- Renderer only runs **1s UI ticks** for display (not sent to server).
+- Do not ask desktop to “poll activity to the web every second” — that pattern is intentionally gone.

@@ -11,6 +11,7 @@ const markEventsDelivered = vi.fn();
 const markEventForRetry = vi.fn((_id: number, _attempts: number) => "2026-06-02T12:00:00.000Z");
 
 vi.mock("../db/queue-repo", () => ({
+  getSessionState: () => ({ active: 0, sessionId: null, projectId: null, description: null, startedAt: null }),
   markEventDelivered: (id: number) => markEventDelivered(id),
   markEventsDelivered: (ids: number[]) => markEventsDelivered(ids),
   markEventForRetry: (id: number, attempts: number) => markEventForRetry(id, attempts)

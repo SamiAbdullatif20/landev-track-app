@@ -1,4 +1,6 @@
 import type { TrackingBatchEventInput } from "../api/client";
+import { getSessionState } from "../db/queue-repo";
+import { buildWorkSessionEventFields, hasUsableWorkSessionId } from "./session-event-fields";
 
 /** Drop subsamples that ended before the current session segment started. */
 export function filterSubsamplesForSessionSegment<T extends { endedAtMs: number }>(
@@ -69,12 +71,45 @@ export function normalizeQueuedBatchPayload(
   return normalized;
 }
 
+function patchActiveSessionFields(payload: Record<string, unknown>): Record<string, unknown> {
+  const state = getSessionState();
+  if (!state.active) {
+    return payload;
+  }
+  const sessionFields = buildWorkSessionEventFields(state);
+  const workSessionId = sessionFields.workSessionId as string | undefined;
+  if (!hasUsableWorkSessionId(workSessionId)) {
+    return payload;
+  }
+  if (
+    hasUsableWorkSessionId(payload.sessionId as string | undefined)
+    || hasUsableWorkSessionId(payload.workSessionId as string | undefined)
+  ) {
+    return payload;
+  }
+
+  const metadata =
+    payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+      ? { ...(payload.metadata as Record<string, unknown>) }
+      : {};
+
+  return {
+    ...payload,
+    ...sessionFields,
+    metadata: {
+      ...metadata,
+      ...sessionFields
+    }
+  };
+}
+
 export function buildBatchPayloadFromQueuedEvent(
   payload: Record<string, unknown>,
   eventUuid: string,
   eventKind: string
 ): TrackingBatchEventInput {
-  const normalized = normalizeQueuedBatchPayload(payload, eventKind);
+  const withSession = patchActiveSessionFields(payload);
+  const normalized = normalizeQueuedBatchPayload(withSession, eventKind);
   return {
     ...(normalized as TrackingBatchEventInput),
     eventUuid,

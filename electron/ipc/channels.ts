@@ -18,9 +18,9 @@ export const IPC_CHANNELS = {
   SYNC_NOW: "tracking:sync",
   NOTIFICATION_SOUND_ENABLED_GET: "app:notification-sound-enabled",
   NOTIFICATION_SOUND_ENABLED_SET: "app:notification-sound-enabled-set",
-  WEB_NOTIFICATIONS_STATUS: "app:web-notifications-status",
   APP_UPDATE_STATUS: "app:update-status",
   APP_UPDATE_CHECK: "app:update-check",
+  APP_UPDATE_RETRY: "app:update-retry",
   APP_UPDATE_DOWNLOAD: "app:update-download",
   APP_UPDATE_INSTALL: "app:update-install",
   APP_OPEN_EXTERNAL: "app:open-external"

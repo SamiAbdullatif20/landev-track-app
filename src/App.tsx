@@ -7,9 +7,10 @@ import { ProjectSearchSelect } from "./components/ProjectSearchSelect";
 import { RecentTasksPanel } from "./components/RecentTasksPanel";
 import { LandevLogo } from "./components/LandevLogo";
 import { TodayWorkList } from "./components/TodayWorkList";
-import { NotificationBell } from "./components/NotificationBell";
 import { SoftwareUpdatePrompt } from "./components/SoftwareUpdatePrompt";
 import { designerCatalogFallbackProjects, isCatalogProjectId } from "./config/designer-project-fallback";
+import { useLiveTick } from "./hooks/useLiveTick";
+import { computeLiveAnchoredMs } from "./utils/liveAnchoredTotal";
 import { useSessionTimer } from "./hooks/useSessionTimer";
 import type { RecentWorkTask } from "./types/recent-task";
 import type { ProjectDayTotal, WorkSummary } from "./types/work-summary";
@@ -35,8 +36,10 @@ function App() {
     todayByProject: [],
     recentTasks: []
   });
+  const [summaryFetchedAtMs, setSummaryFetchedAtMs] = useState<number | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(true);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState({
     online: true,
     syncing: false,
@@ -73,6 +76,33 @@ function App() {
   const resetTracking = useTrackingStore((s) => s.reset);
 
   const sessionTimerLabel = useSessionTimer(session.active, session.startedAt);
+  const liveTickMs = useLiveTick(session.active);
+  const liveTodayTotalMs = computeLiveAnchoredMs(
+    workSummary.todayTotalMs,
+    summaryFetchedAtMs,
+    session.active,
+    liveTickMs
+  );
+  const liveTodayByProject = useMemo((): ProjectDayTotal[] => {
+    if (!session.active || summaryFetchedAtMs == null) {
+      return workSummary.todayByProject;
+    }
+    const drift = Math.max(0, liveTickMs - summaryFetchedAtMs);
+    if (drift <= 0) {
+      return workSummary.todayByProject;
+    }
+    return workSummary.todayByProject.map((item) =>
+      item.projectId === session.projectId
+        ? { ...item, totalMs: item.totalMs + drift }
+        : item
+    );
+  }, [
+    workSummary.todayByProject,
+    session.active,
+    session.projectId,
+    summaryFetchedAtMs,
+    liveTickMs
+  ]);
 
   const loadWorkSummary = useCallback(async (options?: { showLoading?: boolean }) => {
     if (authStatus !== "authenticated") {
@@ -115,6 +145,7 @@ function App() {
         }
         return summary;
       });
+      setSummaryFetchedAtMs(Date.now());
     } catch {
       setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
     } finally {
@@ -126,6 +157,13 @@ function App() {
 
   useEffect(() => {
     window.desktopAPI.getTrackingConsentStatus().then((r) => setConsentAccepted(r.accepted)).catch(() => setConsentAccepted(false));
+  }, []);
+
+  useEffect(() => {
+    window.desktopAPI
+      .getAppInfo()
+      .then((info) => setAppVersion(info.appVersion))
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -235,6 +273,10 @@ function App() {
         return;
       }
       setSession(next);
+      if (next.active) {
+        setTrackingError(null);
+      }
+      void loadWorkSummary({ showLoading: false });
     });
 
     const unsubscribeSync = window.desktopAPI.onSyncStatusPush((status) => {
@@ -246,21 +288,12 @@ function App() {
       setProjectsError(null);
     });
 
-    const unsubscribeInactivity = window.desktopAPI.onInactivityAutoStopPush(() => {
-      pushToast(
-        "info",
-        "Tracking stopped automatically — work activity stayed below 5% for the past hour."
-      );
-      void loadWorkSummary({ showLoading: false });
-    });
-
     window.desktopAPI.getSyncStatus().then((status) => setSyncStatus(status)).catch(() => undefined);
 
     return () => {
       unsubscribe();
       unsubscribeSync();
       unsubscribeProjects();
-      unsubscribeInactivity();
     };
   }, [applyProjectsPayload, fetchProjectsWithRetry, loadWorkSummary, setAuthError, setAuthLoading, setAuthStatus, setRoles, setSession]);
 
@@ -269,9 +302,12 @@ function App() {
       return;
     }
     void loadWorkSummary();
+    if (session.active) {
+      return;
+    }
     const intervalId = window.setInterval(() => {
       void loadWorkSummary();
-    }, session.active ? 1000 : 5000);
+    }, 300_000);
     return () => window.clearInterval(intervalId);
   }, [authStatus, loadWorkSummary, session.active]);
 
@@ -586,7 +622,7 @@ function App() {
               <div className="compact-header-left">
                 <div className="compact-header-main">
                 <p className="compact-kicker">Worked today</p>
-                <p className="daily-total">{formatClockDuration(workSummary.todayTotalMs)}</p>
+                <p className="daily-total">{formatClockDuration(liveTodayTotalMs)}</p>
                 <div className="status-row">
                   <span
                     className={`status-dot ${session.active ? "is-tracking" : "is-paused"}`}
@@ -599,7 +635,11 @@ function App() {
                 </div>
               </div>
               <div className="compact-header-actions">
-                <NotificationBell />
+                {appVersion ? (
+                  <span className="header-version" title="App version">
+                    v{appVersion}
+                  </span>
+                ) : null}
                 <label className="sound-toggle" title="Desktop notification sounds" aria-label="Toggle notification sounds">
                   <input
                     type="checkbox"
@@ -686,8 +726,8 @@ function App() {
             </section>
 
             <TodayWorkList
-              items={workSummary.todayByProject}
-              totalMs={workSummary.todayTotalMs}
+              items={liveTodayByProject}
+              totalMs={liveTodayTotalMs}
               disabled={session.active || sessionLoading}
               onResume={applyProjectDayTotal}
             />

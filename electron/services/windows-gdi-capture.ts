@@ -91,7 +91,7 @@ export async function capturePrimaryScreenGdiJpeg(
       {
         windowsHide: true,
         timeout: CAPTURE_TIMEOUT_MS,
-        maxBuffer: 2 * 1024 * 1024
+        maxBuffer: 8 * 1024 * 1024
       }
     );
 
@@ -100,7 +100,14 @@ export async function capturePrimaryScreenGdiJpeg(
       return null;
     }
 
-    const parts = encoded.split("|");
+    const line =
+      encoded
+        .split(/\r?\n/)
+        .map((entry) => entry.trim())
+        .filter((entry) => /^\d+\|\d+\|/.test(entry))
+        .pop() ?? encoded;
+
+    const parts = line.split("|");
     if (parts.length < 3) {
       return null;
     }

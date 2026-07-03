@@ -30,8 +30,15 @@ export type SyncStatus = {
   lastSyncAt: string | null;
 };
 
-/** Batch flush interval (30–60s target). */
-export const EVENT_BATCH_SYNC_INTERVAL_MS = 45_000;
+/** Batch flush interval — queued activity/screenshot events upload on this cadence. */
+export const EVENT_BATCH_SYNC_INTERVAL_MS = 60_000;
+
+/** Sync these kinds before any optional agent transition events. */
+export const PRIORITY_BATCH_EVENT_KINDS = [
+  "INPUT_ACTIVITY",
+  "APP_FOCUS",
+  "ACTIVITY_INTERVAL"
+] as const;
 
 /** Events + offline screenshots awaiting upload. */
 function getCombinedPendingCount(): number {
@@ -231,26 +238,36 @@ export class SyncWorker {
         onAuthRefresh: refreshAuthSession
       };
 
-      const events = getPendingEventsByKinds(api.BATCH_TRACKING_EVENT_KINDS, BATCH_SIZE);
-      if (events.length > 0) {
+      const syncKinds = async (kinds: readonly string[]): Promise<void> => {
+        const events = getPendingEventsByKinds(kinds, BATCH_SIZE);
+        if (events.length === 0) {
+          return;
+        }
         const prepared = events.map(parseQueuedBatchEvent);
-        let nextRetryAt: string | null = null;
+        logger.info("sync-batch-attempt", {
+          count: prepared.length,
+          kinds: Array.from(new Set(events.map((event) => event.eventKind)))
+        });
+        const result = await syncPreparedQueuedEvents(prepared, requestOptions);
+        if (result.deliveredIds.length > 0) {
+          logger.info("sync-batch-delivered", { count: result.deliveredIds.length });
+          this.onSyncResult?.({ ok: true, statusCode: 200, message: "batch_delivered" });
+          this.status.online = true;
+          this.status.lastError = null;
+          this.status.lastSyncAt = new Date().toISOString();
+        }
+        if (result.nextRetryAt) {
+          this.status.nextRetryAt = result.nextRetryAt;
+        }
+      };
 
-        try {
-          logger.info("sync-batch-attempt", {
-            count: prepared.length,
-            kinds: Array.from(new Set(events.map((event) => event.eventKind)))
-          });
-          const result = await syncPreparedQueuedEvents(prepared, requestOptions);
-          nextRetryAt = result.nextRetryAt;
-          if (result.deliveredIds.length > 0) {
-            logger.info("sync-batch-delivered", { count: result.deliveredIds.length });
-            this.onSyncResult?.({ ok: true, statusCode: 200, message: "batch_delivered" });
-            this.status.online = true;
-            this.status.lastError = null;
-            this.status.lastSyncAt = new Date().toISOString();
-          }
-        } catch (error) {
+      try {
+        await syncKinds(PRIORITY_BATCH_EVENT_KINDS);
+        const remainingKinds = api.BATCH_TRACKING_EVENT_KINDS.filter(
+          (kind) => !PRIORITY_BATCH_EVENT_KINDS.includes(kind as (typeof PRIORITY_BATCH_EVENT_KINDS)[number])
+        );
+        await syncKinds(remainingKinds);
+      } catch (error) {
           this.onSyncResult?.({
             ok: false,
             statusCode: error instanceof api.ApiError ? error.statusCode ?? null : null,
@@ -266,9 +283,6 @@ export class SyncWorker {
           if (remaining > 0) {
             this.maybeNotifySyncFailure(remaining);
           }
-        }
-
-        this.status.nextRetryAt = nextRetryAt;
       }
 
       const screenshotResult = await flushScreenshotQueue(requestOptions);

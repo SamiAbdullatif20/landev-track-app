@@ -12,8 +12,13 @@ import { readCachedUserRoles } from "../api/client";
 import { refreshAuthSession, readAuthContext, type AuthContext } from "./auth-session";
 import { notifyDesktop } from "./desktop-notifications";
 
-/** Timer sync (60–120s). 60s keeps new web projects visible within ~2 min without restart. */
-export const PROJECT_SYNC_INTERVAL_MS = 60_000;
+/**
+ * Slow safety-net refresh. The project list is fetched on demand (login, when
+ * the picker opens, window focus, manual sync), so this only needs to catch
+ * background changes occasionally — keeping it long avoids re-paging the whole
+ * list every minute (fewer Vercel calls).
+ */
+export const PROJECT_SYNC_INTERVAL_MS = 15 * 60_000;
 
 export type ProjectSyncResult = {
   projects: RoleProject[];
@@ -27,12 +32,19 @@ type ProjectSyncServiceOptions = {
   window: BrowserWindow;
   resolveVisibleProjects: (apiProjects: api.Project[], roles: string[]) => RoleProject[];
   fetchRoles: (ctx: AuthContext) => Promise<string[]>;
+  /**
+   * Gate for the periodic timer only. Explicit syncNow() calls (login, picker
+   * open, manual refresh) always run. Returning false skips the background
+   * tick — e.g. while a session is active the project list isn't needed.
+   */
+  shouldRunTimerSync?: () => boolean;
 };
 
 export class ProjectSyncService {
   private readonly window: BrowserWindow;
   private readonly resolveVisibleProjects: ProjectSyncServiceOptions["resolveVisibleProjects"];
   private readonly fetchRoles: ProjectSyncServiceOptions["fetchRoles"];
+  private readonly shouldRunTimerSync: () => boolean;
   private interval: NodeJS.Timeout | null = null;
   private syncInProgress = false;
   private lastPublishedKey = "";
@@ -41,6 +53,7 @@ export class ProjectSyncService {
     this.window = options.window;
     this.resolveVisibleProjects = options.resolveVisibleProjects;
     this.fetchRoles = options.fetchRoles;
+    this.shouldRunTimerSync = options.shouldRunTimerSync ?? (() => true);
   }
 
   public start(): void {
@@ -48,6 +61,9 @@ export class ProjectSyncService {
       return;
     }
     this.interval = setInterval(() => {
+      if (!this.shouldRunTimerSync()) {
+        return;
+      }
       this.syncNow().catch((error) => {
         logger.error("project-sync-interval-failed", { error });
       });

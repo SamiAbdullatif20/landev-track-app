@@ -1,4 +1,4 @@
-import { desktopCapturer, screen, type DesktopCapturerSource, type NativeImage } from "electron";
+import { desktopCapturer, screen, type DesktopCapturerSource, type NativeImage, nativeImage } from "electron";
 import { logger } from "../config/logger";
 import { releaseNativeImage } from "../utils/native-image";
 import { withSilentWindowsCapture } from "../utils/windows-silent-capture";
@@ -212,25 +212,28 @@ export async function capturePrimaryScreenJpeg(
 
   if (process.platform === "win32") {
     const gdi = await capturePrimaryScreenGdiJpeg(maxWidth, PREFERRED_JPEG_QUALITY);
-    if (gdi && gdi.buffer.length <= targetMaxBytes) {
+    if (gdi) {
+      let buffer = gdi.buffer;
+      let quality = gdi.quality;
+      if (buffer.length > targetMaxBytes) {
+        const image = nativeImage.createFromBuffer(buffer);
+        const reencoded = encodeNativeImageToJpeg(image, targetMaxBytes);
+        if (reencoded) {
+          buffer = reencoded.buffer;
+          quality = reencoded.quality;
+        }
+      }
       return {
-        buffer: gdi.buffer,
+        buffer,
         width: gdi.width,
         height: gdi.height,
-        quality: gdi.quality,
+        quality,
         sourceId: "gdi:primary",
         sourceName: "Primary Display",
-        compressedBytes: gdi.buffer.length
+        compressedBytes: buffer.length
       };
     }
-    if (gdi) {
-      logger.info("screenshot-gdi-over-byte-budget-fallback", {
-        bytes: gdi.buffer.length,
-        targetMaxBytes
-      });
-    } else {
-      logger.warn("screenshot-gdi-unavailable-fallback-to-desktop-capturer");
-    }
+    logger.warn("screenshot-gdi-unavailable-fallback-to-desktop-capturer");
   }
 
   const sources = await getScreenSources(size);
