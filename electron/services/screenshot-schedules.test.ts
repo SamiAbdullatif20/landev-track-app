@@ -11,25 +11,25 @@ import {
 } from "./screenshot-schedules";
 
 describe("screenshot schedules", () => {
-  it("defines 12-minute admin-only and 20-minute employee-visible tiers", () => {
-    expect(SCREENSHOT_INTERVAL_MINUTES.superadminOnly).toBe(12);
-    expect(SCREENSHOT_INTERVAL_MINUTES.superadminAndDesigner).toBe(20);
+  it("defines 20-minute admin-only and 30-minute employee-visible tiers", () => {
+    expect(SCREENSHOT_INTERVAL_MINUTES.superadminOnly).toBe(20);
+    expect(SCREENSHOT_INTERVAL_MINUTES.superadminAndDesigner).toBe(30);
     expect(SCREENSHOT_SCHEDULES).toHaveLength(2);
 
     const adminOnly = SCREENSHOT_SCHEDULES.find((s) => s.visibility === "superadmin_only");
     const staffVisible = SCREENSHOT_SCHEDULES.find((s) => s.visibility === "admin_and_employee");
 
-    expect(adminOnly?.intervalMs).toBe(12 * 60 * 1000);
+    expect(adminOnly?.intervalMs).toBe(20 * 60 * 1000);
     expect(adminOnly?.visibleToRoles).toEqual(["SUPER_ADMIN"]);
-    expect(staffVisible?.intervalMs).toBe(20 * 60 * 1000);
+    expect(staffVisible?.intervalMs).toBe(30 * 60 * 1000);
     expect(staffVisible?.visibleToRoles).toEqual(["SUPER_ADMIN", "DESIGNER", "MODERATOR"]);
   });
 
-  it("uses independent 12m and 20m first-capture targets", () => {
+  it("uses independent 20m and 30m first-capture targets", () => {
     expect(initialSuperadminTargetMs()).toBe(superadminIntervalMs());
     expect(initialDesignerTargetMs()).toBe(designerIntervalMs());
-    expect(superadminIntervalMs()).toBe(12 * 60 * 1000);
-    expect(designerIntervalMs()).toBe(20 * 60 * 1000);
+    expect(superadminIntervalMs()).toBe(20 * 60 * 1000);
+    expect(designerIntervalMs()).toBe(30 * 60 * 1000);
   });
 
   it("schedules delay to whichever tier fires next", () => {

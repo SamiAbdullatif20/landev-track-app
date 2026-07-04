@@ -1,0 +1,181 @@
+SYSTEM / TASK PROMPT — LANDEV WEB + BACKEND (give this to Cursor in the WEB repo)
+================================================================================
+
+You are working on the LANDEV web dashboard + backend (Next.js on Vercel, data
+in Supabase Postgres, screenshots in Supabase Storage). A companion Windows
+desktop time-tracker was just optimized to cut Vercel/Supabase cost and stop
+unbounded storage growth. Your job is to update the web/backend so it (a) stays
+compatible with the desktop's new behavior and (b) implements the server-side
+cost fixes the desktop cannot do itself.
+
+Do NOT break existing tracking. Ship changes so the desktop keeps working even
+if a given endpoint is not yet deployed (graceful fallbacks noted below).
+
+--------------------------------------------------------------------------------
+CONTEXT — WHAT THE DESKTOP APP NOW DOES (so you can match it)
+--------------------------------------------------------------------------------
+1. Sessions are started/stopped ONLY from the desktop. The team does not use the
+   web to start or end work sessions. The desktop polls session status at most
+   once every 5 minutes purely as a fallback mirror; treat web-initiated
+   start/stop as unused.
+2. Notifications were REMOVED from the desktop. It no longer calls any
+   /api/notifications* endpoints and no longer shows a notification bell. (OS-level
+   sync-failure / assignment toasts remain purely local to the desktop.)
+3. Project list is fetched on demand (login, opening the picker, window focus,
+   manual sync) plus a slow 15-minute safety refresh — NOT every 60 seconds.
+4. Activity events (INPUT_ACTIVITY, APP_FOCUS/APP_CHANGE, HEARTBEAT, IDLE_*) are
+   queued locally and uploaded in batches roughly every 60 seconds.
+5. Screenshots: two tiers — admin-only every 12 min, employee-visible every
+   20 min. Each image is a downscaled JPEG (~150 KB max, quality ~55). Captures
+   are SKIPPED while the user is idle (5+ min) and during snipping/screen-recording.
+6. Idempotency: activity events carry a stable eventUuid; screenshot uploads
+   carry a stable uploadUuid. Retries/offline-flush may resend the same id — the
+   server MUST dedupe on these and never create duplicates.
+
+--------------------------------------------------------------------------------
+WORK ITEM 1 (HIGH PRIORITY) — DATA RETENTION (stops the bill from growing)
+--------------------------------------------------------------------------------
+Right now screenshots and activity events appear to accumulate forever. Add
+retention so old data is purged automatically.
+
+Do:
+  - Add a configurable retention window (env var, e.g. DATA_RETENTION_DAYS,
+    default 90). Make screenshots and activity events independently configurable
+    if easy (e.g. SCREENSHOT_RETENTION_DAYS, EVENT_RETENTION_DAYS).
+  - Implement a scheduled purge (Vercel Cron or Supabase scheduled job) that:
+      * deletes screenshot rows older than the window AND removes the
+        corresponding objects from Supabase Storage (do not orphan storage
+        objects — delete the file, then the row, or vice-versa transactionally).
+      * deletes activity/event rows older than the window (batch/delete in
+        chunks to avoid long-running statements and lock contention).
+  - Make the purge idempotent and safe to run repeatedly; log counts deleted.
+  - Ensure any admin reports that assume "all history" are updated to reflect the
+    retention window (or add a note in the UI).
+
+Acceptance:
+  - A screenshot older than the window is gone from BOTH the DB and Storage after
+    the job runs.
+  - Events older than the window are removed; recent data is untouched.
+  - Running the job twice in a row deletes nothing the second time and errors
+    zero times.
+
+--------------------------------------------------------------------------------
+WORK ITEM 2 (HIGH PRIORITY) — DIRECT-TO-SUPABASE SIGNED SCREENSHOT UPLOADS
+--------------------------------------------------------------------------------
+Today screenshot image bytes flow THROUGH a Vercel function, which bills Vercel
+bandwidth + function time for every capture. Move the bytes off Vercel.
+
+Do:
+  - Add an endpoint that returns a short-lived Supabase Storage signed upload URL
+    (createSignedUploadUrl) for a screenshot, e.g.:
+        POST /api/tracking/screenshots/sign
+        body: { uploadUuid, capturedAt, projectId, sessionId?, contentType, byteSize }
+        200: { uploadUrl, storagePath, token, expiresInSeconds }
+    Enforce the same auth as the current ingest endpoint. Validate contentType is
+    image/jpeg and byteSize is within a sane cap (e.g. <= 512 KB).
+  - The desktop will PUT the JPEG bytes directly to Supabase using that URL, then
+    call a small "commit" endpoint to persist metadata (no image bytes):
+        POST /api/tracking/screenshots/commit
+        body: { uploadUuid, storagePath, capturedAt, projectId, sessionId?,
+                width, height, mimeType, visibility, visibleToRoles,
+                intervalMinutes, jpegQuality, compressedBytes,
+                mouseMovePercent, mouseActiveSeconds, activityPeriodSeconds,
+                activityPeriodStartAt, activityPeriodEndAt, activitySampleCount }
+        200: { ok: true, id }
+    Commit MUST dedupe on uploadUuid (idempotent).
+  - Keep the EXISTING multipart ingest endpoint working unchanged as a fallback,
+    so the desktop can use signed-upload only when both /sign and /commit exist
+    (the desktop will feature-detect; if /sign returns 404 it falls back to the
+    current multipart upload). This lets you ship server-first.
+  - Preserve current server-side visibility/role enforcement on who can view each
+    screenshot tier (superadmin_only vs admin_and_employee).
+
+Acceptance:
+  - A screenshot uploaded via signed URL + commit is viewable in the dashboard
+    exactly like a multipart-uploaded one.
+  - Re-sending the same uploadUuid to /commit does not create a duplicate.
+  - The Vercel function for /sign and /commit never receives the image bytes.
+
+--------------------------------------------------------------------------------
+WORK ITEM 3 (MEDIUM) — CHEAP PROJECTS "VERSION" ENDPOINT (kill repeat full fetches)
+--------------------------------------------------------------------------------
+The desktop no longer polls projects every minute, but it still does a full
+paginated GET /api/projects on focus/login/safety-refresh. Give it a cheap way to
+know NOTHING changed so it can skip the full fetch.
+
+Do:
+  - Add GET /api/projects/version returning { count, hash, updatedAt }, scoped to
+    the SAME projects the caller would see from GET /api/projects (respect
+    role/assignment filtering). Same auth as GET /api/projects.
+  - hash must be deterministic and change whenever the visible set changes:
+    project added/removed/unassigned, renamed, or chargeable flag changed.
+    Suggested: sort by id, build `${id}:${name}:${isNonChargeable?1:0}:${updatedAt}`
+    per project, join with "\n", SHA-256 → hex.
+  - Keep it a single lightweight indexed query (id, name, chargeable, updatedAt);
+    tiny response regardless of project count.
+  - Do NOT change GET /api/projects; it stays the source of truth. If /version is
+    absent the desktop falls back to periodic full fetch, so this can ship alone.
+
+Acceptance:
+  - Two calls with no change return identical hash+count.
+  - Add/remove/rename/chargeable-toggle each change the hash.
+  - Different users with different visible sets get different hashes.
+  - Auth enforced; never leaks projects the caller can't see.
+
+--------------------------------------------------------------------------------
+WORK ITEM 4 (MEDIUM) — SCREENSHOT VIEWING EGRESS
+--------------------------------------------------------------------------------
+When admins browse screenshots, each view is Supabase egress. Reduce repeated
+egress:
+  - Serve screenshots to the dashboard via time-limited signed URLs (or a CDN in
+    front of Storage) with cache headers so the same image isn't re-downloaded on
+    every render.
+  - Generate/store a small thumbnail per screenshot and use it in list/grid
+    views; only load the full JPEG on click.
+  - Paginate/lazy-load screenshot galleries (don't fetch a whole day at once).
+
+Acceptance:
+  - Screenshot grids load thumbnails, not full images.
+  - Re-opening the same screenshot within its cache window does not re-egress the
+    full object.
+
+--------------------------------------------------------------------------------
+WORK ITEM 5 (LOW / CLEANUP) — DEPRECATE NOTIFICATIONS + AUDIT INDEXES
+--------------------------------------------------------------------------------
+  - The desktop no longer calls /api/notifications/* (unread-count, unread, count,
+    mark-all-read, read-all, mark-seen). If nothing else (the web UI) uses them,
+    remove or stop scheduling any background jobs that populate desktop
+    notifications. If the web UI still uses notifications, leave those paths but
+    remove any desktop-specific polling assumptions.
+  - Audit indexes on the activity/events and screenshots tables for the columns
+    used by report queries and by the retention purge (e.g. createdAt/capturedAt,
+    userId, sessionId, projectId, workDateKey). Missing indexes make both reports
+    and purges expensive (Vercel function duration). Add what's missing.
+  - Confirm event ingestion dedupes on eventUuid and screenshots on uploadUuid
+    with a UNIQUE constraint (not just app-level checks).
+
+Acceptance:
+  - Report queries and the purge job use indexes (check EXPLAIN).
+  - Duplicate eventUuid / uploadUuid inserts are rejected/ignored at the DB level.
+
+--------------------------------------------------------------------------------
+ENDPOINTS THE DESKTOP CURRENTLY RELIES ON (do not break)
+--------------------------------------------------------------------------------
+  - POST /api/auth/login, logout, GET /api/auth/me (+ session)
+  - GET  /api/projects            (paginated; params: limit, cursor)
+  - POST /api/tracking/events/batch    (activity events; dedupe on eventUuid)
+  - POST /api/tracking/screenshots/ingest  (current multipart upload; keep as fallback)
+  - POST /api/tracking/session/start | /stop
+  - GET  /api/tracking/session/active | /status   (polled at most every 5 min)
+  - GET  /api/attendance/today
+
+--------------------------------------------------------------------------------
+DELIVERY ORDER (recommended)
+--------------------------------------------------------------------------------
+  1. Work Item 1 (retention) — biggest recurring saving, no desktop change needed.
+  2. Work Item 2 (signed uploads) — server-first; desktop feature-detects later.
+  3. Work Item 3 (projects/version) — server-first; desktop adopts later.
+  4. Work Items 4 & 5 — ongoing.
+
+For each item: implement, add tests covering the Acceptance bullets, and keep all
+existing endpoints backward compatible.

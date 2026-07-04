@@ -10,7 +10,6 @@ import {
   initialSuperadminTargetMs,
   scheduleForVisibility,
   schedulesDueAtElapsed,
-  SCREENSHOT_BOOTSTRAP_CAPTURE_MS,
   superadminIntervalMs,
   type ScreenshotSchedule
 } from "./screenshot-schedules";
@@ -66,7 +65,16 @@ export type ScreenshotUploadInput = {
 type ScreenshotWorkerOptions = {
   uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
   onUploadComplete?: () => void;
+  /**
+   * Milliseconds since the last user input. Injected (defaults to 0 = active)
+   * so the worker stays free of the electron powerMonitor dependency and is
+   * easy to test. Used to skip captures while the user is idle.
+   */
+  getSystemIdleMs?: () => number;
 };
+
+/** Skip screenshots once the user has been idle this long (no monitoring value, saves storage). */
+export const SCREENSHOT_IDLE_SKIP_MS = 5 * 60_000;
 
 type DueScheduleCapture = {
   schedule: ScreenshotSchedule;
@@ -74,14 +82,14 @@ type DueScheduleCapture = {
 };
 
 /**
- * Admin-only screenshots every 6 minutes; employee-visible every 10 minutes.
- * One timer schedules the earlier of the two next targets (both may fire at 10m, 20m, …).
+ * Two tiers on independent intervals (see SCREENSHOT_INTERVAL_MINUTES).
+ * One timer schedules the earlier of the two next targets.
  */
 export class ScreenshotWorker {
   private readonly uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
   private readonly onUploadComplete?: () => void;
+  private readonly getSystemIdleMs: () => number;
   private timeoutHandle: NodeJS.Timeout | null = null;
-  private bootstrapHandle: NodeJS.Timeout | null = null;
   private context: SessionContext = { projectId: null, sessionId: null };
   private running = false;
   private captureInFlight = false;
@@ -92,6 +100,7 @@ export class ScreenshotWorker {
   constructor(options: ScreenshotWorkerOptions) {
     this.uploadScreenshot = options.uploadScreenshot;
     this.onUploadComplete = options.onUploadComplete;
+    this.getSystemIdleMs = options.getSystemIdleMs ?? (() => 0);
   }
 
   public async start(context: SessionContext): Promise<void> {
@@ -102,12 +111,9 @@ export class ScreenshotWorker {
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
     this.scheduleNextCapture();
-    this.bootstrapHandle = setTimeout(() => {
-      void this.runBootstrapCapture();
-    }, SCREENSHOT_BOOTSTRAP_CAPTURE_MS);
     logger.info("screenshot-cadence-started", {
-      superadminEveryMinutes: 6,
-      designerEveryMinutes: 10,
+      superadminEveryMinutes: superadminIntervalMs() / 60_000,
+      designerEveryMinutes: designerIntervalMs() / 60_000,
       firstSuperadminTargetMs: this.nextSuperadminTargetMs,
       firstDesignerTargetMs: this.nextDesignerTargetMs,
       runsInMainProcess: true,
@@ -118,10 +124,6 @@ export class ScreenshotWorker {
   public stop(): void {
     this.running = false;
     this.clearScheduledCapture();
-    if (this.bootstrapHandle) {
-      clearTimeout(this.bootstrapHandle);
-      this.bootstrapHandle = null;
-    }
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
     logger.info("screenshot-worker-stopped");
@@ -170,21 +172,6 @@ export class ScreenshotWorker {
       projectId,
       sessionId: state.sessionId ?? this.context.sessionId
     };
-  }
-
-  private async runBootstrapCapture(): Promise<void> {
-    if (!this.running || !getSessionState().active) {
-      return;
-    }
-    const schedule =
-      scheduleForVisibility("admin_and_employee") ?? scheduleForVisibility("superadmin_only");
-    if (!schedule) {
-      return;
-    }
-    logger.info("screenshot-bootstrap-capture", { delayMs: SCREENSHOT_BOOTSTRAP_CAPTURE_MS });
-    await this.captureAndUploadSchedules([
-      { schedule, cadenceTargetMs: SCREENSHOT_BOOTSTRAP_CAPTURE_MS }
-    ]);
   }
 
   private scheduleNextCapture(): void {
@@ -282,6 +269,16 @@ export class ScreenshotWorker {
 
     this.captureInFlight = true;
     try {
+      const idleMs = this.getSystemIdleMs();
+      if (idleMs >= SCREENSHOT_IDLE_SKIP_MS) {
+        logger.info("screenshot-skipped-user-idle", {
+          scheduleCount: dueCaptures.length,
+          idleMs,
+          thresholdMs: SCREENSHOT_IDLE_SKIP_MS
+        });
+        return;
+      }
+
       const guard = await shouldSkipScreenshotCapture();
       if (guard.shouldSkipCapture) {
         logger.info("screenshot-skipped-non-interference-guard", {

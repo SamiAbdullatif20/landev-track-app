@@ -98,6 +98,31 @@ describe("ScreenshotWorker primary capture", () => {
     expect(uploads[0]?.metadata?.displayCount).toBe(1);
   });
 
+  it("skips capture while the user is idle beyond the threshold", async () => {
+    const uploads: unknown[] = [];
+    const worker = new ScreenshotWorker({
+      uploadScreenshot: async (payload) => {
+        uploads.push(payload);
+      },
+      getSystemIdleMs: () => 6 * 60_000
+    });
+
+    await worker.start({ projectId: "proj-1", sessionId: "sess-1" });
+
+    const schedule = scheduleForVisibility("admin_and_employee");
+    const captureAndUpload = (
+      worker as unknown as {
+        captureAndUpload: (schedule: ScreenshotSchedule, cadenceTargetMs: number) => Promise<void>;
+      }
+    ).captureAndUpload.bind(worker);
+    await captureAndUpload(schedule!, 600_000);
+
+    worker.stop();
+
+    expect(mockCapturePrimaryScreenJpeg).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
   it("captures once when admin and employee schedules are both due", async () => {
     const uploads: Array<{ metadata?: { visibility?: string } }> = [];
     const worker = new ScreenshotWorker({

@@ -40,6 +40,7 @@ function App() {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(true);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [manualSyncing, setManualSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState({
     online: true,
     syncing: false,
@@ -416,6 +417,20 @@ function App() {
     }
   };
 
+  const onManualSync = async () => {
+    if (manualSyncing) return;
+    setManualSyncing(true);
+    try {
+      await window.desktopAPI.syncNow();
+      await fetchProjectsWithRetry();
+      pushToast("success", "Projects synced.");
+    } catch (error) {
+      pushToast("error", "Sync failed. Please try again.");
+    } finally {
+      setManualSyncing(false);
+    }
+  };
+
   const onLogout = async () => {
     if (authLoading) return;
     setAuthLoading(true);
@@ -655,6 +670,16 @@ function App() {
                     <path d="M15.5 8.5a5 5 0 0 1 0 7" />
                   </svg>
                 </label>
+                <button
+                  type="button"
+                  className="header-action-btn header-sync-btn"
+                  disabled={manualSyncing}
+                  aria-label="Sync projects"
+                  title="Sync projects"
+                  onClick={onManualSync}
+                >
+                  {manualSyncing ? "Syncing…" : "Sync"}
+                </button>
                 <button
                   type="button"
                   className="header-action-btn header-logout-btn"

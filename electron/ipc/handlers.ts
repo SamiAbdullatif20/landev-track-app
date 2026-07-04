@@ -1,4 +1,4 @@
-import { BrowserWindow, dialog, ipcMain, app, shell } from "electron";
+import { BrowserWindow, dialog, ipcMain, app, shell, powerMonitor } from "electron";
 import { startSessionPowerBlocker, stopSessionPowerBlocker } from "../services/session-power";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -278,37 +278,16 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         return roles;
       }
       return fetchUserRoles(ctx);
-    },
-    shouldRunTimerSync: () => !getSessionState().active
-  });
-
-  // Refresh the project list when the user returns to the window (they may be
-  // about to pick a project), throttled so rapid focus toggling can't spam it.
-  const FOCUS_PROJECT_SYNC_THROTTLE_MS = 2 * 60_000;
-  let lastFocusProjectSyncMs = 0;
-  mainWindow.on("focus", () => {
-    if (!isAuthenticated() || getSessionState().active) {
-      return;
     }
-    const now = Date.now();
-    if (now - lastFocusProjectSyncMs < FOCUS_PROJECT_SYNC_THROTTLE_MS) {
-      return;
-    }
-    lastFocusProjectSyncMs = now;
-    void projectSync.syncNow().catch((error) => {
-      logger.warn("project-sync-focus-failed", { error });
-    });
   });
 
   const startLiveSync = (): void => {
-    projectSync.start();
     worker.start();
     sessionRemoteSync?.start();
   };
 
   const stopLiveSync = (): void => {
     sessionRemoteSync?.stop();
-    projectSync.stop();
     worker.stop();
   };
 
@@ -327,7 +306,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     },
     onUploadComplete: () => {
       void worker.flush();
-    }
+    },
+    getSystemIdleMs: () => powerMonitor.getSystemIdleTime() * 1000
   });
   const trackingAgent = new EventDrivenTrackingAgent();
   const inputActivitySampler = new InputActivitySampler();

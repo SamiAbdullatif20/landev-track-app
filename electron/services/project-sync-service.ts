@@ -12,14 +12,6 @@ import { readCachedUserRoles } from "../api/client";
 import { refreshAuthSession, readAuthContext, type AuthContext } from "./auth-session";
 import { notifyDesktop } from "./desktop-notifications";
 
-/**
- * Slow safety-net refresh. The project list is fetched on demand (login, when
- * the picker opens, window focus, manual sync), so this only needs to catch
- * background changes occasionally — keeping it long avoids re-paging the whole
- * list every minute (fewer Vercel calls).
- */
-export const PROJECT_SYNC_INTERVAL_MS = 15 * 60_000;
-
 export type ProjectSyncResult = {
   projects: RoleProject[];
   roles: string[];
@@ -32,20 +24,18 @@ type ProjectSyncServiceOptions = {
   window: BrowserWindow;
   resolveVisibleProjects: (apiProjects: api.Project[], roles: string[]) => RoleProject[];
   fetchRoles: (ctx: AuthContext) => Promise<string[]>;
-  /**
-   * Gate for the periodic timer only. Explicit syncNow() calls (login, picker
-   * open, manual refresh) always run. Returning false skips the background
-   * tick — e.g. while a session is active the project list isn't needed.
-   */
-  shouldRunTimerSync?: () => boolean;
 };
 
+/**
+ * Project sync is on-demand only: it runs once on boot/login and whenever the
+ * user presses the manual "Sync" button (or opens the picker). There is no
+ * background timer — projects rarely change and re-paging the whole list on a
+ * schedule wastes Vercel calls.
+ */
 export class ProjectSyncService {
   private readonly window: BrowserWindow;
   private readonly resolveVisibleProjects: ProjectSyncServiceOptions["resolveVisibleProjects"];
   private readonly fetchRoles: ProjectSyncServiceOptions["fetchRoles"];
-  private readonly shouldRunTimerSync: () => boolean;
-  private interval: NodeJS.Timeout | null = null;
   private syncInProgress = false;
   private lastPublishedKey = "";
 
@@ -53,31 +43,6 @@ export class ProjectSyncService {
     this.window = options.window;
     this.resolveVisibleProjects = options.resolveVisibleProjects;
     this.fetchRoles = options.fetchRoles;
-    this.shouldRunTimerSync = options.shouldRunTimerSync ?? (() => true);
-  }
-
-  public start(): void {
-    if (this.interval) {
-      return;
-    }
-    this.interval = setInterval(() => {
-      if (!this.shouldRunTimerSync()) {
-        return;
-      }
-      this.syncNow().catch((error) => {
-        logger.error("project-sync-interval-failed", { error });
-      });
-    }, PROJECT_SYNC_INTERVAL_MS);
-    logger.info("project-sync-started", { intervalMs: PROJECT_SYNC_INTERVAL_MS });
-  }
-
-  public stop(): void {
-    if (!this.interval) {
-      return;
-    }
-    clearInterval(this.interval);
-    this.interval = null;
-    logger.info("project-sync-stopped");
   }
 
   public async syncNow(): Promise<ProjectSyncResult> {

@@ -1,12 +1,9 @@
-/** First employee-visible capture shortly after session start (then normal 12/20m cadence). */
-export const SCREENSHOT_BOOTSTRAP_CAPTURE_MS = 60_000;
-
 /** Minutes between captures for each tier. Longer = fewer uploads + less Supabase storage. */
 export const SCREENSHOT_INTERVAL_MINUTES = {
   /** Admin-only tier (SUPER_ADMIN in web UI). */
-  superadminOnly: 12,
+  superadminOnly: 20,
   /** Employee + admin tier (DESIGNER, MODERATOR, SUPER_ADMIN). */
-  superadminAndDesigner: 20
+  superadminAndDesigner: 30
 } as const;
 
 export type ScreenshotVisibility = "superadmin_only" | "admin_and_employee";
