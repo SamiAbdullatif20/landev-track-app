@@ -106,6 +106,40 @@ export type ScreenshotIngestInput = {
   metadata?: Record<string, unknown>;
 };
 
+export type ScreenshotSignInput = {
+  capturedAtIso: string;
+  mimeType: "image/png" | "image/jpeg";
+  uploadUuid: string;
+  byteSize?: number;
+  projectId?: string | null;
+  sessionId?: string;
+};
+
+export type ScreenshotSignResult = {
+  path: string;
+  token: string;
+  signedUrl: string;
+  uploadUuid: string;
+  mimeType: string;
+  capturedAtIso: string;
+};
+
+export type ScreenshotCommitInput = {
+  path: string;
+  uploadUuid: string;
+  capturedAtIso: string;
+  mimeType?: "image/png" | "image/jpeg";
+  projectId?: string | null;
+  sessionId?: string;
+  workSessionId?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type ScreenshotCommitResult = {
+  duplicate: boolean;
+  screenshotId?: string;
+};
+
 export type SessionStopResult = {
   ok: true;
   queued: boolean;
@@ -272,6 +306,55 @@ function mapRawProjectRecord(source: Record<string, unknown>): Omit<Project, "is
     projectAddress,
     clientName: clientNameStr
   };
+}
+
+function mapProjectWithChargeable(source: Record<string, unknown>): Project | null {
+  const mapped = mapRawProjectRecord(source);
+  if (!mapped) {
+    return null;
+  }
+  const isNonChargeable =
+    typeof source.isNonChargeable === "boolean"
+      ? source.isNonChargeable
+      : typeof source.nonChargeable === "boolean"
+        ? source.nonChargeable
+        : typeof source.chargeable === "boolean"
+          ? !source.chargeable
+          : isNonChargeableProjectName(mapped.name);
+  return { ...mapped, isNonChargeable };
+}
+
+function parseRemovedProjectIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return [];
+  }
+  const record = payload as Record<string, unknown>;
+  const candidates = [
+    record.removedIds,
+    record.removed_ids,
+    record.removed,
+    record.deletedIds,
+    record.deleted_ids,
+    record.unassignedIds
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate
+        .map((value) => asStringOrNull(value))
+        .filter((value): value is string => Boolean(value));
+    }
+  }
+  return [];
+}
+
+function parseServerProjectCount(payload: unknown): number | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  const raw = record.serverCount ?? record.totalCount ?? record.total ?? record.count;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function finalizeProjectRows(items: Array<Omit<Project, "isNonChargeable"> & { isNonChargeable?: boolean }>): Project[] {
@@ -869,8 +952,16 @@ export async function login(payload: LoginInput, options: RequestOptions): Promi
 }
 
 export async function probeSession(options: RequestOptions): Promise<{ authenticated: boolean }> {
+  if (!options.token && !options.sessionCookie) {
+    return { authenticated: false };
+  }
+
   try {
-    await getProjects(options);
+    const client = getClient();
+    const response = await firstSuccess(API_ENDPOINTS.auth.me, (path) =>
+      client.get(path, { headers: authHeader(options) })
+    );
+    persistCookieIfPresent(response, options);
     return { authenticated: true };
   } catch (error) {
     if (error instanceof ApiError && error.kind === "auth") {
@@ -881,13 +972,22 @@ export async function probeSession(options: RequestOptions): Promise<{ authentic
 }
 
 export async function logout(options: RequestOptions): Promise<void> {
-  await withRetry(async () => {
+  try {
     const client = getClient();
-    const response = await firstSuccess(API_ENDPOINTS.auth.logout, (path) =>
-      client.post(path, {}, { headers: authHeader(options) })
+    await firstSuccess(API_ENDPOINTS.auth.logout, (path) =>
+      client.post(path, {}, { headers: authHeader(options), timeout: 8_000 })
     );
-    persistCookieIfPresent(response, options);
-  });
+  } catch (error) {
+    const status = axios.isAxiosError(error) ? error.response?.status : null;
+    if (status === 404 || status === 401 || status === 403) {
+      logger.info("auth-logout-local-only", { status: status ?? "unknown" });
+      return;
+    }
+    logger.warn("auth-logout-request-failed", {
+      error: error instanceof Error ? error.message : "unknown",
+      status
+    });
+  }
 }
 
 export async function testConnection(): Promise<{ reachable: boolean; message: string }> {
@@ -945,20 +1045,10 @@ export async function getAllProjectsPaginated(options: AuthAwareRequestOptions):
         if (!item || typeof item !== "object") {
           continue;
         }
-        const source = item as Record<string, unknown>;
-        const mapped = mapRawProjectRecord(source);
-        if (!mapped) {
-          continue;
+        const mapped = mapProjectWithChargeable(item as Record<string, unknown>);
+        if (mapped) {
+          merged.set(mapped.id, mapped);
         }
-        const isNonChargeable =
-          typeof source.isNonChargeable === "boolean"
-            ? source.isNonChargeable
-            : typeof source.nonChargeable === "boolean"
-              ? source.nonChargeable
-              : typeof source.chargeable === "boolean"
-                ? !source.chargeable
-                : isNonChargeableProjectName(mapped.name);
-        merged.set(mapped.id, { ...mapped, isNonChargeable });
       }
 
       cursor = nextCursor;
@@ -972,6 +1062,126 @@ export async function getAllProjectsPaginated(options: AuthAwareRequestOptions):
 
 export async function getProjects(options: AuthAwareRequestOptions): Promise<Project[]> {
   return getAllProjectsPaginated(options);
+}
+
+export type ProjectsVersion = {
+  count: number;
+  hash: string;
+  updatedAt?: string;
+};
+
+const projectsVersionResponseSchema = z.object({
+  count: z.number().int().nonnegative(),
+  hash: z.string().min(1),
+  updatedAt: z.string().optional()
+});
+
+/** Cheap fingerprint of the user's visible project set. Returns null if endpoint is not deployed (404). */
+export async function fetchProjectsVersion(
+  options: AuthAwareRequestOptions
+): Promise<ProjectsVersion | null> {
+  return withAuthRetry(async (requestOptions) => {
+    const http = getClient();
+    try {
+      const response = await http.get(API_ENDPOINTS.tracking.projectsVersion, {
+        headers: authHeader(requestOptions)
+      });
+      persistCookieIfPresent(response, requestOptions);
+      return projectsVersionResponseSchema.parse(response.data);
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        logger.info("projects-version-endpoint-unavailable");
+        return null;
+      }
+      throw mapAxiosError(error);
+    }
+  }, options);
+}
+
+export type ProjectsDeltaResult = {
+  /** Projects created or updated since the requested timestamp. */
+  projects: Project[];
+  /** Projects that were unassigned/removed since the requested timestamp. */
+  removedIds: string[];
+  /** Total number of the user's visible projects on the server, if reported. */
+  serverCount: number | null;
+};
+
+/**
+ * Fetch only the projects that changed since `sinceIso` so the cache can be updated
+ * incrementally without re-downloading the full list. Returns null if the endpoint
+ * is not deployed (404), so callers can fall back to a full paginated fetch.
+ */
+export async function fetchProjectsDelta(
+  sinceIso: string,
+  options: AuthAwareRequestOptions
+): Promise<ProjectsDeltaResult | null> {
+  return withAuthRetry(async (requestOptions) => {
+    const http = getClient();
+    const path = API_ENDPOINTS.tracking.projectsDelta;
+    try {
+      const merged = new Map<string, Project>();
+      const removed = new Set<string>();
+      let serverCount: number | null = null;
+      let cursor: string | null = null;
+      let page = 0;
+
+      do {
+        if (page >= PROJECTS_MAX_PAGES) {
+          logger.warn("projects-delta-page-cap", { maxPages: PROJECTS_MAX_PAGES });
+          break;
+        }
+        page += 1;
+        const response = await http.get(path, {
+          headers: authHeader(requestOptions),
+          params: {
+            since: sinceIso,
+            limit: 200,
+            ...(cursor ? { cursor } : {})
+          }
+        });
+        persistCookieIfPresent(response, requestOptions);
+
+        for (const item of normalizeProjectsPayload(response.data)) {
+          if (!item || typeof item !== "object") {
+            continue;
+          }
+          const mapped = mapProjectWithChargeable(item as Record<string, unknown>);
+          if (mapped) {
+            merged.set(mapped.id, mapped);
+          }
+        }
+        for (const id of parseRemovedProjectIds(response.data)) {
+          removed.add(id);
+        }
+        const count = parseServerProjectCount(response.data);
+        if (count != null) {
+          serverCount = count;
+        }
+
+        cursor = parseProjectsNextCursor(response.data);
+      } while (cursor);
+
+      const projects = finalizeProjectRows(Array.from(merged.values()));
+      logger.info("projects-delta-fetch-count", {
+        since: sinceIso,
+        changed: projects.length,
+        removed: removed.size,
+        serverCount
+      });
+      return {
+        projects,
+        removedIds: Array.from(removed),
+        serverCount
+      };
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        logger.info("projects-delta-endpoint-unavailable");
+        return null;
+      }
+      throw mapAxiosError(error);
+    }
+  }, options);
 }
 
 function buildSessionStartBody(payload: SessionStartInput, clockStartUtc: string): Record<string, unknown> {
@@ -1196,6 +1406,106 @@ async function ingestScreenshotMultipart(
     })
   );
   persistCookieIfPresent(response, options);
+}
+
+const screenshotSignResponseSchema = z
+  .object({
+    ok: z.literal(true).optional(),
+    path: z.string().min(1).optional(),
+    storagePath: z.string().min(1).optional(),
+    token: z.string().min(1),
+    signedUrl: z.string().url().optional(),
+    uploadUrl: z.string().url().optional(),
+    uploadUuid: z.string().optional(),
+    mimeType: z.string().optional(),
+    contentType: z.string().optional(),
+    capturedAtIso: z.string().optional(),
+    capturedAt: z.string().optional()
+  })
+  .refine((data) => Boolean(data.path || data.storagePath), {
+    message: "path or storagePath required"
+  })
+  .refine((data) => Boolean(data.signedUrl || data.uploadUrl), {
+    message: "signedUrl or uploadUrl required"
+  });
+
+function buildScreenshotSignRequestBody(payload: ScreenshotSignInput): Record<string, unknown> {
+  return {
+    uploadUuid: payload.uploadUuid,
+    capturedAtIso: payload.capturedAtIso,
+    capturedAt: payload.capturedAtIso,
+    mimeType: payload.mimeType,
+    contentType: payload.mimeType,
+    ...(typeof payload.byteSize === "number" ? { byteSize: payload.byteSize } : {}),
+    ...(payload.projectId ? { projectId: payload.projectId } : {}),
+    ...(payload.sessionId
+      ? { sessionId: payload.sessionId, workSessionId: payload.sessionId }
+      : {})
+  };
+}
+
+function parseScreenshotSignResponse(
+  data: unknown,
+  payload: ScreenshotSignInput
+): ScreenshotSignResult {
+  const parsed = screenshotSignResponseSchema.parse(data);
+  const path = parsed.path ?? parsed.storagePath!;
+  const signedUrl = parsed.signedUrl ?? parsed.uploadUrl!;
+  return {
+    path,
+    token: parsed.token,
+    signedUrl,
+    uploadUuid: parsed.uploadUuid ?? payload.uploadUuid,
+    mimeType: (parsed.mimeType ?? parsed.contentType ?? payload.mimeType) as
+      | "image/png"
+      | "image/jpeg",
+    capturedAtIso: parsed.capturedAtIso ?? parsed.capturedAt ?? payload.capturedAtIso
+  };
+}
+
+const screenshotCommitResponseSchema = z.object({
+  ok: z.literal(true),
+  duplicate: z.boolean().optional(),
+  screenshotId: z.string().optional()
+});
+
+export async function signScreenshotUpload(
+  payload: ScreenshotSignInput,
+  options: AuthAwareRequestOptions
+): Promise<ScreenshotSignResult> {
+  return withAuthRetry(async (requestOptions) => {
+    const client = getClient();
+    const response = await client.post(
+      API_ENDPOINTS.tracking.screenshotsSign,
+      buildScreenshotSignRequestBody(payload),
+      { headers: authHeader(requestOptions) }
+    );
+    persistCookieIfPresent(response, requestOptions);
+    return parseScreenshotSignResponse(response.data, payload);
+  }, options);
+}
+
+export async function commitScreenshotMetadata(
+  payload: ScreenshotCommitInput,
+  options: AuthAwareRequestOptions
+): Promise<ScreenshotCommitResult> {
+  return withAuthRetry(async (requestOptions) => {
+    const client = getClient();
+    const response = await client.post(
+      API_ENDPOINTS.tracking.screenshotsCommit,
+      {
+        ...payload,
+        storagePath: payload.path
+      },
+      { headers: authHeader(requestOptions) }
+    );
+    persistCookieIfPresent(response, requestOptions);
+    const parsed = screenshotCommitResponseSchema.parse(response.data);
+    return {
+      duplicate: parsed.duplicate ?? false,
+      screenshotId: parsed.screenshotId
+    };
+  }, options);
 }
 
 function screenshotRetryDelayMs(attempt: number, error: unknown): number | null {

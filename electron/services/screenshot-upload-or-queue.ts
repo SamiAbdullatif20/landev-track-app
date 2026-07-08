@@ -3,6 +3,7 @@ import axios from "axios";
 import * as api from "../api/client";
 import { enqueueScreenshot } from "../db/screenshot-queue";
 import { logger } from "../config/logger";
+import { uploadScreenshot } from "./screenshot-upload";
 import type { ScreenshotUploadInput } from "./screenshot-worker";
 
 function isPayloadTooLargeError(error: unknown): boolean {
@@ -30,7 +31,7 @@ export async function uploadScreenshotOrEnqueue(
   };
 
   try {
-    await api.ingestScreenshot(enriched, options);
+    await uploadScreenshot(enriched, options);
   } catch (error) {
     if (isPayloadTooLargeError(error)) {
       throw error;

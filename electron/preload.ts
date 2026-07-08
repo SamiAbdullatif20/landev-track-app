@@ -155,6 +155,11 @@ contextBridge.exposeInMainWorld("desktopAPI", {
     ipcRenderer.on("tracking:status-push", listener);
     return () => ipcRenderer.removeListener("tracking:status-push", listener);
   },
+  onStartFailed: (cb: (payload: { message: string }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: { message: string }) => cb(payload);
+    ipcRenderer.on("tracking:start-failed", listener);
+    return () => ipcRenderer.removeListener("tracking:start-failed", listener);
+  },
   onSyncStatusPush: (cb: (status: SyncStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: SyncStatus) => cb(payload);
     ipcRenderer.on("tracking:sync-status-push", listener);

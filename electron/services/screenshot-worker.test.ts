@@ -98,31 +98,6 @@ describe("ScreenshotWorker primary capture", () => {
     expect(uploads[0]?.metadata?.displayCount).toBe(1);
   });
 
-  it("skips capture while the user is idle beyond the threshold", async () => {
-    const uploads: unknown[] = [];
-    const worker = new ScreenshotWorker({
-      uploadScreenshot: async (payload) => {
-        uploads.push(payload);
-      },
-      getSystemIdleMs: () => 6 * 60_000
-    });
-
-    await worker.start({ projectId: "proj-1", sessionId: "sess-1" });
-
-    const schedule = scheduleForVisibility("admin_and_employee");
-    const captureAndUpload = (
-      worker as unknown as {
-        captureAndUpload: (schedule: ScreenshotSchedule, cadenceTargetMs: number) => Promise<void>;
-      }
-    ).captureAndUpload.bind(worker);
-    await captureAndUpload(schedule!, 600_000);
-
-    worker.stop();
-
-    expect(mockCapturePrimaryScreenJpeg).not.toHaveBeenCalled();
-    expect(uploads).toHaveLength(0);
-  });
-
   it("captures once when admin and employee schedules are both due", async () => {
     const uploads: Array<{ metadata?: { visibility?: string } }> = [];
     const worker = new ScreenshotWorker({
@@ -159,5 +134,86 @@ describe("ScreenshotWorker primary capture", () => {
       "admin_and_employee",
       "superadmin_only"
     ]);
+  });
+
+  it("skips capture while the user is idle beyond the threshold", async () => {
+    const uploads: unknown[] = [];
+    const worker = new ScreenshotWorker({
+      uploadScreenshot: async (payload) => {
+        uploads.push(payload);
+      },
+      getSystemIdleMs: () => 6 * 60_000
+    });
+
+    await worker.start({ projectId: "proj-1", sessionId: "sess-1" });
+
+    const schedule = scheduleForVisibility("admin_and_employee");
+    const captureAndUpload = (
+      worker as unknown as {
+        captureAndUpload: (schedule: ScreenshotSchedule, cadenceTargetMs: number) => Promise<void>;
+      }
+    ).captureAndUpload.bind(worker);
+    await captureAndUpload(schedule!, 600_000);
+
+    worker.stop();
+
+    expect(mockCapturePrimaryScreenJpeg).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
+  it("captures session bootstrap screenshot at 1 minute even when idle", async () => {
+    const uploads: Array<{ metadata?: { sessionBootstrap?: boolean; visibility?: string; intervalMinutes?: number } }> = [];
+    const worker = new ScreenshotWorker({
+      uploadScreenshot: async (payload) => {
+        uploads.push(payload);
+      },
+      getSystemIdleMs: () => 6 * 60_000
+    });
+
+    await worker.start({ projectId: "proj-1", sessionId: "sess-1" });
+
+    const runScheduledCaptures = (
+      worker as unknown as { runScheduledCaptures: () => Promise<void> }
+    ).runScheduledCaptures.bind(worker);
+
+    (worker as unknown as { startedAtMs: number }).startedAtMs = Date.now() - 61_000;
+
+    await runScheduledCaptures();
+
+    expect(mockCapturePrimaryScreenJpeg).toHaveBeenCalledTimes(1);
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]?.metadata?.sessionBootstrap).toBe(true);
+    expect(uploads[0]?.metadata?.intervalMinutes).toBe(30);
+    expect(uploads[0]?.metadata?.visibility).toBe("admin_and_employee");
+    expect((worker as unknown as { bootstrapCaptured: boolean }).bootstrapCaptured).toBe(true);
+
+    worker.stop();
+  });
+
+  it("retries bootstrap when capture fails instead of giving up immediately", async () => {
+    mockCapturePrimaryScreenJpeg
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(primaryCapture);
+
+    const uploads: unknown[] = [];
+    const worker = new ScreenshotWorker({
+      uploadScreenshot: async (payload) => {
+        uploads.push(payload);
+      }
+    });
+
+    await worker.start({ projectId: "proj-1", sessionId: "sess-1" });
+
+    const runScheduledCaptures = (
+      worker as unknown as { runScheduledCaptures: () => Promise<void> }
+    ).runScheduledCaptures.bind(worker);
+
+    (worker as unknown as { startedAtMs: number }).startedAtMs = Date.now() - 61_000;
+
+    await runScheduledCaptures();
+    expect((worker as unknown as { bootstrapCaptured: boolean }).bootstrapCaptured).toBe(false);
+    expect((worker as unknown as { bootstrapAttemptCount: number }).bootstrapAttemptCount).toBe(1);
+
+    worker.stop();
   });
 });

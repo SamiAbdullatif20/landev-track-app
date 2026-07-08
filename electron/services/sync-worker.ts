@@ -14,6 +14,7 @@ import { flushScreenshotQueue } from "./screenshot-queue-flush";
 import { refreshAuthSession, readAuthContext } from "./auth-session";
 import { buildBatchPayloadFromQueuedEvent } from "./batch-event-payload";
 import { notifyDesktop } from "./desktop-notifications";
+import { batchEventKindsForSync } from "./tracking-agent-flags";
 
 const SYNC_FAILURE_NOTIFY_COOLDOWN_MS = 5 * 60_000;
 /** After this many failed uploads, drop the event so the rest of the queue can drain. */
@@ -31,7 +32,7 @@ export type SyncStatus = {
 };
 
 /** Batch flush interval — queued activity/screenshot events upload on this cadence. */
-export const EVENT_BATCH_SYNC_INTERVAL_MS = 60_000;
+export const EVENT_BATCH_SYNC_INTERVAL_MS = 5 * 60_000;
 
 /** Sync these kinds before any optional agent transition events. */
 export const PRIORITY_BATCH_EVENT_KINDS = [
@@ -239,7 +240,11 @@ export class SyncWorker {
       };
 
       const syncKinds = async (kinds: readonly string[]): Promise<void> => {
-        const events = getPendingEventsByKinds(kinds, BATCH_SIZE);
+        const syncableKinds = batchEventKindsForSync(kinds);
+        if (syncableKinds.length === 0) {
+          return;
+        }
+        const events = getPendingEventsByKinds(syncableKinds, BATCH_SIZE);
         if (events.length === 0) {
           return;
         }

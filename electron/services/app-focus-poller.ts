@@ -1,5 +1,6 @@
 import { logger } from "../config/logger";
 import { getSessionState } from "../db/queue-repo";
+import type { SessionState } from "../db/index";
 import type { ActivityContext } from "./activity-metadata";
 import { collectActivityContext } from "./activity-metadata";
 import {
@@ -56,8 +57,8 @@ export class AppFocusPoller {
   }
 
   /** Emit remaining foreground seconds before session stop so app-time is not under-counted. */
-  async flushPending(): Promise<void> {
-    if (!getSessionState().active) {
+  async flushPending(sessionState?: SessionState): Promise<void> {
+    if (!sessionState && !getSessionState().active) {
       return;
     }
     const context = this.lastReportableContext;
@@ -69,7 +70,12 @@ export class AppFocusPoller {
     if (activeSeconds <= 0) {
       return;
     }
-    const queued = await this.emitFocusForContext(context, activeSeconds, "foreground_tick");
+    const queued = await this.emitFocusForContext(
+      context,
+      activeSeconds,
+      "foreground_tick",
+      sessionState
+    );
     if (queued) {
       this.lastEmittedAtMs = nowMs;
     }
@@ -96,16 +102,20 @@ export class AppFocusPoller {
   private async emitFocusForContext(
     context: ActivityContext,
     activeSeconds: number,
-    triggerType: "foreground_change" | "foreground_tick"
+    triggerType: "foreground_change" | "foreground_tick",
+    sessionState?: SessionState
   ): Promise<boolean> {
     const seconds = Math.max(activeSeconds, 0.001);
-    return recordAppFocusEvent({
-      activeSeconds: seconds,
-      source: "app-focus-poller",
-      triggerType,
-      context,
-      trackerElapsedMs: Math.round(seconds * 1000)
-    });
+    return recordAppFocusEvent(
+      {
+        activeSeconds: seconds,
+        source: "app-focus-poller",
+        triggerType,
+        context,
+        trackerElapsedMs: Math.round(seconds * 1000)
+      },
+      sessionState
+    );
   }
 
   private leavingAppSeconds(elapsedSeconds: number): number {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getClientIanaTimeZone } from "../config/client-timezone";
+import type { SessionState } from "../db/index";
 import { enqueueEvent, getSessionState } from "../db/queue-repo";
 import { logger } from "../config/logger";
 import { buildWorkSessionEventFields } from "./session-event-fields";
@@ -163,9 +164,12 @@ export function buildAppFocusPayload(
   };
 }
 
-export async function recordAppFocusEvent(options: RecordAppFocusOptions): Promise<boolean> {
-  const state = getSessionState();
-  if (!state.active) {
+export async function recordAppFocusEvent(
+  options: RecordAppFocusOptions,
+  sessionState?: SessionState
+): Promise<boolean> {
+  const state = sessionState ?? getSessionState();
+  if (!sessionState && !state.active) {
     return false;
   }
 

@@ -1,3 +1,6 @@
+/** Always capture once this many ms after session start (in addition to tier intervals). */
+export const SESSION_START_SCREENSHOT_DELAY_MS = 60 * 1000;
+
 /** Minutes between captures for each tier. Longer = fewer uploads + less Supabase storage. */
 export const SCREENSHOT_INTERVAL_MINUTES = {
   /** Admin-only tier (SUPER_ADMIN in web UI). */
@@ -53,17 +56,23 @@ export function initialDesignerTargetMs(): number {
   return designerIntervalMs();
 }
 
-/** Delay until the earlier of two upcoming capture targets. */
+/** Delay until the next capture target (bootstrap, superadmin, or designer — whichever is soonest). */
 export function delayMsUntilEarlierTarget(
   startedAtMs: number,
   superadminTargetMs: number,
   designerTargetMs: number,
+  bootstrapTargetMs: number | null = SESSION_START_SCREENSHOT_DELAY_MS,
   nowMs = Date.now()
 ): number {
   const elapsedMs = Math.max(0, nowMs - startedAtMs);
-  const untilSuperadmin = Math.max(0, superadminTargetMs - elapsedMs);
-  const untilDesigner = Math.max(0, designerTargetMs - elapsedMs);
-  return Math.max(250, Math.min(untilSuperadmin, untilDesigner));
+  const candidates = [
+    Math.max(0, superadminTargetMs - elapsedMs),
+    Math.max(0, designerTargetMs - elapsedMs)
+  ];
+  if (bootstrapTargetMs !== null) {
+    candidates.push(Math.max(0, bootstrapTargetMs - elapsedMs));
+  }
+  return Math.max(250, Math.min(...candidates));
 }
 
 /** Which screenshot tiers are due at elapsed session time (10-min wins on overlap). */

@@ -5,6 +5,7 @@ import {
   initialDesignerTargetMs,
   initialSuperadminTargetMs,
   schedulesDueAtElapsed,
+  SESSION_START_SCREENSHOT_DELAY_MS,
   SCREENSHOT_INTERVAL_MINUTES,
   SCREENSHOT_SCHEDULES,
   superadminIntervalMs
@@ -37,16 +38,41 @@ describe("screenshot schedules", () => {
     const startedAt = 1_000_000;
 
     expect(
-      delayMsUntilEarlierTarget(startedAt, 6 * minute, 10 * minute, startedAt)
+      delayMsUntilEarlierTarget(startedAt, 6 * minute, 10 * minute, null, startedAt)
     ).toBe(6 * minute);
 
     expect(
-      delayMsUntilEarlierTarget(startedAt, 12 * minute, 10 * minute, startedAt + 6 * minute)
+      delayMsUntilEarlierTarget(startedAt, 12 * minute, 10 * minute, null, startedAt + 6 * minute)
     ).toBe(4 * minute);
 
     expect(
-      delayMsUntilEarlierTarget(startedAt, 10 * minute, 10 * minute, startedAt + 8 * minute)
+      delayMsUntilEarlierTarget(startedAt, 10 * minute, 10 * minute, null, startedAt + 8 * minute)
     ).toBe(2 * minute);
+  });
+
+  it("schedules bootstrap capture at 1 minute when pending", () => {
+    const minute = 60 * 1000;
+    const startedAt = 1_000_000;
+
+    expect(
+      delayMsUntilEarlierTarget(
+        startedAt,
+        20 * minute,
+        30 * minute,
+        SESSION_START_SCREENSHOT_DELAY_MS,
+        startedAt
+      )
+    ).toBe(minute);
+
+    expect(
+      delayMsUntilEarlierTarget(
+        startedAt,
+        20 * minute,
+        30 * minute,
+        SESSION_START_SCREENSHOT_DELAY_MS,
+        startedAt + 30_000
+      )
+    ).toBe(30_000);
   });
 
   it("prioritizes employee-visible capture when 6m and 10m tiers overlap", () => {

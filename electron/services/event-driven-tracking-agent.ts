@@ -36,7 +36,7 @@ export class EventDrivenTrackingAgent {
     this.foregroundWatcher.start(async () => {
       await this.handleForegroundChange();
     });
-    await this.foregroundWatcher.detectChange(true);
+    void this.foregroundWatcher.detectChange(true);
 
     this.idleMonitor.start();
 

@@ -6,8 +6,12 @@ export const API_ENDPOINTS = {
   },
   tracking: {
     projects: ["/api/projects", "/projects", "/api/tracking/projects", "/tracking/projects"],
+    projectsVersion: "/api/projects/version",
+    projectsDelta: "/api/projects/delta",
     eventsIngest: ["/api/tracking/events/ingest", "/tracking/events/ingest"],
     eventsBatch: "/api/tracking/events/batch",
+    screenshotsSign: "/api/tracking/screenshots/sign",
+    screenshotsCommit: "/api/tracking/screenshots/commit",
     screenshotsIngest: ["/api/tracking/screenshots/ingest", "/tracking/screenshots/ingest"],
     sessionStart: "/api/tracking/session/start",
     sessionStop: "/api/tracking/session/stop",

@@ -4,7 +4,7 @@ import type { ScreenshotUploadInput } from "./screenshot-worker";
 
 const mocks = vi.hoisted(() => ({
   enqueueScreenshot: vi.fn(() => "queued-uuid"),
-  ingestScreenshot: vi.fn()
+  uploadScreenshot: vi.fn()
 }));
 
 vi.mock("../db/screenshot-queue", () => ({
@@ -19,11 +19,14 @@ vi.mock("../config/logger", () => ({
   }
 }));
 
+vi.mock("./screenshot-upload", () => ({
+  uploadScreenshot: mocks.uploadScreenshot
+}));
+
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return {
-    ...actual,
-    ingestScreenshot: mocks.ingestScreenshot
+    ...actual
   };
 });
 
@@ -48,14 +51,14 @@ const basePayload: ScreenshotUploadInput = {
 
 describe("uploadScreenshotOrEnqueue", () => {
   beforeEach(() => {
-    mocks.ingestScreenshot.mockReset();
+    mocks.uploadScreenshot.mockReset();
     mocks.enqueueScreenshot.mockClear();
   });
 
-  it("passes uploadUuid to live ingest on success", async () => {
-    mocks.ingestScreenshot.mockResolvedValue(undefined);
+  it("passes uploadUuid to live upload on success", async () => {
+    mocks.uploadScreenshot.mockResolvedValue({ uploadUuid: "u1", method: "direct" });
     await uploadScreenshotOrEnqueue(basePayload, {});
-    const payload = mocks.ingestScreenshot.mock.calls[0]?.[0] as {
+    const payload = mocks.uploadScreenshot.mock.calls[0]?.[0] as {
       metadata: { uploadUuid: string };
     };
     expect(typeof payload.metadata.uploadUuid).toBe("string");
@@ -63,7 +66,7 @@ describe("uploadScreenshotOrEnqueue", () => {
   });
 
   it("enqueues on network failure without throwing", async () => {
-    mocks.ingestScreenshot.mockRejectedValue(new ApiError("network", "offline"));
+    mocks.uploadScreenshot.mockRejectedValue(new ApiError("network", "offline"));
     await expect(uploadScreenshotOrEnqueue(basePayload, {})).resolves.toBeUndefined();
     expect(mocks.enqueueScreenshot).toHaveBeenCalledTimes(1);
     expect(mocks.enqueueScreenshot).toHaveBeenCalledWith(
@@ -72,7 +75,9 @@ describe("uploadScreenshotOrEnqueue", () => {
   });
 
   it("rethrows 413 so the worker can capture a smaller JPEG", async () => {
-    mocks.ingestScreenshot.mockRejectedValue(new ApiError("validation", "too large", { statusCode: 413 }));
+    mocks.uploadScreenshot.mockRejectedValue(
+      new ApiError("validation", "too large", { statusCode: 413 })
+    );
     await expect(uploadScreenshotOrEnqueue(basePayload, {})).rejects.toBeInstanceOf(ApiError);
     expect(mocks.enqueueScreenshot).not.toHaveBeenCalled();
   });

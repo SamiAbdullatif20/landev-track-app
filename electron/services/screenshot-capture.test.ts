@@ -10,7 +10,11 @@ vi.mock("electron", () => ({
     getSources: (...args: unknown[]) => mockGetSources(...args)
   },
   screen: {
-    getAllDisplays: () => mockGetAllDisplays()
+    getAllDisplays: () => mockGetAllDisplays(),
+    getPrimaryDisplay: () => ({
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      scaleFactor: 1
+    })
   }
 }));
 

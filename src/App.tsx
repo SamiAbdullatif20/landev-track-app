@@ -40,7 +40,6 @@ function App() {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(true);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [manualSyncing, setManualSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState({
     online: true,
     syncing: false,
@@ -276,8 +275,17 @@ function App() {
       setSession(next);
       if (next.active) {
         setTrackingError(null);
+        setSessionLoading(false);
+      } else {
+        setSessionLoading(false);
       }
       void loadWorkSummary({ showLoading: false });
+    });
+
+    const unsubscribeStartFailed = window.desktopAPI.onStartFailed((payload) => {
+      setTrackingError(toFriendlyMessage(payload.message));
+      pushToast("error", "Failed to start session.");
+      setSessionLoading(false);
     });
 
     const unsubscribeSync = window.desktopAPI.onSyncStatusPush((status) => {
@@ -293,6 +301,7 @@ function App() {
 
     return () => {
       unsubscribe();
+      unsubscribeStartFailed();
       unsubscribeSync();
       unsubscribeProjects();
     };
@@ -407,7 +416,6 @@ function App() {
 
       await fetchProjectsWithRetry();
       await loadWorkSummary();
-      await window.desktopAPI.syncNow();
       pushToast("success", "Logged in successfully.");
     } catch (error) {
       setAuthError(toFriendlyMessage(error));
@@ -417,30 +425,17 @@ function App() {
     }
   };
 
-  const onManualSync = async () => {
-    if (manualSyncing) return;
-    setManualSyncing(true);
-    try {
-      await window.desktopAPI.syncNow();
-      await fetchProjectsWithRetry();
-      pushToast("success", "Projects synced.");
-    } catch (error) {
-      pushToast("error", "Sync failed. Please try again.");
-    } finally {
-      setManualSyncing(false);
-    }
-  };
-
   const onLogout = async () => {
     if (authLoading) return;
     setAuthLoading(true);
     setAuthError(null);
+    resetTracking();
+    resetAuth();
+    setProjectsError(null);
+    setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
+    setPassword("");
     try {
       await window.desktopAPI.logout();
-      resetTracking();
-      resetAuth();
-      setProjectsError(null);
-      setWorkSummary({ todayTotalMs: 0, todayByProject: [], recentTasks: [] });
       pushToast("info", "Logged out.");
     } catch (error) {
       setAuthError(toFriendlyMessage(error));
@@ -520,7 +515,7 @@ function App() {
     try {
       await window.desktopAPI.stopSession({ stoppedAt: new Date().toISOString() });
       pushToast("success", "Stopped.");
-      await loadWorkSummary();
+      void loadWorkSummary();
     } catch (error) {
       const message = toFriendlyMessage(error);
       setTrackingError(message);
@@ -670,16 +665,6 @@ function App() {
                     <path d="M15.5 8.5a5 5 0 0 1 0 7" />
                   </svg>
                 </label>
-                <button
-                  type="button"
-                  className="header-action-btn header-sync-btn"
-                  disabled={manualSyncing}
-                  aria-label="Sync projects"
-                  title="Sync projects"
-                  onClick={onManualSync}
-                >
-                  {manualSyncing ? "Syncing…" : "Sync"}
-                </button>
                 <button
                   type="button"
                   className="header-action-btn header-logout-btn"

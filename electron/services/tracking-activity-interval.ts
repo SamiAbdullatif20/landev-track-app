@@ -7,6 +7,7 @@ import {
   flushActivityIntervalTracker,
   type CompletedActivityInterval
 } from "./activity-interval-tracker";
+import { QUEUE_INPUT_ACTIVITY_FOR_SYNC } from "./tracking-agent-flags";
 
 export async function recordActivityIntervalEvent(
   interval: CompletedActivityInterval
@@ -71,6 +72,14 @@ export async function recordActivityIntervalEvent(
       clientTimeZone: interval.clientTimeZone ?? getClientIanaTimeZone()
     }
   };
+
+  if (!QUEUE_INPUT_ACTIVITY_FOR_SYNC) {
+    logger.debug("activity-interval-local-only", {
+      intervalStartAt: interval.intervalStartAt,
+      queued: false
+    });
+    return false;
+  }
 
   enqueueEvent("ACTIVITY_INTERVAL", payload);
   logger.info("activity-interval", {

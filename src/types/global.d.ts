@@ -118,6 +118,7 @@ declare global {
       acceptTrackingConsent: () => Promise<{ accepted: true }>;
       syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
       onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
+      onStartFailed: (cb: (payload: { message: string }) => void) => () => void;
       onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;
     };
   }

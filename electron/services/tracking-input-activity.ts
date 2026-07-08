@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getClientIanaTimeZone } from "../config/client-timezone";
+import type { SessionState } from "../db/index";
 import { enqueueEvent, getSessionState } from "../db/queue-repo";
 import { logger } from "../config/logger";
 import { collectActivityContext } from "./activity-metadata";
@@ -23,6 +24,7 @@ import { recordActivityIntervalEvent } from "./tracking-activity-interval";
 import {
   recordInputActivityRollupSample
 } from "./input-activity-rollup";
+import { QUEUE_INPUT_ACTIVITY_FOR_SYNC } from "./tracking-agent-flags";
 
 export type InputActivitySample = {
   mouseMoveCount: number;
@@ -62,9 +64,12 @@ function shouldSkipAllZero(sample: InputActivitySample, eventKind: "INPUT_ACTIVI
   return eventKind === "INPUT_ACTIVITY";
 }
 
-export async function recordInputActivityEvent(sample: InputActivitySample): Promise<boolean> {
-  const state = getSessionState();
-  if (!state.active) {
+export async function recordInputActivityEvent(
+  sample: InputActivitySample,
+  sessionState?: SessionState
+): Promise<boolean> {
+  const state = sessionState ?? getSessionState();
+  if (!sessionState && !state.active) {
     return false;
   }
 
@@ -214,7 +219,10 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
     }
   };
 
-  enqueueEvent(eventKind, payload);
+  if (QUEUE_INPUT_ACTIVITY_FOR_SYNC) {
+    enqueueEvent(eventKind, payload);
+  }
+
   recordInputActivityRollupSample({
     endedAtMs: Date.parse(occurredAtIso),
     mouseActiveSeconds: antiCheat.validMouseSeconds,
@@ -239,10 +247,22 @@ export async function recordInputActivityEvent(sample: InputActivitySample): Pro
   const completedIntervals = ingestActivityIntervalSubsample(intervalSubsample, {
     segmentStartedAtMs: Number.isFinite(segmentStartedAtMs) ? segmentStartedAtMs : null
   });
-  for (const interval of completedIntervals) {
-    await recordActivityIntervalEvent(interval);
+  if (QUEUE_INPUT_ACTIVITY_FOR_SYNC) {
+    for (const interval of completedIntervals) {
+      await recordActivityIntervalEvent(interval);
+    }
   }
 
-  logger.info("input-activity-sample", payload);
+  if (QUEUE_INPUT_ACTIVITY_FOR_SYNC) {
+    logger.info("input-activity-sample", payload);
+  } else {
+    logger.debug("input-activity-sample-local-only", {
+      eventKind,
+      mouseMoveCount: sample.mouseMoveCount,
+      keyPressCount: sample.keyPressCount,
+      clickCount: sample.clickCount ?? 0,
+      queued: false
+    });
+  }
   return true;
 }

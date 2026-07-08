@@ -32,6 +32,7 @@ import { SyncWorker } from "../services/sync-worker";
 import { ProjectSyncService } from "../services/project-sync-service";
 import { readAuthContext, refreshAuthSession, isAuthenticated } from "../services/auth-session";
 import { saveCredentials, clearCredentials, readCredentials } from "../security/credential-store";
+import { clearApiSessionCookies } from "../security/api-session-cookies";
 import {
   clearActiveSessionOwner,
   clearCurrentAppUser,
@@ -83,18 +84,15 @@ import {
   clearActiveSessionProjectName,
   getWorkSummary,
   recordCompletedWorkSession,
-  resolveMirroredSessionStartedAt,
   setActiveSessionProjectName
 } from "../db/work-log";
 import { TrackingOverlayManager } from "../services/tracking-overlay";
-import { SessionRemoteSyncService } from "../services/session-remote-sync";
 import {
   isActiveSessionStartConflictError,
   resolveAndCloseStaleRemoteSession,
   reconcileActiveSessionStartConflict
 } from "../services/session-start-reconcile";
 import { syncPendingRemoteSessionStart } from "../services/session-remote-start-sync";
-import type { RemoteSessionStatus } from "../services/session-remote-status";
 
 let stopActiveTrackingSession: ((
   stoppedAt: string,
@@ -163,6 +161,12 @@ function sendSessionStatus(mainWindow: BrowserWindow, overlay?: TrackingOverlayM
   overlay?.syncVisibility();
 }
 
+function sendSessionStartFailed(mainWindow: BrowserWindow, message: string): void {
+  if (!mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("tracking:start-failed", { message });
+  }
+}
+
 function authContext() {
   return {
     ...readAuthContext(),
@@ -211,34 +215,6 @@ function enrichSessionStartPayload(payload: unknown): unknown {
 }
 
 
-function resolveRemoteProject(remote: RemoteSessionStatus): {
-  projectId: string;
-  projectName: string;
-  isNonChargeable: boolean;
-} | null {
-  const projectName = remote.projectName?.trim();
-  const projectId = remote.projectId?.trim();
-  if (projectId) {
-    return {
-      projectId,
-      projectName: projectName ?? projectId,
-      isNonChargeable: isCatalogProjectId(projectId) || (projectName ? isNonChargeableProjectName(projectName) : false)
-    };
-  }
-  if (projectName) {
-    const slug = projectName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-    return {
-      projectId: `catalog:${slug || "unknown"}`,
-      projectName,
-      isNonChargeable: isNonChargeableProjectName(projectName)
-    };
-  }
-  return null;
-}
-
 export function registerIpc(mainWindow: BrowserWindow): void {
   if (ipcHandlersRegistered) {
     return;
@@ -279,19 +255,19 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       }
       return fetchUserRoles(ctx);
     }
+    // Periodic sync is now cheap (version check + incremental delta), so it runs
+    // even during an active session to surface newly assigned projects quickly.
   });
 
   const startLiveSync = (): void => {
     worker.start();
-    sessionRemoteSync?.start();
+    projectSync.start();
   };
 
   const stopLiveSync = (): void => {
-    sessionRemoteSync?.stop();
+    projectSync.stop();
     worker.stop();
   };
-
-  let sessionRemoteSync: SessionRemoteSyncService | undefined;
 
   const clearedOnBoot = clearSyntheticSessionPendingEvents();
   if (clearedOnBoot > 0) {
@@ -412,7 +388,6 @@ export function registerIpc(mainWindow: BrowserWindow): void {
           sessionId: hasUsableWorkSessionId(sessionId) ? sessionId : null,
           isNonChargeable: getSetting("activeSessionIsNonChargeable") === "true"
         });
-        sessionRemoteSync?.markLocalUserAction();
         sendSessionStatus(mainWindow, trackingOverlay);
         return;
       }
@@ -564,7 +539,10 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         saveSessionCookie(result.sessionCookie);
       }
       startLiveSync();
-      void Promise.all([worker.flush(), projectSync.syncNow()]).catch((syncError) => {
+      await Promise.all([
+        worker.flush(),
+        projectSync.syncNow()
+      ]).catch((syncError) => {
         logger.warn("auth-login-post-sync-failed", { error: syncError });
       });
       const roles = result.roles.length > 0 ? result.roles : await fetchUserRoles(authContext());
@@ -575,6 +553,11 @@ export function registerIpc(mainWindow: BrowserWindow): void {
   });
 
   ipcMain.handle(IPC_CHANNELS.AUTH_STATUS, async () => {
+    if (!isAuthenticated()) {
+      stopLiveSync();
+      return { authenticated: false, roles: [] };
+    }
+
     try {
       const ctx = authContext();
       const probe = await api.probeSession(ctx);
@@ -595,6 +578,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       clearSessionCookie();
       clearCachedUserRoles();
       clearCredentials();
+      await clearApiSessionCookies();
       stopLiveSync();
       finalizeAccountLogout();
       return { authenticated: false, roles: [] };
@@ -603,53 +587,68 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.AUTH_LOGOUT, async () => {
     const stoppedAt = new Date().toISOString();
-    const savedCredentials = readCredentials();
-    if (savedCredentials) {
-      setCurrentAppUser(savedCredentials.username);
+    const sessionAtLogout = getSessionState();
+    const authAtLogout = authContext();
+
+    stopLiveSync();
+
+    try {
+      if (sessionAtLogout.active) {
+        stopTrackingCapture();
+        void trackingAgent.stop("USER");
+        finalizeLocalSessionStop(sessionAtLogout, stoppedAt, "USER");
+      } else {
+        stopTrackingCapture();
+        void trackingAgent.stop();
+        stopSessionPowerBlocker();
+        trackingOverlay.syncVisibility();
+      }
+    } catch (error) {
+      logger.warn("logout-local-stop-failed", { error });
     }
-    if (getSessionState().active) {
-      try {
-        await performSessionStop(stoppedAt);
-      } catch (error) {
-        logger.warn("stop-on-logout-failed", { error });
-        if (getSessionState().active) {
-          finalizeLocalSessionStop(getSessionState(), stoppedAt);
+
+    finalizeAccountLogout();
+    clearProjectsCache();
+    clearToken();
+    clearSessionCookie();
+    clearCachedUserRoles();
+    clearCredentials();
+    await clearApiSessionCookies();
+    notifySessionStatus();
+
+    void (async () => {
+      if (sessionAtLogout.active && (authAtLogout.token || authAtLogout.sessionCookie)) {
+        try {
+          const stopPayload = buildSessionStopInput(sessionAtLogout, stoppedAt, {
+            stopReason: "USER"
+          });
+          await api.stopSession(stopPayload, {
+            ...authAtLogout,
+            onAuthRefresh: async () => null
+          });
+        } catch (error) {
+          logger.warn("logout-remote-session-stop-failed", { error });
         }
       }
-    } else {
-      stopLiveSync();
-      screenshotWorker.stop();
-      stopSessionPowerBlocker();
-      void trackingAgent.stop();
-      inputActivitySampler.stop();
-      appFocusPoller.stop();
-      trackingOverlay.syncVisibility();
-    }
-    try {
-      await api.logout(authContext());
-    } catch (error) {
-      logger.warn("backend-logout-failed", { error });
-    } finally {
-      clearToken();
-      clearSessionCookie();
-      clearCachedUserRoles();
-      clearCredentials();
-      finalizeAccountLogout();
-      clearProjectsCache();
-      stopLiveSync();
-      notifySessionStatus();
-    }
+      try {
+        await api.logout(authAtLogout);
+      } catch (error) {
+        logger.warn("backend-logout-failed", { error });
+      }
+    })();
+
     return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.TRACKING_PROJECTS, async () => {
     try {
-      const result = await projectSync.syncNow();
+      const result = projectSync.getCached();
       logger.info("projects-role-filter", {
         roles: result.roles,
         serverCount: result.serverCount,
         localCount: result.localCount,
-        visibleCount: result.projects.length
+        visibleCount: result.projects.length,
+        source: "cache"
       });
       return { projects: result.projects, roles: result.roles };
     } catch (error) {
@@ -675,7 +674,6 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     let startTimeUtc = new Date().toISOString();
 
     const rollbackLocalStart = (): void => {
-      sessionRemoteSync?.markLocalUserAction(90_000);
       try {
         stopTrackingCapture();
         resetActiveSessionState();
@@ -743,11 +741,99 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       return { sessionId: sessionId ?? null };
     };
 
+    const finalizeSessionStartInBackground = async (
+      parsed: z.infer<typeof startSchema>,
+      clockStartUtc: string
+    ): Promise<void> => {
+      const ctx = authContext();
+      try {
+        try {
+          const closedOrphan = await resolveAndCloseStaleRemoteSession(ctx);
+          if (closedOrphan) {
+            logger.info("tracking-start-preclosed-orphan-remote-session");
+          }
+        } catch (error) {
+          logger.warn("tracking-start-preclose-orphan-failed", { error });
+        }
+
+        if (!getSessionState().active || getSessionState().startedAt !== clockStartUtc) {
+          logger.info("tracking-start-background-aborted", { reason: "session-no-longer-active" });
+          return;
+        }
+
+        await startLocalCaptureHeavy();
+
+        if (!getSessionState().active || getSessionState().startedAt !== clockStartUtc) {
+          logger.info("tracking-start-background-aborted", { reason: "stopped-during-warmup" });
+          return;
+        }
+
+        let remoteStart: { sessionId: string | null };
+        try {
+          remoteStart = await requestRemoteSessionStart(parsed, clockStartUtc);
+        } catch (error) {
+          if (isActiveSessionStartConflictError(error)) {
+            logger.warn("tracking-start-conflict-reconciling", {
+              message: error instanceof Error ? error.message : "unknown"
+            });
+            try {
+              await reconcileActiveSessionStartConflict(ctx);
+              remoteStart = await requestRemoteSessionStart(parsed, clockStartUtc);
+            } catch (retryError) {
+              if (retryError instanceof api.ApiError && retryError.kind === "network") {
+                persistStartedSession({
+                  sessionId: null,
+                  projectId: parsed.projectId,
+                  description: parsed.description,
+                  startedAt: clockStartUtc
+                });
+                logger.warn("tracking-start-remote-deferred-offline", {
+                  reason: "conflict-reconcile-offline"
+                });
+                return;
+              }
+              throw retryError;
+            }
+          } else if (error instanceof api.ApiError && error.kind === "network") {
+            persistStartedSession({
+              sessionId: null,
+              projectId: parsed.projectId,
+              description: parsed.description,
+              startedAt: clockStartUtc
+            });
+            logger.warn("tracking-start-remote-deferred-offline", {
+              message: error.message
+            });
+            return;
+          } else {
+            throw error;
+          }
+        }
+
+        if (!getSessionState().active || getSessionState().startedAt !== clockStartUtc) {
+          logger.info("tracking-start-background-aborted", { reason: "stopped-before-persist" });
+          return;
+        }
+
+        persistStartedSession({
+          sessionId: remoteStart.sessionId,
+          projectId: parsed.projectId,
+          description: parsed.description,
+          startedAt: clockStartUtc
+        });
+        sendSessionStatus(mainWindow, trackingOverlay);
+      } catch (error) {
+        logger.warn("tracking-start-background-failed", { error });
+        rollbackLocalStart();
+        sendSessionStartFailed(mainWindow, asUserError(error).message);
+      } finally {
+        sessionStartFinalizePromise = null;
+      }
+    };
+
     try {
-      sessionRemoteSync?.markLocalUserAction();
       const parsed = startSchema.parse(enrichSessionStartPayload(payload));
       const currentState = getSessionState();
-      const ctx = authContext();
 
       if (!readToken() && !readSessionCookie()) {
         throw new Error("AUTH: Not authenticated");
@@ -755,7 +841,12 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       if (getSetting("trackingConsentAccepted") !== "true") {
         throw new Error("VALIDATION: Accept tracking terms before starting.");
       }
-      if (currentState.active) throw new Error("VALIDATION: Session already running.");
+      if (currentState.active) {
+        throw new Error("VALIDATION: Session already running.");
+      }
+      if (sessionStartFinalizePromise) {
+        throw new Error("VALIDATION: Session start already in progress.");
+      }
 
       const catalogProject = isCatalogProjectId(parsed.projectId);
       logger.info("tracking-start-validated", {
@@ -765,21 +856,8 @@ export function registerIpc(mainWindow: BrowserWindow): void {
         descriptionLength: parsed.description.length
       });
       startTimeUtc = new Date().toISOString();
-      const userKey = getCurrentAppUserKey();
-      if (userKey) {
-        setActiveSessionOwnerKey(userKey);
-      }
 
-      try {
-        const closedOrphan = await resolveAndCloseStaleRemoteSession(ctx);
-        if (closedOrphan) {
-          logger.info("tracking-start-preclosed-orphan-remote-session");
-        }
-      } catch (error) {
-        logger.warn("tracking-start-preclose-orphan-failed", { error });
-      }
-
-      await startLocalCapture({
+      await startLocalCaptureFast({
         projectId: parsed.projectId,
         projectName: (parsed.projectName ?? parsed.projectId).trim(),
         description: parsed.description,
@@ -790,55 +868,10 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       localCaptureStarted = true;
       sendSessionStatus(mainWindow, trackingOverlay);
 
-      let remoteStart: { sessionId: string | null };
-      try {
-        remoteStart = await requestRemoteSessionStart(parsed, startTimeUtc);
-      } catch (error) {
-        if (isActiveSessionStartConflictError(error)) {
-          logger.warn("tracking-start-conflict-reconciling", {
-            message: error instanceof Error ? error.message : "unknown"
-          });
-          try {
-            await reconcileActiveSessionStartConflict(ctx);
-            remoteStart = await requestRemoteSessionStart(parsed, startTimeUtc);
-          } catch (retryError) {
-            if (retryError instanceof api.ApiError && retryError.kind === "network") {
-              persistStartedSession({
-                sessionId: null,
-                projectId: parsed.projectId,
-                description: parsed.description,
-                startedAt: startTimeUtc
-              });
-              logger.warn("tracking-start-remote-deferred-offline", {
-                reason: "conflict-reconcile-offline"
-              });
-              return { sessionId: null };
-            }
-            throw retryError;
-          }
-        } else if (error instanceof api.ApiError && error.kind === "network") {
-          persistStartedSession({
-            sessionId: null,
-            projectId: parsed.projectId,
-            description: parsed.description,
-            startedAt: startTimeUtc
-          });
-          logger.warn("tracking-start-remote-deferred-offline", {
-            message: error.message
-          });
-          return { sessionId: null };
-        } else {
-          throw error;
-        }
-      }
+      sessionStartFinalizePromise = finalizeSessionStartInBackground(parsed, startTimeUtc);
+      void sessionStartFinalizePromise;
 
-      persistStartedSession({
-        sessionId: remoteStart.sessionId,
-        projectId: parsed.projectId,
-        description: parsed.description,
-        startedAt: startTimeUtc
-      });
-      return { sessionId: remoteStart.sessionId };
+      return { sessionId: getSessionState().sessionId };
     } catch (error) {
       if (localCaptureStarted) {
         rollbackLocalStart();
@@ -891,7 +924,6 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     options: SessionStopOptions = {}
   ): Promise<api.SessionStopResult> => {
     const stopReason = options.stopReason ?? "USER";
-    sessionRemoteSync?.markLocalUserAction();
 
     let state = getSessionState();
 
@@ -914,30 +946,13 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       };
     }
 
-    if (!hasUsableWorkSessionId(state.sessionId)) {
-      try {
-        const resolved = await api.fetchActiveWorkSessionId(authContext());
-        if (hasUsableWorkSessionId(resolved)) {
-          saveSessionState({
-            active: state.active,
-            sessionId: resolved,
-            projectId: state.projectId,
-            description: state.description,
-            startedAt: state.startedAt
-          });
-          state = getSessionState();
-        }
-      } catch (error) {
-        logger.warn("tracking-stop-session-id-resolve-failed", { error });
-      }
-    }
-
-    const stopPayload = buildSessionStopInput(state, stoppedAt, {
+    const endState = { ...state };
+    const stopPayload = buildSessionStopInput(endState, stoppedAt, {
       stopReason
     });
 
     logger.info("tracking-stop-flow-start", {
-      localSessionId: state.sessionId,
+      localSessionId: endState.sessionId,
       stoppedAt: stopPayload.stoppedAt,
       startedAt: stopPayload.startedAt ?? null,
       durationMs: stopPayload.durationMs ?? null,
@@ -947,30 +962,40 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       stopReason
     });
 
-    // Stop locally first, then sync to the server in the background.
-    try {
-      logger.info("tracking-stop-followup", { step: "flush-and-finalize-immediately" });
-      await inputActivitySampler.flushPendingSample();
-      await appFocusPoller.flushPending();
-      await flushPendingActivityIntervals();
-      await trackingAgent.stop(stopReason);
-      stopTrackingCapture();
-      const clearedAfterStop = clearSyntheticSessionPendingEvents();
-      if (clearedAfterStop > 0) {
-        logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "after-stop" });
-      }
-    } catch (error) {
-      logger.warn("tracking-stop-local-cleanup-failed", { error });
-    } finally {
-      if (getSessionState().active) {
-        finalizeLocalSessionStop(state, stoppedAt, stopReason);
-      }
+    finalizeLocalSessionStop(endState, stoppedAt, stopReason);
+    stopTrackingCapture();
+    const clearedAfterStop = clearSyntheticSessionPendingEvents();
+    if (clearedAfterStop > 0) {
+      logger.info("queue-cleanup-synthetic-session-events", { cleared: clearedAfterStop, reason: "after-stop" });
     }
 
     const runBackgroundSync = async (): Promise<void> => {
       try {
-        logger.info("tracking-stop-followup", { step: "remote-stop-background" });
-        const stopResult = await api.stopSession(stopPayload, {
+        logger.info("tracking-stop-followup", { step: "flush-and-remote-stop-background" });
+        await Promise.allSettled([
+          inputActivitySampler.flushPendingSample(endState),
+          appFocusPoller.flushPending(endState),
+          flushPendingActivityIntervals(),
+          trackingAgent.stop(stopReason)
+        ]);
+      } catch (error) {
+        logger.warn("tracking-stop-local-cleanup-failed", { error });
+      }
+
+      try {
+        let remoteStopPayload = stopPayload;
+        if (!hasUsableWorkSessionId(remoteStopPayload.sessionId)) {
+          try {
+            const resolved = await api.fetchActiveWorkSessionId(authContext());
+            if (hasUsableWorkSessionId(resolved)) {
+              remoteStopPayload = { ...remoteStopPayload, sessionId: resolved };
+            }
+          } catch (error) {
+            logger.warn("tracking-stop-session-id-resolve-failed", { error });
+          }
+        }
+
+        const stopResult = await api.stopSession(remoteStopPayload, {
           ...authContext(),
           onAuthRefresh: refreshAuthSession
         });
@@ -997,7 +1022,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
       endpointPath: "/api/tracking/session/stop",
       status: null,
       confirmedBy: "idempotent" as const,
-      sessionId: state.sessionId,
+      sessionId: endState.sessionId,
       timesheetId: null,
       responsePreview: null
     };
@@ -1005,7 +1030,7 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   stopActiveTrackingSession = (stoppedAt) => performSessionStop(stoppedAt);
 
-  const startLocalCapture = async (input: {
+  const startLocalCaptureFast = async (input: {
     projectId: string;
     projectName: string;
     description: string;
@@ -1030,12 +1055,10 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     clearInputActivityRollup();
     clearActivityIntervalTracker();
     startSessionPowerBlocker();
-    await resetAndWarmUpWindowsProbes();
     await screenshotWorker.start({
       projectId: isCatalogProjectId(input.projectId) ? null : input.projectId,
       sessionId: input.sessionId
     });
-    await trackingAgent.start();
     inputActivitySampler.start();
     appFocusPoller.start();
     setActiveSessionProjectName(input.projectName);
@@ -1043,67 +1066,24 @@ export function registerIpc(mainWindow: BrowserWindow): void {
     void worker.flush();
   };
 
-  sessionRemoteSync = new SessionRemoteSyncService(mainWindow, {
-    getLocalState: () => {
-      const state = normalizeSessionState();
-      return {
-        active: state.active,
-        sessionId: state.sessionId,
-        startedAt: state.startedAt
-      };
-    },
-    mirrorStart: async (remote) => {
-      if (getSessionState().active) {
-        return;
-      }
-      if (getSetting("trackingConsentAccepted") !== "true") {
-        return;
-      }
-      const project = resolveRemoteProject(remote);
-      if (!project) {
-        logger.warn("session-remote-sync-mirror-start-skipped", { reason: "missing-project" });
-        return;
-      }
-      const mirrorNowMs = Date.now();
-      const startedAt = resolveMirroredSessionStartedAt(
-        remote.startedAt ?? new Date(mirrorNowMs).toISOString(),
-        project.projectId,
-        mirrorNowMs
-      );
-      await startLocalCapture({
-        projectId: project.projectId,
-        projectName: project.projectName,
-        description: remote.description?.trim() || "Web session",
-        startedAt,
-        sessionId: hasUsableWorkSessionId(remote.sessionId) ? remote.sessionId : null,
-        isNonChargeable: project.isNonChargeable
-      });
-    },
-    updateSessionId: (sessionId) => {
-      const state = getSessionState();
-      if (!state.active || !hasUsableWorkSessionId(sessionId)) {
-        return;
-      }
-      saveSessionState({
-        active: state.active,
-        sessionId,
-        projectId: state.projectId,
-        description: state.description,
-        startedAt: state.startedAt
-      });
-      const backfilledEvents = backfillWorkSessionIdOnPendingEvents(sessionId);
-      const backfilledScreenshots = backfillWorkSessionIdOnPendingScreenshots(sessionId);
-      if (backfilledEvents > 0 || backfilledScreenshots > 0) {
-        logger.info("pending-work-session-backfill", {
-          sessionId,
-          backfilledEvents,
-          backfilledScreenshots
-        });
-      }
-      void worker.flush();
-    },
-    notifyStatus: notifySessionStatus
-  });
+  const startLocalCaptureHeavy = async (): Promise<void> => {
+    void resetAndWarmUpWindowsProbes();
+    await trackingAgent.start();
+  };
+
+  const startLocalCapture = async (input: {
+    projectId: string;
+    projectName: string;
+    description: string;
+    startedAt: string;
+    sessionId: string | null;
+    isNonChargeable: boolean;
+  }): Promise<void> => {
+    await startLocalCaptureFast(input);
+    await startLocalCaptureHeavy();
+  };
+
+  let sessionStartFinalizePromise: Promise<void> | null = null;
 
   if (isAuthenticated()) {
     startLiveSync();
@@ -1126,9 +1106,9 @@ export function registerIpc(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.SYNC_NOW, async () => {
     try {
-      await projectSync.syncNow();
+      const projectResult = await projectSync.syncNow();
       const status = await worker.flush();
-      return { ok: true, status };
+      return { ok: true, status, projectsSkipped: projectResult.skipped === true };
     } catch (error) {
       logger.error("sync-now-failed", { error });
       throw asUserError(error);

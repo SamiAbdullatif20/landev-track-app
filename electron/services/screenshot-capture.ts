@@ -150,10 +150,20 @@ function encodeSourceToJpeg(
 }
 
 async function getScreenSources(size: { width: number; height: number }): Promise<DesktopCapturerSource[]> {
+  const primary = screen.getPrimaryDisplay();
+  const scaleFactor = primary.scaleFactor > 0 ? primary.scaleFactor : 1;
+  const physicalWidth = Math.max(1, Math.round(primary.bounds.width * scaleFactor));
+  const physicalHeight = Math.max(1, Math.round(primary.bounds.height * scaleFactor));
+  const targetWidth = Math.min(size.width, SCREENSHOT_CAPTURE_MAX_WIDTH);
+  const targetHeight = Math.max(
+    1,
+    Math.round(physicalHeight * (targetWidth / physicalWidth))
+  );
+
   return withSilentWindowsCapture(() =>
     desktopCapturer.getSources({
       types: ["screen"],
-      thumbnailSize: { width: size.width, height: size.height },
+      thumbnailSize: { width: targetWidth, height: targetHeight },
       fetchWindowIcons: false
     })
   );

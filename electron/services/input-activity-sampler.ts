@@ -1,5 +1,6 @@
-import { logger } from "../config/logger";
+import type { SessionState } from "../db/index";
 import { getSessionState } from "../db/queue-repo";
+import { logger } from "../config/logger";
 import { InputActivityCounter } from "./input-activity-counter";
 import {
   computeClickActivityPercent,
@@ -81,11 +82,11 @@ export class InputActivitySampler {
   }
 
   /** Emit a final partial sample so stop/auto-stop does not drop the current window. */
-  async flushPendingSample(): Promise<void> {
+  async flushPendingSample(sessionState?: SessionState): Promise<void> {
     if (!this.sampleTimer) {
       return;
     }
-    await this.emitSample("session_end");
+    await this.emitSample("session_end", sessionState);
   }
 
   private isRunActive(runId: number): boolean {
@@ -137,15 +138,19 @@ export class InputActivitySampler {
     this.counter.ingest(snapshot);
   }
 
-  private async emitSample(triggerType: string): Promise<void> {
+  private async emitSample(triggerType: string, sessionState?: SessionState): Promise<void> {
     const runId = this.runGeneration;
-    if (!this.isRunActive(runId)) {
+    if (!sessionState && !this.isRunActive(runId)) {
       return;
     }
 
-    await this.pollOnce();
-    if (!this.isRunActive(runId)) {
-      return;
+    if (!sessionState) {
+      await this.pollOnce();
+      if (!this.isRunActive(runId)) {
+        return;
+      }
+    } else {
+      await this.pollOnce().catch(() => undefined);
     }
 
     const drained = this.counter.drain();
@@ -205,26 +210,29 @@ export class InputActivitySampler {
       Date.now()
     );
 
-    await recordInputActivityEvent({
-      mouseMoveCount: drained.mouseMoveCount,
-      keyPressCount: drained.keyPressCount,
-      clickCount: drained.clickCount,
-      scrollCount: drained.scrollCount,
-      activeSeconds,
-      idleSeconds,
-      trackerElapsedMs: windowMs,
-      totalSamples,
-      mouseMoveSamples,
-      mouseMovePercent,
-      mouseActiveSeconds,
-      clickActivityPercent,
-      clickActiveSeconds,
-      clickSamples,
-      pollTravelPx,
-      validEngagedSeconds,
-      fullEngagementPolls: engagedFromPolls.fullEngagementPolls,
-      microEngagementPolls: engagedFromPolls.microEngagementPolls,
-      triggerType
-    });
+    await recordInputActivityEvent(
+      {
+        mouseMoveCount: drained.mouseMoveCount,
+        keyPressCount: drained.keyPressCount,
+        clickCount: drained.clickCount,
+        scrollCount: drained.scrollCount,
+        activeSeconds,
+        idleSeconds,
+        trackerElapsedMs: windowMs,
+        totalSamples,
+        mouseMoveSamples,
+        mouseMovePercent,
+        mouseActiveSeconds,
+        clickActivityPercent,
+        clickActiveSeconds,
+        clickSamples,
+        pollTravelPx,
+        validEngagedSeconds,
+        fullEngagementPolls: engagedFromPolls.fullEngagementPolls,
+        microEngagementPolls: engagedFromPolls.microEngagementPolls,
+        triggerType
+      },
+      sessionState
+    );
   }
 }

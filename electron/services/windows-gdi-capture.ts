@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { screen } from "electron";
 import { promisify } from "node:util";
 import { logger } from "../config/logger";
 
@@ -6,8 +7,8 @@ const execFileAsync = promisify(execFile);
 
 const CAPTURE_TIMEOUT_MS = 12_000;
 
-/** Max width of the intermediate full-screen bitmap (caps RAM in the helper process). */
-const GDI_INTERMEDIATE_MAX_WIDTH = 1600;
+/** Cap intermediate full-frame bitmap width (RAM in the helper process). */
+const MAX_PHYSICAL_CAPTURE_WIDTH = 5120;
 
 export type GdiJpegCapture = {
   buffer: Buffer;
@@ -16,31 +17,97 @@ export type GdiJpegCapture = {
   quality: number;
 };
 
-function buildCaptureScript(maxWidth: number, jpegQuality: number): string {
+export type PrimaryCaptureGeometry = {
+  sourceX: number;
+  sourceY: number;
+  physicalWidth: number;
+  physicalHeight: number;
+  outputWidth: number;
+  outputHeight: number;
+  scaleFactor: number;
+};
+
+/**
+ * Map the primary display's logical bounds to physical pixels for GDI capture.
+ * WinForms Screen.Bounds is logical on scaled displays; CopyFromScreen uses physical pixels.
+ */
+export function computePrimaryCaptureGeometry(
+  maxOutputWidth: number,
+  display: Pick<Electron.Display, "bounds" | "scaleFactor"> = screen.getPrimaryDisplay()
+): PrimaryCaptureGeometry {
+  const scaleFactor = display.scaleFactor > 0 ? display.scaleFactor : 1;
+  const { bounds } = display;
+
+  let physicalWidth = Math.max(1, Math.round(bounds.width * scaleFactor));
+  let physicalHeight = Math.max(1, Math.round(bounds.height * scaleFactor));
+  const sourceX = Math.round(bounds.x * scaleFactor);
+  const sourceY = Math.round(bounds.y * scaleFactor);
+
+  if (physicalWidth > MAX_PHYSICAL_CAPTURE_WIDTH) {
+    physicalHeight = Math.max(1, Math.round(physicalHeight * (MAX_PHYSICAL_CAPTURE_WIDTH / physicalWidth)));
+    physicalWidth = MAX_PHYSICAL_CAPTURE_WIDTH;
+  }
+
+  const outputWidth = Math.max(1, Math.min(maxOutputWidth, physicalWidth));
+  const outputHeight = Math.max(
+    1,
+    Math.round(physicalHeight * (outputWidth / physicalWidth))
+  );
+
+  return {
+    sourceX,
+    sourceY,
+    physicalWidth,
+    physicalHeight,
+    outputWidth,
+    outputHeight,
+    scaleFactor
+  };
+}
+
+function buildCaptureScript(
+  maxOutputWidth: number,
+  jpegQuality: number,
+  geometry: PrimaryCaptureGeometry
+): string {
   const quality = Math.min(100, Math.max(30, Math.round(jpegQuality)));
-  const capMaxW = GDI_INTERMEDIATE_MAX_WIDTH;
+  const maxW = Math.max(160, Math.round(maxOutputWidth));
+
   return `
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-$screen = [Windows.Forms.Screen]::PrimaryScreen
-if ($null -eq $screen) { exit 2 }
-$bounds = $screen.Bounds
-$maxW = ${Math.max(160, Math.round(maxWidth))}
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class LandevDpi {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+"@
+[void][LandevDpi]::SetProcessDPIAware()
+
+$srcX = ${geometry.sourceX}
+$srcY = ${geometry.sourceY}
+$physW = ${geometry.physicalWidth}
+$physH = ${geometry.physicalHeight}
+$tw = ${geometry.outputWidth}
+$th = ${geometry.outputHeight}
+$maxW = ${maxW}
 $quality = ${quality}
-$capW = [Math]::Min($bounds.Width, ${capMaxW})
-$capH = [int][Math]::Max(1, [Math]::Round($bounds.Height * ($capW / [double]$bounds.Width)))
-$tw = [int][Math]::Min($maxW, $capW)
-$th = [int][Math]::Max(1, [Math]::Round($capH * ($tw / [double]$capW)))
-$full = New-Object Drawing.Bitmap $capW, $capH
+if ($tw -gt $maxW) {
+  $th = [int][Math]::Max(1, [Math]::Round($th * ($maxW / [double]$tw)))
+  $tw = $maxW
+}
+
+$full = New-Object Drawing.Bitmap $physW, $physH
 try {
   $fg = [Drawing.Graphics]::FromImage($full)
-  $fg.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, (New-Object Drawing.Size $capW, $capH), [Drawing.CopyPixelOperation]::SourceCopy)
+  $fg.CopyFromScreen($srcX, $srcY, 0, 0, (New-Object Drawing.Size $physW, $physH), [Drawing.CopyPixelOperation]::SourceCopy)
   $fg.Dispose()
   $scaled = New-Object Drawing.Bitmap $tw, $th
   try {
     $sg = [Drawing.Graphics]::FromImage($scaled)
-    $sg.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::Low
+    $sg.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
     $sg.CompositingQuality = [Drawing.Drawing2D.CompositingQuality]::HighSpeed
     $sg.DrawImage($full, 0, 0, $tw, $th)
     $sg.Dispose()
@@ -70,12 +137,14 @@ try {
  * Avoids Electron desktopCapturer, which can spike Chromium RAM by 1+ GB on multi-monitor setups.
  */
 export async function capturePrimaryScreenGdiJpeg(
-  maxWidth: number,
+  maxOutputWidth: number,
   jpegQuality: number
 ): Promise<GdiJpegCapture | null> {
   if (process.platform !== "win32") {
     return null;
   }
+
+  const geometry = computePrimaryCaptureGeometry(maxOutputWidth);
 
   try {
     const { stdout } = await execFileAsync(
@@ -86,7 +155,7 @@ export async function capturePrimaryScreenGdiJpeg(
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        buildCaptureScript(maxWidth, jpegQuality)
+        buildCaptureScript(maxOutputWidth, jpegQuality, geometry)
       ],
       {
         windowsHide: true,
@@ -120,6 +189,15 @@ export async function capturePrimaryScreenGdiJpeg(
     }
 
     const quality = Math.min(100, Math.max(30, Math.round(jpegQuality)));
+    logger.debug("screenshot-gdi-capture-ok", {
+      width,
+      height,
+      bytes: buffer.length,
+      scaleFactor: geometry.scaleFactor,
+      physicalWidth: geometry.physicalWidth,
+      physicalHeight: geometry.physicalHeight
+    });
+
     return {
       buffer,
       width,
@@ -128,7 +206,10 @@ export async function capturePrimaryScreenGdiJpeg(
     };
   } catch (error) {
     logger.warn("screenshot-gdi-capture-failed", {
-      error: error instanceof Error ? error.message : "unknown"
+      error: error instanceof Error ? error.message : "unknown",
+      scaleFactor: geometry.scaleFactor,
+      physicalWidth: geometry.physicalWidth,
+      physicalHeight: geometry.physicalHeight
     });
     return null;
   }

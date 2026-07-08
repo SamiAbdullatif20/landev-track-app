@@ -8,6 +8,8 @@ import {
   type QueuedScreenshotRow
 } from "../db/screenshot-queue";
 import { logger } from "../config/logger";
+import { isAuthenticated } from "./auth-session";
+import { uploadScreenshot, isBackendAuthForbidden } from "./screenshot-upload";
 import fs from "node:fs";
 
 function rowToIngestInput(row: QueuedScreenshotRow): api.ScreenshotIngestInput | null {
@@ -37,6 +39,10 @@ export async function flushScreenshotQueue(
   options: api.AuthAwareRequestOptions,
   limit = 10
 ): Promise<{ uploaded: number; failed: number }> {
+  if (!isAuthenticated()) {
+    return { uploaded: 0, failed: 0 };
+  }
+
   const pending = getPendingScreenshots(limit);
   if (pending.length === 0) {
     return { uploaded: 0, failed: 0 };
@@ -60,7 +66,7 @@ export async function flushScreenshotQueue(
     }
 
     try {
-      await api.ingestScreenshot(payload, options);
+      await uploadScreenshot(payload, options);
       markScreenshotDelivered(row.id, row.filePath);
       uploaded += 1;
       logger.info("screenshot-queue-uploaded", {
@@ -69,11 +75,21 @@ export async function flushScreenshotQueue(
       });
     } catch (error) {
       failed += 1;
+      if (isBackendAuthForbidden(error) && row.attempts + 1 >= 3) {
+        quarantineScreenshot(row.id, row.filePath, "auth_forbidden");
+        logger.warn("screenshot-queue-quarantined-auth", {
+          uploadUuid: row.uploadUuid,
+          attempts: row.attempts + 1,
+          error: error instanceof Error ? error.message : "unknown"
+        });
+        continue;
+      }
       const nextRetryAt = markScreenshotForRetry(row.id, row.attempts + 1);
       logger.warn("screenshot-queue-upload-failed", {
         uploadUuid: row.uploadUuid,
         attempts: row.attempts + 1,
         nextRetryAt,
+        status: error instanceof api.ApiError ? error.statusCode : undefined,
         error: error instanceof Error ? error.message : "unknown"
       });
     }

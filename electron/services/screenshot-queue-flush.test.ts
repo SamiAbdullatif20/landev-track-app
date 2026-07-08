@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   markScreenshotDelivered: vi.fn(),
   markScreenshotForRetry: vi.fn(() => "2026-06-02T12:00:00.000Z"),
   quarantineScreenshot: vi.fn(),
-  ingestScreenshot: vi.fn()
+  uploadScreenshot: vi.fn()
 }));
 
 vi.mock("../db/screenshot-queue", () => ({
@@ -33,11 +33,22 @@ vi.mock("node:fs", () => ({
   }
 }));
 
+vi.mock("./auth-session", () => ({
+  isAuthenticated: () => true
+}));
+
+vi.mock("./screenshot-upload", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./screenshot-upload")>();
+  return {
+    ...actual,
+    uploadScreenshot: mocks.uploadScreenshot
+  };
+});
+
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return {
-    ...actual,
-    ingestScreenshot: mocks.ingestScreenshot
+    ...actual
   };
 });
 
@@ -63,7 +74,7 @@ function queuedRow(overrides: Partial<QueuedScreenshotRow> = {}): QueuedScreensh
 
 describe("flushScreenshotQueue", () => {
   beforeEach(() => {
-    mocks.ingestScreenshot.mockReset();
+    mocks.uploadScreenshot.mockReset();
     mocks.getPendingScreenshots.mockReset();
     mocks.markScreenshotDelivered.mockReset();
     mocks.markScreenshotForRetry.mockReset();
@@ -72,22 +83,35 @@ describe("flushScreenshotQueue", () => {
 
   it("uploads pending screenshots oldest-first and clears the queue", async () => {
     mocks.getPendingScreenshots.mockReturnValue([queuedRow()]);
-    mocks.ingestScreenshot.mockResolvedValue(undefined);
+    mocks.uploadScreenshot.mockResolvedValue({ uploadUuid: "shot-1", method: "multipart" });
 
     const result = await flushScreenshotQueue({}, 5);
 
     expect(result).toEqual({ uploaded: 1, failed: 0 });
-    expect(mocks.ingestScreenshot).toHaveBeenCalledTimes(1);
-    const payload = mocks.ingestScreenshot.mock.calls[0]?.[0] as {
+    expect(mocks.uploadScreenshot).toHaveBeenCalledTimes(1);
+    const payload = mocks.uploadScreenshot.mock.calls[0]?.[0] as {
       metadata: { uploadUuid: string };
     };
     expect(payload.metadata.uploadUuid).toBe("shot-1");
     expect(mocks.markScreenshotDelivered).toHaveBeenCalledWith(1, "C:\\tmp\\shot-1.jpg");
   });
 
+  it("quarantines after repeated backend auth failures", async () => {
+    mocks.getPendingScreenshots.mockReturnValue([queuedRow({ attempts: 2 })]);
+    mocks.uploadScreenshot.mockRejectedValue(
+      new ApiError("auth", "forbidden", { statusCode: 403 })
+    );
+
+    const result = await flushScreenshotQueue({}, 5);
+
+    expect(result).toEqual({ uploaded: 0, failed: 1 });
+    expect(mocks.quarantineScreenshot).toHaveBeenCalledWith(1, "C:\\tmp\\shot-1.jpg", "auth_forbidden");
+    expect(mocks.markScreenshotForRetry).not.toHaveBeenCalled();
+  });
+
   it("keeps failed uploads pending with retry status", async () => {
     mocks.getPendingScreenshots.mockReturnValue([queuedRow({ uploadUuid: "shot-fail" })]);
-    mocks.ingestScreenshot.mockRejectedValue(new ApiError("network", "offline"));
+    mocks.uploadScreenshot.mockRejectedValue(new ApiError("network", "offline"));
 
     const result = await flushScreenshotQueue({}, 5);
 

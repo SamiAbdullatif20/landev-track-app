@@ -1,0 +1,121 @@
+TASK FOR THE WEB / BACKEND TEAM
+================================
+Add an incremental "projects delta" endpoint so the desktop tracker can pick up
+newly assigned projects within minutes WITHOUT re-downloading the entire project
+list. This pairs with the existing GET /api/projects/version fingerprint.
+
+BACKGROUND
+----------
+The desktop already polls GET /api/projects/version (tiny count+hash) to detect
+whether anything about the user's visible project set changed. Today, when the
+fingerprint changes, the only way for the desktop to learn WHAT changed is to
+re-run the full paginated GET /api/projects (up to 200/page). For users with many
+projects that is slow and heavy, so the desktop used to defer it for up to 24h —
+which meant a newly assigned project could take a long time to appear.
+
+The desktop now polls every 3 minutes. To keep that cheap, it wants to fetch only
+the projects that changed since its last sync and merge them into its local cache.
+
+GOAL
+----
+Give the desktop a way to ask "which of my visible projects changed since <time>?"
+and get back just the added/updated projects (plus any removed ids), so it can add
+the new project(s) without reloading everything.
+
+
+WHAT TO BUILD
+-------------
+New endpoint:
+
+    GET /api/projects/delta?since=<ISO-8601 timestamp>
+
+Query params:
+  - since (required): ISO-8601 UTC timestamp. Return every visible project whose
+    server-side updatedAt (created OR modified OR (un)assigned) is strictly AFTER
+    this time. The desktop passes the timestamp of its last successful sync.
+  - limit (optional): page size, default 200. Support the SAME cursor pagination
+    shape as GET /api/projects (nextCursor / pagination.nextCursor). Most delta
+    responses will be a single page.
+  - cursor (optional): pagination cursor, same semantics as GET /api/projects.
+
+Auth: identical to GET /api/projects (same session cookie / bearer token / role
+scoping). MUST be scoped to the SAME visible set the user would get from
+GET /api/projects.
+
+Response (200), JSON:
+
+    {
+      "projects": [ /* full project objects, SAME shape as GET /api/projects */ ],
+      "removedIds": ["<projectId>", ...],   // projects unassigned/deleted since `since`
+      "serverCount": 42,                     // total visible project count for this user (all, not just the delta)
+      "nextCursor": null                     // or a cursor string if more pages
+    }
+
+FIELD NOTES
+-----------
+  - "projects": each item must be the SAME representation as GET /api/projects
+    (id, name, projectNumber, projectAddress, clientName, chargeable flag, etc.),
+    so the desktop can drop them straight into its cache. Include a project here
+    if it was newly assigned, renamed, or had any displayed field change after
+    `since`.
+  - "removedIds": ids of projects that WERE visible but no longer are (unassigned
+    or deleted) after `since`. The desktop deletes these from its local cache.
+    Aliases accepted by the desktop: removedIds | removed_ids | removed |
+    deletedIds | deleted_ids | unassignedIds. Prefer "removedIds".
+  - "serverCount": the CURRENT total number of visible projects for this user
+    (the same number GET /api/projects/version returns as "count"). This is
+    critical: the desktop only trusts the incremental merge if, after applying the
+    delta, its local count equals serverCount. If they differ it falls back to a
+    full GET /api/projects to re-reconcile. Aliases accepted: serverCount |
+    totalCount | total | count. Prefer "serverCount".
+
+This endpoint must be cheap: an indexed query filtered by updatedAt > since,
+scoped to the user's visible set. For removals you can query an assignment/audit
+table for unassign/delete events after `since`; if that is hard, returning an
+empty removedIds is acceptable as long as serverCount is correct (a count
+mismatch simply triggers a one-time full fetch on the desktop, which self-heals).
+
+
+DESKTOP BEHAVIOR AFTER THIS SHIPS (for context)
+-----------------------------------------------
+  Every ~3 minutes (and on login / manual refresh), the desktop:
+    1. Calls GET /api/projects/version. If the fingerprint is unchanged => stop
+       (no delta call). Common case, near-zero cost.
+    2. If the fingerprint CHANGED => calls
+       GET /api/projects/delta?since=<lastSyncTime>.
+    3. Upserts the returned "projects" and deletes "removedIds" from its local
+       cache (it does NOT wipe untouched rows).
+    4. If localCount after merge == serverCount => done (fast path, new project
+       shown immediately, no full fetch).
+    5. If they differ, or the delta endpoint returns 404 => it falls back to the
+       full GET /api/projects to reconcile.
+
+
+BACKWARD COMPATIBILITY
+----------------------
+  - Do NOT change or remove GET /api/projects; it stays the source of truth for
+    the full list and the reconciliation fallback.
+  - If GET /api/projects/delta returns 404 / not implemented, the desktop falls
+    back to a full GET /api/projects when the version fingerprint changes. So this
+    can ship independently; the desktop already handles both cases.
+  - Requires GET /api/projects/version to be present (already specified in
+    WEB_PROJECTS_VERSION_SYNC_PROMPT.txt). The delta endpoint is only consulted
+    after the version fingerprint indicates a change.
+
+
+ACCEPTANCE TESTS
+----------------
+  1. With `since` before an assignment: the newly assigned project appears in
+     "projects" and serverCount reflects the new total.
+  2. With `since` = "now" (no changes since): "projects" is empty, "removedIds"
+     is empty, serverCount equals the user's current visible count.
+  3. Unassigning/deleting a visible project: its id appears in "removedIds" and
+     serverCount decreases.
+  4. Renaming a visible project: it appears in "projects" (updated fields),
+     serverCount unchanged.
+  5. Two different users get only their own visible deltas (no leakage).
+  6. Enforces the same auth as GET /api/projects (401/403 when unauthenticated).
+  7. Pagination: when more than `limit` projects changed, nextCursor is returned
+     and following it yields the rest; serverCount is consistent across pages.
+  8. Objects in "projects" are byte-for-byte compatible with GET /api/projects
+     items (same field names/shapes) so the desktop can cache them directly.

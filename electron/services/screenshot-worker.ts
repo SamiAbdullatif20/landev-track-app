@@ -10,6 +10,7 @@ import {
   initialSuperadminTargetMs,
   scheduleForVisibility,
   schedulesDueAtElapsed,
+  SESSION_START_SCREENSHOT_DELAY_MS,
   superadminIntervalMs,
   type ScreenshotSchedule
 } from "./screenshot-schedules";
@@ -59,6 +60,8 @@ export type ScreenshotUploadInput = {
     activitySampleCount?: number;
     /** Stable id for server-side dedup on retry / offline queue flush. */
     uploadUuid?: string;
+    /** One-time capture at session start (see SESSION_START_SCREENSHOT_DELAY_MS). */
+    sessionBootstrap?: boolean;
   };
 };
 
@@ -76,14 +79,24 @@ type ScreenshotWorkerOptions = {
 /** Skip screenshots once the user has been idle this long (no monitoring value, saves storage). */
 export const SCREENSHOT_IDLE_SKIP_MS = 5 * 60_000;
 
+/** Retry session-start bootstrap when capture/upload is skipped or fails. */
+export const SCREENSHOT_BOOTSTRAP_RETRY_MS = 15_000;
+export const SCREENSHOT_BOOTSTRAP_MAX_ATTEMPTS = 6;
+
 type DueScheduleCapture = {
   schedule: ScreenshotSchedule;
   cadenceTargetMs: number;
+  /** Bypass idle skip (session-start bootstrap capture). */
+  bypassIdleSkip?: boolean;
+  /** Bypass non-interference guard (session-start bootstrap capture). */
+  bypassCaptureGuard?: boolean;
+  sessionBootstrap?: boolean;
 };
 
 /**
- * Two tiers on independent intervals (see SCREENSHOT_INTERVAL_MINUTES).
- * One timer schedules the earlier of the two next targets.
+ * Two tiers on independent intervals (see SCREENSHOT_INTERVAL_MINUTES),
+ * plus a one-time capture SESSION_START_SCREENSHOT_DELAY_MS after start.
+ * One timer schedules whichever target is soonest.
  */
 export class ScreenshotWorker {
   private readonly uploadScreenshot: (payload: ScreenshotUploadInput) => Promise<void>;
@@ -96,6 +109,8 @@ export class ScreenshotWorker {
   private startedAtMs = 0;
   private nextSuperadminTargetMs = initialSuperadminTargetMs();
   private nextDesignerTargetMs = initialDesignerTargetMs();
+  private bootstrapCaptured = false;
+  private bootstrapAttemptCount = 0;
 
   constructor(options: ScreenshotWorkerOptions) {
     this.uploadScreenshot = options.uploadScreenshot;
@@ -110,8 +125,11 @@ export class ScreenshotWorker {
     this.startedAtMs = Date.now();
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
+    this.bootstrapCaptured = false;
+    this.bootstrapAttemptCount = 0;
     this.scheduleNextCapture();
     logger.info("screenshot-cadence-started", {
+      bootstrapAfterMinutes: SESSION_START_SCREENSHOT_DELAY_MS / 60_000,
       superadminEveryMinutes: superadminIntervalMs() / 60_000,
       designerEveryMinutes: designerIntervalMs() / 60_000,
       firstSuperadminTargetMs: this.nextSuperadminTargetMs,
@@ -126,6 +144,8 @@ export class ScreenshotWorker {
     this.clearScheduledCapture();
     this.nextSuperadminTargetMs = initialSuperadminTargetMs();
     this.nextDesignerTargetMs = initialDesignerTargetMs();
+    this.bootstrapCaptured = false;
+    this.bootstrapAttemptCount = 0;
     logger.info("screenshot-worker-stopped");
   }
 
@@ -180,10 +200,12 @@ export class ScreenshotWorker {
     }
 
     this.clearScheduledCapture();
+    const bootstrapTargetMs = this.bootstrapCaptured ? null : SESSION_START_SCREENSHOT_DELAY_MS;
     const delayMs = delayMsUntilEarlierTarget(
       this.startedAtMs,
       this.nextSuperadminTargetMs,
-      this.nextDesignerTargetMs
+      this.nextDesignerTargetMs,
+      bootstrapTargetMs
     );
 
     this.timeoutHandle = setTimeout(() => {
@@ -192,6 +214,7 @@ export class ScreenshotWorker {
 
     logger.info("screenshot-cadence-tick-scheduled", {
       delayMs,
+      bootstrapPending: !this.bootstrapCaptured,
       nextSuperadminTargetMs: this.nextSuperadminTargetMs,
       nextDesignerTargetMs: this.nextDesignerTargetMs,
       elapsedMs: Date.now() - this.startedAtMs
@@ -211,6 +234,64 @@ export class ScreenshotWorker {
 
     const elapsedMs = Date.now() - this.startedAtMs;
     const toleranceMs = 500;
+    const bootstrapDue =
+      !this.bootstrapCaptured
+      && elapsedMs + toleranceMs >= SESSION_START_SCREENSHOT_DELAY_MS;
+
+    if (bootstrapDue) {
+      const schedule = scheduleForVisibility("admin_and_employee");
+      if (schedule) {
+        let uploaded = false;
+        try {
+          uploaded = await this.captureAndUploadSchedules([
+            {
+              schedule,
+              cadenceTargetMs: SESSION_START_SCREENSHOT_DELAY_MS,
+              bypassIdleSkip: true,
+              bypassCaptureGuard: true,
+              sessionBootstrap: true
+            }
+          ]);
+        } catch (error) {
+          logger.warn("screenshot-bootstrap-capture-failed", {
+            attempt: this.bootstrapAttemptCount + 1,
+            error: error instanceof Error ? error.message : "unknown"
+          });
+        }
+
+        if (uploaded) {
+          this.bootstrapCaptured = true;
+          this.bootstrapAttemptCount = 0;
+          logger.info("screenshot-bootstrap-uploaded");
+        } else if (this.bootstrapAttemptCount + 1 >= SCREENSHOT_BOOTSTRAP_MAX_ATTEMPTS) {
+          logger.warn("screenshot-bootstrap-gave-up", {
+            attempts: this.bootstrapAttemptCount + 1
+          });
+          this.bootstrapCaptured = true;
+          this.bootstrapAttemptCount = 0;
+        } else {
+          this.bootstrapAttemptCount += 1;
+          this.clearScheduledCapture();
+          this.timeoutHandle = setTimeout(() => {
+            void this.runScheduledCaptures();
+          }, SCREENSHOT_BOOTSTRAP_RETRY_MS);
+          logger.info("screenshot-bootstrap-retry-scheduled", {
+            attempt: this.bootstrapAttemptCount,
+            retryMs: SCREENSHOT_BOOTSTRAP_RETRY_MS
+          });
+          return;
+        }
+      } else {
+        this.bootstrapCaptured = true;
+        this.bootstrapAttemptCount = 0;
+      }
+
+      if (this.running) {
+        this.scheduleNextCapture();
+      }
+      return;
+    }
+
     const superadminDue = elapsedMs + toleranceMs >= this.nextSuperadminTargetMs;
     const designerDue = elapsedMs + toleranceMs >= this.nextDesignerTargetMs;
     const overlapBothDue = superadminDue && designerDue;
@@ -255,39 +336,43 @@ export class ScreenshotWorker {
     }
   }
 
-  private async captureAndUploadSchedules(dueCaptures: DueScheduleCapture[]): Promise<void> {
+  private async captureAndUploadSchedules(dueCaptures: DueScheduleCapture[]): Promise<boolean> {
     if (!this.running || dueCaptures.length === 0) {
-      return;
+      return false;
     }
 
     if (this.captureInFlight) {
       logger.info("screenshot-skip-capture-in-flight", {
         scheduleCount: dueCaptures.length
       });
-      return;
+      return false;
     }
 
     this.captureInFlight = true;
     try {
+      const bypassIdleSkip = dueCaptures.some((entry) => entry.bypassIdleSkip);
+      const bypassCaptureGuard = dueCaptures.some((entry) => entry.bypassCaptureGuard);
       const idleMs = this.getSystemIdleMs();
-      if (idleMs >= SCREENSHOT_IDLE_SKIP_MS) {
+      if (!bypassIdleSkip && idleMs >= SCREENSHOT_IDLE_SKIP_MS) {
         logger.info("screenshot-skipped-user-idle", {
           scheduleCount: dueCaptures.length,
           idleMs,
           thresholdMs: SCREENSHOT_IDLE_SKIP_MS
         });
-        return;
+        return false;
       }
 
-      const guard = await shouldSkipScreenshotCapture();
-      if (guard.shouldSkipCapture) {
-        logger.info("screenshot-skipped-non-interference-guard", {
-          scheduleCount: dueCaptures.length,
-          reason: guard.reason,
-          processName: guard.processName,
-          windowTitle: guard.windowTitle
-        });
-        return;
+      if (!bypassCaptureGuard) {
+        const guard = await shouldSkipScreenshotCapture();
+        if (guard.shouldSkipCapture) {
+          logger.info("screenshot-skipped-non-interference-guard", {
+            scheduleCount: dueCaptures.length,
+            reason: guard.reason,
+            processName: guard.processName,
+            windowTitle: guard.windowTitle
+          });
+          return false;
+        }
       }
 
       let capture: ScreenCaptureJpegResult | null = null;
@@ -304,8 +389,10 @@ export class ScreenshotWorker {
         try {
           const liveContext = this.resolveLiveContext();
           for (const entry of dueCaptures) {
-            const { schedule, cadenceTargetMs } = entry;
-            const periodMs = schedule.intervalMinutes * 60 * 1000;
+            const { schedule, cadenceTargetMs, sessionBootstrap } = entry;
+            const periodMs = sessionBootstrap
+              ? SESSION_START_SCREENSHOT_DELAY_MS
+              : schedule.intervalMinutes * 60 * 1000;
             const periodMouse = getMouseStatsForPeriod(captureMs, periodMs);
             const imageBytes = capture.buffer;
 
@@ -324,6 +411,13 @@ export class ScreenshotWorker {
                 visibility: schedule.visibility,
                 visibleToRoles: [...schedule.visibleToRoles],
                 cadenceTargetMs,
+                ...(sessionBootstrap
+                  ? {
+                      sessionBootstrap: true,
+                      capturePhase: "session_bootstrap",
+                      bootstrapDelayMs: SESSION_START_SCREENSHOT_DELAY_MS
+                    }
+                  : {}),
                 mouseMovePercent: periodMouse.mouseMovePercent,
                 mouseActiveSeconds: periodMouse.mouseActiveSeconds,
                 activityPeriodSeconds: periodMouse.activityPeriodSeconds,
@@ -344,6 +438,7 @@ export class ScreenshotWorker {
               visibility: schedule.visibility,
               intervalMinutes: schedule.intervalMinutes,
               cadenceTargetMs,
+              sessionBootstrap: Boolean(sessionBootstrap),
               periodMousePercent: periodMouse.mouseMovePercent,
               periodMouseSeconds: periodMouse.mouseActiveSeconds,
               projectId: liveContext.projectId,
@@ -359,7 +454,7 @@ export class ScreenshotWorker {
 
           capture = null;
           this.onUploadComplete?.();
-          return;
+          return true;
         } catch (error) {
           const status = (error as { response?: { status?: number } }).response?.status;
           if (status === 413) {
@@ -378,6 +473,7 @@ export class ScreenshotWorker {
       logger.warn("screenshot-skipped-capture-failed", {
         scheduleCount: dueCaptures.length
       });
+      return false;
     } finally {
       this.captureInFlight = false;
       void trimWorkingSetAfterHeavyWork();
@@ -385,7 +481,7 @@ export class ScreenshotWorker {
   }
 
   /** @internal Test hook for single-schedule capture. */
-  async captureAndUpload(schedule: ScreenshotSchedule, cadenceTargetMs: number): Promise<void> {
-    await this.captureAndUploadSchedules([{ schedule, cadenceTargetMs }]);
+  async captureAndUpload(schedule: ScreenshotSchedule, cadenceTargetMs: number): Promise<boolean> {
+    return this.captureAndUploadSchedules([{ schedule, cadenceTargetMs }]);
   }
 }
