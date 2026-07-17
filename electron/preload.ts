@@ -1,174 +1,83 @@
 import { contextBridge, ipcRenderer } from "electron";
 import { IPC_CHANNELS } from "./ipc/channels";
 
-type TrackingStatus = {
-  active: boolean;
-  sessionId: string | null;
-  projectId: string | null;
-  description: string | null;
-  startedAt: string | null;
+type UserProfile = {
+  id: string | null;
+  name: string;
+  username: string;
+  email: string | null;
+  roles: string[];
 };
 
 type Project = {
   id: string;
   name: string;
+  displayLabel: string;
+  searchLabel: string;
+  projectNumber: string | null;
+  projectAddress: string | null;
+  clientName: string | null;
 };
 
-type RecentWorkTask = {
-  projectId: string;
-  projectName: string;
-  description: string;
-  isNonChargeable: boolean;
-  lastUsedAt: string;
-};
-
-type ProjectDayTotal = {
-  projectId: string;
-  projectName: string;
-  totalMs: number;
-  lastDescription: string;
-};
-
-type WorkSummary = {
-  todayTotalMs: number;
-  todayByProject: ProjectDayTotal[];
-  recentTasks: RecentWorkTask[];
-};
-
-type SyncStatus = {
-  online: boolean;
-  syncing: boolean;
-  pendingCount: number;
-  nextRetryAt: string | null;
-  lastError: string | null;
-  lastSyncAt: string | null;
-};
-
-type AppInfo = {
-  appName: string;
-  appVersion: string;
-  electronVersion: string;
-  nodeVersion: string;
-  platform: string;
-  arch: string;
-  env: string;
-  apiBaseUrl: string;
-};
-
-type StopSessionResult = {
-  ok: true;
-  queued: boolean;
-  endpointPath: string;
-  status: number | null;
-  confirmedBy: "tracking" | "attendance" | "idempotent";
+type TrackingStatus = {
+  active: boolean;
   sessionId: string | null;
-  timesheetId: string | null;
-  responsePreview: string | null;
-};
-
-type AppUpdateStatus =
-  | { phase: "idle" }
-  | { phase: "checking" }
-  | { phase: "available"; version: string; currentVersion: string }
-  | {
-      phase: "downloading";
-      percent: number;
-      version: string;
-      transferred: number;
-      total: number;
-      bytesPerSecond: number;
-    }
-  | { phase: "ready"; version: string }
-  | { phase: "error"; message: string; version: string | null };
-
-type TrackingDebugSnapshot = {
-  counters: {
-    totalCaptured: number;
-    totalSynced: number;
-    missingWindowTitleCount: number;
-    fallbackAppNameCount: number;
-    normalizedAppNameCount: number;
-  };
-  lastSync: {
-    ok: boolean;
-    statusCode: number | null;
-    message: string;
-    at: string | null;
-  };
-  events: Array<{
-    capturedAt: string;
-    eventId: string;
-    eventType: string;
-    rawApplication: string;
-    rawWindowTitle: string;
-    processName: string;
-    application: string;
-    hasWindowTitle: boolean;
-    hasForegroundWindowHandle: boolean;
-    source: string;
-    windowReasonCode: string | null;
-  }>;
+  projectId: string | null;
+  projectName: string | null;
+  description: string;
+  draftDescription: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  todayCompletedMs: number;
+  appsUsed: Array<{ displayName: string; processName: string | null; seconds: number }>;
+  status: "idle" | "tracking" | "starting" | "stopping";
 };
 
 contextBridge.exposeInMainWorld("desktopAPI", {
-  login: (payload: { username: string; password: string }) => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGIN, payload) as Promise<{ ok: true; roles: string[] }>,
-  authStatus: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_STATUS) as Promise<{ authenticated: boolean; roles: string[] }>,
-  logout: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGOUT),
-  getAppInfo: () => ipcRenderer.invoke(IPC_CHANNELS.APP_INFO) as Promise<AppInfo>,
-  openExternalUrl: (url: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.APP_OPEN_EXTERNAL, url) as Promise<{ ok: true }>,
-  testConnection: () => ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{ reachable: boolean; message: string }>,
+  login: (payload: { username: string; password: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGIN, payload) as Promise<{
+      ok: true;
+      profile: UserProfile;
+      tracking: TrackingStatus;
+    }>,
+  logout: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGOUT) as Promise<{ ok: true }>,
+  authStatus: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.AUTH_STATUS) as Promise<{
+      authenticated: boolean;
+      profile: UserProfile | null;
+      tracking: TrackingStatus;
+    }>,
+  testConnection: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.CONNECTION_TEST) as Promise<{
+      reachable: boolean;
+      message: string;
+    }>,
+  getAppInfo: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.APP_INFO) as Promise<{
+      appName: string;
+      appVersion: string;
+      env: string;
+      apiBaseUrl: string;
+    }>,
   getProjects: () =>
-    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_PROJECTS) as Promise<{ projects: Project[]; roles: string[] }>,
-  getRecentTasks: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_RECENT_TASKS) as Promise<RecentWorkTask[]>,
-  getWorkSummary: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_WORK_SUMMARY) as Promise<WorkSummary>,
-  startSession: (payload: {
-    projectId: string;
-    projectName?: string;
-    isNonChargeable?: boolean;
-    description: string;
-  }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_START, payload) as Promise<{ sessionId: string | null }>,
-  stopSession: (payload: { stoppedAt: string }) => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STOP, payload) as Promise<StopSessionResult>,
-  trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_EVENT, payload),
-  getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_STATUS) as Promise<TrackingStatus>,
-  getSyncStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_SYNC_STATUS) as Promise<SyncStatus>,
-  getTrackingDebugEvents: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_DEBUG_LAST_EVENTS) as Promise<TrackingDebugSnapshot>,
-  getTrackingConsentStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_STATUS) as Promise<{ accepted: boolean }>,
-  acceptTrackingConsent: () => ipcRenderer.invoke(IPC_CHANNELS.TRACKING_CONSENT_ACCEPT) as Promise<{ accepted: true }>,
-  syncNow: () => ipcRenderer.invoke(IPC_CHANNELS.SYNC_NOW),
-  getNotificationSoundEnabled: () =>
-    ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_GET) as Promise<{ enabled: boolean }>,
-  setNotificationSoundEnabled: (enabled: boolean) =>
-    ipcRenderer.invoke(IPC_CHANNELS.NOTIFICATION_SOUND_ENABLED_SET, enabled) as Promise<{ enabled: boolean }>,
-  getAppUpdateStatus: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_STATUS) as Promise<AppUpdateStatus>,
-  checkForAppUpdates: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_CHECK) as Promise<AppUpdateStatus>,
-  retryAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_RETRY) as Promise<AppUpdateStatus>,
-  downloadAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_DOWNLOAD) as Promise<AppUpdateStatus>,
-  installAppUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_UPDATE_INSTALL) as Promise<{ ok: true }>,
-  onAppUpdateStatusPush: (cb: (status: AppUpdateStatus) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: AppUpdateStatus) => cb(payload);
-    ipcRenderer.on("app:update-status-push", listener);
-    return () => ipcRenderer.removeListener("app:update-status-push", listener);
-  },
-  onStatusPush: (cb: (status: TrackingStatus) => void) => {
+    ipcRenderer.invoke(IPC_CHANNELS.PROJECTS_LIST) as Promise<{ projects: Project[] }>,
+  getTrackingStatus: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_STATUS) as Promise<TrackingStatus>,
+  startTracking: (payload: { projectId: string; projectName: string; description: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_START, payload) as Promise<TrackingStatus>,
+  stopTracking: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_STOP) as Promise<TrackingStatus>,
+  saveDescription: (description: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRACKING_SAVE_DESCRIPTION, { description }) as Promise<{
+      ok: true;
+    }>,
+  getRecentProjects: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.RECENT_PROJECTS) as Promise<{
+      projects: Array<{ projectId: string; projectName: string; lastWorkedAt: string }>;
+    }>,
+  onTrackingStatus: (cb: (status: TrackingStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: TrackingStatus) => cb(payload);
-    ipcRenderer.on("tracking:status-push", listener);
-    return () => ipcRenderer.removeListener("tracking:status-push", listener);
-  },
-  onStartFailed: (cb: (payload: { message: string }) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: { message: string }) => cb(payload);
-    ipcRenderer.on("tracking:start-failed", listener);
-    return () => ipcRenderer.removeListener("tracking:start-failed", listener);
-  },
-  onSyncStatusPush: (cb: (status: SyncStatus) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: SyncStatus) => cb(payload);
-    ipcRenderer.on("tracking:sync-status-push", listener);
-    return () => ipcRenderer.removeListener("tracking:sync-status-push", listener);
-  },
-  onProjectsPush: (cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: { projects: Project[]; roles: string[]; fetchedAt: string }) =>
-      cb(payload);
-    ipcRenderer.on("tracking:projects-push", listener);
-    return () => ipcRenderer.removeListener("tracking:projects-push", listener);
+    ipcRenderer.on("tracking:status", listener);
+    return () => ipcRenderer.removeListener("tracking:status", listener);
   }
 });

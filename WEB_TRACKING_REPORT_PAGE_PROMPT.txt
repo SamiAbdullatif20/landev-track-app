@@ -1,0 +1,183 @@
+Copy everything below into your **Landev web / Next.js** Cursor chat.
+**Attach the design screenshot/image** of the tracking report page UI you want (the desktop tracker owner will provide it in the same message).
+
+---
+
+# Task: Build / update the Tracking Report page to match the attached design + desktop tracker data
+
+You are working in the **Landev web app** (Next.js), **not** the Electron desktop repo.
+
+The **LANDEV Tracker desktop app** already sends sessions and screenshots to this backend. Build (or rewrite) an admin/employee **Tracking Report** page so it:
+
+1. **Looks like the attached image** (layout, hierarchy, spacing, typography, colors — match that mock as closely as the existing design system allows).
+2. **Uses real desktop-synced data** from the database / existing tracking APIs.
+3. Shows **wall-clock worked time only** (start → stop). Do **not** gate or reduce time using activity %, engagement, idle scores, or anti-cheat.
+
+**Do not change the Electron desktop app in this task — web/backend + report UI only.**
+
+---
+
+## Visual brief (use the attached image as source of truth)
+
+Match the attached UI for:
+
+- Page chrome / header / filters (user, date, role visibility as shown)
+- Primary **total time worked** display for the selected day
+- Session / project / description structure
+- Screenshot timeline or gallery (if present in the image)
+- Empty and loading states consistent with the mock
+- Compact, modern, production-ready look — avoid inventing a different dashboard layout
+
+If something is ambiguous between the image and this prompt, **prefer the image for layout** and **this prompt for data rules**.
+
+---
+
+## Product rules (must match desktop)
+
+### Time
+- **Duration = `stoppedAt − startedAt`** (UTC timestamps), clamped ≥ 0.
+- Prefer stored `durationMs` when it matches timestamp math within **1 second**.
+- Day total = **sum of all WorkSession segments** for `userId + workDateKey` (local calendar day in `clientTimeZone` / stored `workDateKey`).
+- Live open session (no `stoppedAt`): include `now − startedAt` for that day’s portion only.
+- **Never** subtract idle / inactivity / activity threshold from report totals.
+
+### Projects
+- Show `projectName` / display label from the session.
+- Support catalog/admin names like `Admin - New Task` (may be non-chargeable).
+- Aggregate time **per project** for the day when the design shows a project breakdown (same project → sum durations).
+
+### Sessions
+- Multiple Start/Stop cycles in one day = **multiple segments**. Report must list **all**, not only the latest.
+- Each row should show at least: project, description, start time, stop time, duration.
+
+### Screenshots
+Desktop upload path is **direct to Supabase storage**, not Vercel multipart:
+
+1. `POST /api/tracking/screenshots/sign` — JSON only → signed Supabase URL  
+2. Desktop `PUT`s JPEG bytes **directly to Supabase**  
+3. `POST /api/tracking/screenshots/commit` — JSON metadata → DB row  
+
+Report UI must:
+
+- Load screenshots linked by `userId + workDateKey` and/or `workSessionId` / `sessionId`
+- Show all screenshots for the **selected day** (all segments), not only the active/latest session
+- Use signed **read** URLs from storage (or existing screenshot list API) — do **not** re-upload through Vercel
+- Cadence context (informational): first capture ~**1 minute** after session start, then every **~20 minutes** until stop
+- Deduplicate by `uploadUuid` if present
+
+### Apps used (if shown in the design)
+- `APP_FOCUS` / apps-used is **evidence only** — never modify duration totals.
+
+---
+
+## Suggested page behavior
+
+| Control | Behavior |
+|--------|----------|
+| User picker | Moderators/admins: filter by employee. Designers: usually self only. Super admin: all. |
+| Date picker | Select `workDateKey` (YYYY-MM-DD in employee timezone). Default = today. |
+| Total | Large “Worked today / Worked this day” clock = sum of segment durations (+ live if open). |
+| Session list | Chronological segments for that day. |
+| Screenshots | Grid/timeline under sessions or day (match attached image). |
+| Refresh | Soft refresh or poll while viewing “today” so live open session totals update. |
+
+Respect existing **roles/permissions**. Do not invent a separate auth system.
+
+---
+
+## Data / API expectations (implement or wire what already exists)
+
+Audit the codebase and use existing routes when present. Ensure the report can load:
+
+### Session list for a day
+Example shape (adapt to your schemas):
+
+```http
+GET /api/tracking/report?userId=…&workDateKey=2026-07-15
+```
+
+or equivalent report/timesheet endpoint that returns:
+
+```json
+{
+  "workDateKey": "2026-07-15",
+  "timezone": "Europe/Istanbul",
+  "totalDurationMs": 12600000,
+  "sessions": [
+    {
+      "id": "clx…",
+      "projectId": "…",
+      "projectName": "Admin - New Task",
+      "description": "…",
+      "startedAt": "2026-07-15T08:01:00.000Z",
+      "stoppedAt": "2026-07-15T10:15:00.000Z",
+      "durationMs": 8040000,
+      "isNonChargeable": true
+    }
+  ],
+  "byProject": [
+    {
+      "projectId": "…",
+      "projectName": "Admin - New Task",
+      "totalDurationMs": 8040000
+    }
+  ],
+  "screenshots": [
+    {
+      "id": "…",
+      "uploadUuid": "…",
+      "workSessionId": "clx…",
+      "capturedAt": "2026-07-15T08:02:00.000Z",
+      "url": "https://…supabase…/signed-read-url",
+      "path": "…"
+    }
+  ]
+}
+```
+
+### Desktop ingest that must already persist correctly
+- `POST /api/tracking/session/start`
+- `POST /api/tracking/session/stop` (with `durationMs`, `startedAt`, `stoppedAt`)
+- `POST /api/tracking/screenshots/sign`
+- `POST /api/tracking/screenshots/commit`
+
+If report queries only the **latest** `workSessionId`, fix them to aggregate **all sessions for the day**.
+
+---
+
+## Implementation checklist
+
+1. Audit current tracking report / timesheet / admin session pages.
+2. Build or restyle the page to match the **attached image**.
+3. Wire day total, sessions, project aggregation, screenshots from DB/API.
+4. Enforce wall-clock duration rules (remove activity gating from this page’s totals).
+5. Role-aware access (designer vs moderator vs super admin).
+6. Loading / empty / error states.
+7. Mobile/desktop responsive enough for admin use.
+8. Brief note of files changed + how to test.
+
+---
+
+## Acceptance tests
+
+- [ ] UI closely matches the attached design image.
+- [ ] Employee with 3 Start/Stop cycles same day → report shows **3 segments** and correct **sum** total.
+- [ ] Total equals sum of `(stoppedAt − startedAt)` for completed segments (+ live open segment if any).
+- [ ] Screenshots from desktop (sign → Supabase → commit) appear for the day, across all segments.
+- [ ] Duplicate `uploadUuid` does not create duplicate tiles.
+- [ ] Changing date/user updates totals, sessions, and screenshots.
+- [ ] Designer cannot see other users’ reports unless your product rules already allow it.
+- [ ] Non-chargeable admin projects (e.g. `Admin - New Task`) display correctly.
+- [ ] No dependence on Vercel multipart screenshot ingest for display.
+
+---
+
+## Out of scope
+
+- Changing the Electron desktop tracker
+- Reintroducing activity-score-based time reductions on this report
+- Uploading screenshot bytes through Vercel again
+
+---
+
+**Start by:** locating the existing report/timesheet routes and components, then implement the page to match the attached image using day-aggregated session + screenshot data as defined above.

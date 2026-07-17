@@ -1,0 +1,203 @@
+Copy everything below into your **Landev web / Next.js** Cursor chat.
+Attach any report UI screenshot if you want the page layout matched.
+
+---
+
+# Task: Support desktop tracker apps-used + day report data (latest desktop update)
+
+You are working in the **Landev web app** (Next.js), **not** the Electron desktop repo.
+
+The **LANDEV Tracker** desktop app was rebuilt and just gained **Apps used** capture (LogWork-style). Update the web backend + tracking report page so apps used from desktop appear correctly for each employee/day.
+
+**Do not change the Electron desktop app in this task — web/backend + report UI only.**
+
+---
+
+## What desktop now does (source of truth)
+
+### Session timing (unchanged)
+- Start / Stop wall-clock sessions
+- Day total = sum of `(stoppedAt − startedAt)` for all segments that day
+- No activity-score deductions on duration
+
+### Screenshots (unchanged)
+1. `POST /api/tracking/screenshots/sign` — JSON only  
+2. Desktop uploads JPEG **directly to Supabase** (not Vercel multipart)  
+3. `POST /api/tracking/screenshots/commit` — JSON metadata → DB row  
+- First shot ~**1 min** after start, then every **~20 min**
+
+### Apps used (NEW — just added on desktop)
+While a session is **active**, desktop:
+
+- Samples foreground Windows app every **~3 seconds**
+- Emits **`APP_FOCUS`** events on app change, or every **~15 seconds** while the same app stays focused
+- Filters out shell noise client-side: `powershell`, `pwsh`, `cmd`, `conhost`, `wt`, `openconsole`
+- Shows a local **“Apps used today”** list (display name + time)
+- Queues events offline and syncs via batch ingest
+- Sends friendly names when possible (e.g. Google Chrome, AutoCAD, Zoom, Teams, VS Code)
+
+---
+
+## Batch ingest contract
+
+### `POST /api/tracking/events/batch`
+
+Body:
+
+```json
+{
+  "events": [
+    {
+      "eventUuid": "uuid",
+      "eventKind": "APP_FOCUS",
+      "type": "APP_FOCUS",
+      "occurredAt": "2026-07-15T12:34:56.000Z",
+      "occurredAtIso": "2026-07-15T12:34:56.000Z",
+      "workDateKey": "2026-07-15",
+      "clientTimeZone": "Europe/Istanbul",
+      "projectId": "…",
+      "workSessionId": "clx…",
+      "sessionId": "clx…",
+      "sessionSegmentStartedAt": "2026-07-15T08:00:00.000Z",
+      "appName": "Google Chrome",
+      "applicationDisplayName": "Google Chrome",
+      "application": "chrome",
+      "processName": "chrome.exe",
+      "windowTitle": "Document - Google Chrome",
+      "activeSeconds": 15,
+      "idleSeconds": 0,
+      "metadata": {
+        "application": "chrome",
+        "applicationDisplayName": "Google Chrome",
+        "processName": "chrome.exe",
+        "windowTitle": "Document - Google Chrome",
+        "activeSeconds": 15,
+        "idleSeconds": 0,
+        "source": "landev-tracker-v2"
+      }
+    }
+  ]
+}
+```
+
+### Web MUST
+- Accept `{ events: [...] }` and return **200**
+- Idempotent on **`eventUuid`** (retries safe)
+- Persist full payload / metadata JSON (don’t strip unknown keys)
+- If `workSessionId` is briefly missing (offline start), resolve active session server-side — **do not drop** the event
+- Stopping a session must **never delete** APP_FOCUS rows or screenshots
+
+---
+
+## Tracking report: Apps used panel
+
+For selected `userId` + `workDateKey`:
+
+1. Load **all** `APP_FOCUS` events for that employee/day across **all** `workSessionId`s (multi start/stop same day = append, don’t replace).
+2. Aggregate:
+
+```ts
+function aggregateAppsUsed(events) {
+  const byName = new Map();
+  for (const e of events) {
+    if (e.eventKind !== "APP_FOCUS") continue;
+    const name =
+      e.applicationDisplayName ??
+      e.appName ??
+      (e.processName ? String(e.processName).replace(/\.exe$/i, "") : null) ??
+      "Unknown";
+    const key = String(name).trim();
+    if (!key) continue;
+    const lower = key.toLowerCase();
+    if (["powershell", "pwsh", "cmd", "conhost", "wt", "openconsole"].includes(lower)) continue;
+    byName.set(key, (byName.get(key) ?? 0) + Number(e.activeSeconds ?? 0));
+  }
+  return [...byName.entries()]
+    .map(([name, seconds]) => ({
+      name,
+      seconds,
+      formatted: formatDuration(seconds) // e.g. "47m" or "1:12:05"
+    }))
+    .filter((row) => row.seconds >= 1)
+    .sort((a, b) => b.seconds - a.seconds);
+}
+```
+
+3. UI (LogWork-like list):
+
+```
+Apps used
+Google Chrome     0:22:10
+AutoCAD           0:47:03
+Zoom              0:15:40
+```
+
+Rules:
+- Prefer **`applicationDisplayName` / `appName`** for labels (not raw slug alone)
+- Minutes/time = **SUM(`activeSeconds`)** — not session wall-clock by itself
+- Apps used is **evidence**; it must **not** change paid/tracked day total
+- Day total remains wall-clock WorkSession sum only
+
+---
+
+## Suggested report API shape
+
+```json
+{
+  "workDateKey": "2026-07-15",
+  "timezone": "Europe/Istanbul",
+  "totalDurationMs": 12600000,
+  "sessions": [
+    {
+      "id": "clx…",
+      "projectName": "Admin - New Task",
+      "description": "…",
+      "startedAt": "…",
+      "stoppedAt": "…",
+      "durationMs": 8040000
+    }
+  ],
+  "byProject": [
+    { "projectId": "…", "projectName": "Admin - New Task", "totalDurationMs": 8040000 }
+  ],
+  "appsUsed": [
+    { "name": "Google Chrome", "seconds": 1330, "formatted": "0:22:10" },
+    { "name": "AutoCAD", "seconds": 2823, "formatted": "0:47:03" }
+  ],
+  "screenshots": [
+    {
+      "id": "…",
+      "uploadUuid": "…",
+      "workSessionId": "clx…",
+      "capturedAt": "…",
+      "url": "https://…supabase…/signed-read-url"
+    }
+  ]
+}
+```
+
+Wire this into the tracking report page (match attached image if provided).
+
+---
+
+## Acceptance tests
+
+- [ ] Desktop session using Chrome + AutoCAD + Zoom → report shows **all three** with time > 0
+- [ ] Two Start/Stop cycles same day → apps times **accumulate**, not reset
+- [ ] No `powershell` / `cmd` rows in apps list
+- [ ] Duplicate `eventUuid` retry does not double-count
+- [ ] `POST /api/tracking/events/batch` with APP_FOCUS payload → **200**
+- [ ] Day total still = wall-clock sessions only (apps used does not alter it)
+- [ ] Screenshots still load via Supabase read URLs (no Vercel multipart required)
+
+---
+
+## Out of scope
+
+- Changing the Electron desktop tracker
+- Reintroducing activity-score time gating
+- Uploading screenshot bytes through Vercel
+
+---
+
+**Start by:** locating `events/batch` ingest + tracking report aggregation, then persist/display `APP_FOCUS` as above and expose `appsUsed` on the report page.

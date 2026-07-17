@@ -1,0 +1,135 @@
+TASK FOR THE WEB / BACKEND TEAM
+================================
+Fix session start/stop consistency and duration math so web reports/timesheets match
+the desktop tracker exactly.
+
+This is the FINAL source-of-truth contract for session timing.
+
+
+GOAL
+----
+Use only session lifecycle timestamps (start + stop) as the authoritative basis
+for tracked time. Remove legacy activity-based deductions and percentage gates.
+Keep only these tracking features:
+  1) Start/stop session
+  2) Duration between start and stop
+  3) Apps used
+  4) Screenshots
+
+Everything else related to activity scoring must be removed from web computation.
+
+
+REQUIRED BEHAVIOR
+-----------------
+1) INSTANT START / STOP VISIBILITY
+   - When desktop calls session start endpoint, web should create/mark active session
+     immediately and reflect it in live UI/status APIs.
+   - When desktop calls session stop endpoint, web should close the active session
+     immediately and reflect stopped state in live UI/status APIs.
+   - Do not wait for any activity events, screenshot ingest, or secondary jobs
+     before changing active/stopped state.
+
+2) AUTHORITATIVE DURATION
+   - Session duration = stopTimeUtc - startTimeUtc (wall clock only).
+   - Clamp to >= 0.
+   - Store in milliseconds as canonical numeric value (and derived seconds if needed).
+   - Reports and timesheets must read this canonical duration.
+
+3) REMOVE ACTIVITY-BASED TIME LOGIC
+   Remove/disable any logic that affects payable/worked duration using:
+   - activity score / efficiency / engagement percent
+   - minimum activity thresholds (e.g. <= X% do not count time)
+   - anti-cheat reductions
+   - idle pair deductions
+   - heartbeat/input-activity derived time
+   - meeting-attributed override/deductions
+
+   These may remain as historical fields for compatibility only, but MUST NOT
+   change duration totals in reports/timesheets/live totals.
+
+4) APPS USED + SCREENSHOTS ONLY AS EVIDENCE
+   - Keep APP_FOCUS (apps used) and screenshot records as supporting evidence.
+   - They are informational and must NOT modify duration totals.
+
+5) ZOOM / TEAMS / MEETING APPS
+   - Meeting apps are normal apps in app-usage timelines.
+   - Time while a session is active counts normally regardless of meeting app focus.
+
+
+DESKTOP/WEB CONTRACT (MUST FOLLOW)
+----------------------------------
+Treat desktop payload as source of truth for lifecycle:
+
+- Session start request includes:
+  - projectId
+  - description/workDetails
+  - clientTimeZone
+  - startTimeUtc
+
+- Session stop request includes:
+  - sessionId (or resolved active session id)
+  - stoppedAt
+  - startedAt (if present)
+  - durationMs (desktop-calculated wall-clock)
+
+Web implementation rule:
+- Prefer server-computed duration from persisted start/stop timestamps.
+- Accept desktop durationMs as compatible input; if both exist, they must match
+  within a small tolerance (<= 1 second).
+- If mismatch is above tolerance, log anomaly and use server timestamp math.
+
+
+DATA MODEL + API EXPECTATIONS
+-----------------------------
+1) Active session status endpoint
+   - Returns active flag + active session id + startedAt + project + description
+   - Must update immediately after start/stop writes.
+
+2) Session start endpoint
+   - Idempotent by user + currently active session constraints.
+   - If a stale active session exists, resolve deterministically (close old session
+     or reject with explicit conflict contract used by desktop).
+
+3) Session stop endpoint
+   - Idempotent for repeated stop calls.
+   - Always returns final stored session duration and stop timestamp.
+
+4) Reports/timesheets queries
+   - Use canonical session table durations from start/stop, not activity tables.
+   - Aggregate by date range using exact overlap/splitting rules currently used,
+     but duration unit must come from session lifecycle only.
+
+
+MIGRATION / CLEANUP
+-------------------
+- Keep old activity tables/events only if needed for backward compatibility.
+- Remove them from duration aggregation SQL/services.
+- Remove or disable feature flags/cron jobs that recalculate time from activity.
+- Remove UI labels that imply activity gating affects counted time.
+
+
+ACCEPTANCE TESTS (MANDATORY)
+----------------------------
+1) Start appears in active-session API/UI immediately after start request success.
+2) Stop appears in active-session API/UI immediately after stop request success.
+3) For a 10-minute session, reports/timesheets show 10 minutes (+/- 1 second max).
+4) For a 30-second session, reports/timesheets still show ~30 seconds (not dropped).
+5) No percentage threshold can reduce a short/low-activity session duration.
+6) Zoom/Teams foreground during active session does not reduce duration.
+7) APP_FOCUS and screenshots still ingest/display normally.
+8) Repeated start/stop retries are idempotent (no duplicate sessions, no double count).
+
+
+NON-GOALS
+---------
+- Do not reintroduce engagement scoring into payable duration logic.
+- Do not block session state transitions on screenshot or app-event upload success.
+
+
+DELIVERABLE
+-----------
+After implementation, provide:
+- list of changed web files/services
+- SQL/query changes proving duration source is session lifecycle only
+- before/after sample for one user-day showing totals now match desktop
+- confirmation that activity gating is removed from time counting

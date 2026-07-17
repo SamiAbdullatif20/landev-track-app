@@ -1,16 +1,14 @@
-import { app, BrowserWindow, desktopCapturer, nativeImage, session } from "electron";
+import { app, BrowserWindow, nativeImage } from "electron";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
-import { registerIpc, stopActiveSessionIfRunning } from "./ipc/handlers";
-import { releaseNativeImage } from "./utils/native-image";
-import { logger } from "./config/logger";
 import dotenv from "dotenv";
-import { setupCrashAndDiagnostics } from "./services/diagnostics";
-import { setupAutoUpdate } from "./services/auto-update";
-import { refreshWindowsShortcuts } from "./services/windows-shortcut-icon";
+import { registerIpc } from "./ipc/handlers";
+import { logger } from "./config/logger";
 import { readEnv } from "./config/env";
 import { applyPackagedEnvDefaults } from "./config/packaged-defaults";
+import { setupCrashAndDiagnostics } from "./services/diagnostics";
+import { startAutoUpdater } from "./services/auto-update";
 
 function loadEnvFiles(): void {
   const envProfile = process.env.VITE_APP_ENV ?? (app.isPackaged ? "prod" : "development");
@@ -21,9 +19,8 @@ function loadEnvFiles(): void {
     path.join(app.getAppPath(), ".env"),
     path.join(process.cwd(), profileFile),
     path.join(process.resourcesPath, profileFile),
-    path.join(app.getAppPath(), profileFile),
+    path.join(app.getAppPath(), profileFile)
   ];
-
   for (const envPath of candidates) {
     if (!fs.existsSync(envPath)) continue;
     dotenv.config({ path: envPath, override: true });
@@ -33,118 +30,57 @@ function loadEnvFiles(): void {
 
 loadEnvFiles();
 
-if (app.isPackaged) {
-  app.commandLine.appendSwitch("disable-http-cache");
-  app.commandLine.appendSwitch("disk-cache-size", "2097152");
-  app.commandLine.appendSwitch("js-flags", "--max-old-space-size=256 --expose-gc");
-  app.commandLine.appendSwitch("disable-features", "SpareRendererForSitePerProcess");
-  app.commandLine.appendSwitch("renderer-process-limit", "2");
-}
-
-/** Windows toast AUMID — required for Notification sounds/toasts on Windows 10/11. */
 if (process.platform === "win32") {
   app.setAppUserModelId(app.isPackaged ? "com.landev.track" : "com.landev.track.dev");
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 process.env.APP_ROOT = path.join(__dirname, "..");
-
 export const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
-export const MAIN_DIST = path.join(process.env.APP_ROOT, "dist-electron");
 export const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
-
-process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path.join(process.env.APP_ROOT, "public") : RENDERER_DIST;
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
+  ? path.join(process.env.APP_ROOT, "public")
+  : RENDERER_DIST;
 
 let win: BrowserWindow | null;
 
 function focusMainWindow(): void {
-  if (!win || win.isDestroyed()) {
-    return;
-  }
-  if (win.isMinimized()) {
-    win.restore();
-  }
-  if (!win.isVisible()) {
-    win.show();
-  }
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  if (!win.isVisible()) win.show();
   win.focus();
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
-
 if (!gotSingleInstanceLock) {
-  logger.warn("second-instance-quit", { pid: process.pid });
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    logger.info("second-instance-blocked-focusing-existing", { pid: process.pid });
-    focusMainWindow();
-  });
-}
-
-function setupDisplayMediaHandler(): void {
-  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-    desktopCapturer
-      .getSources({ types: ["screen"], thumbnailSize: { width: 480, height: 270 } })
-      .then((sources) => {
-        const screen = sources.find((source) => source.id.toLowerCase().startsWith("screen")) ?? sources[0];
-        for (const source of sources) {
-          if (source !== screen) {
-            releaseNativeImage(source.thumbnail);
-          }
-        }
-        if (screen) {
-          callback({ video: screen, audio: "loopback" });
-          return;
-        }
-        callback({});
-      })
-      .catch((error) => {
-        logger.warn("display-media-handler-failed", { error });
-        callback({});
-      });
-  });
-}
-
-function resolveAppIconPath(): string {
-  const candidates: string[] = [];
-  if (app.isPackaged) {
-    candidates.push(
-      path.join(process.resourcesPath, "icon.ico"),
-      path.join(process.resourcesPath, "app-icon.png")
-    );
-  }
-  candidates.push(
-    path.join(process.env.APP_ROOT, "build", "icons", "icon.ico"),
-    path.join(process.env.VITE_PUBLIC, "app-icon.png")
-  );
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return candidates[candidates.length - 1];
+  app.on("second-instance", () => focusMainWindow());
 }
 
 function loadAppIcon() {
-  const iconPath = resolveAppIconPath();
-  if (!fs.existsSync(iconPath)) {
-    return undefined;
+  const candidates = [
+    path.join(process.env.APP_ROOT ?? "", "build", "icons", "icon.ico"),
+    path.join(process.env.VITE_PUBLIC ?? "", "app-icon.png")
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      const image = nativeImage.createFromPath(candidate);
+      if (!image.isEmpty()) return image;
+    }
   }
-  const image = nativeImage.createFromPath(iconPath);
-  return image.isEmpty() ? undefined : image;
+  return undefined;
 }
 
 function createWindow() {
-  const windowIcon = loadAppIcon();
+  const icon = loadAppIcon();
   win = new BrowserWindow({
-    width: 400,
+    width: 420,
     height: 720,
-    minWidth: 360,
-    minHeight: 560,
+    minWidth: 380,
+    minHeight: 600,
     title: "LANDEV Tracker",
-    ...(windowIcon ? { icon: windowIcon } : {}),
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.mjs"),
       contextIsolation: true,
@@ -174,40 +110,14 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
-  }
-});
-
-let isQuitting = false;
-app.on("before-quit", (event) => {
-  if (isQuitting) {
-    return;
-  }
-  event.preventDefault();
-  isQuitting = true;
-  void stopActiveSessionIfRunning({ awaitBackgroundSync: true })
-    .catch((error) => {
-      logger.warn("stop-on-app-quit-failed", { error });
-    })
-    .finally(() => {
-      app.exit(0);
-    });
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
 app.whenReady().then(() => {
-  if (!gotSingleInstanceLock) {
-    return;
-  }
+  if (!gotSingleInstanceLock) return;
   readEnv();
   setupCrashAndDiagnostics();
-  setupDisplayMediaHandler();
-  if (process.platform === "win32" && app.isPackaged) {
-    refreshWindowsShortcuts();
-  }
   createWindow();
-  if (win) {
-    setupAutoUpdate(win);
-  }
-  logger.info("app-ready");
+  startAutoUpdater(() => win);
+  logger.info("app-ready-tracker-v2", { apiBaseUrl: readEnv().VITE_API_BASE_URL });
 });

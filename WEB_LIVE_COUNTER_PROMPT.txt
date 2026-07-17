@@ -1,0 +1,172 @@
+Copy everything below into your **Landev web / Next.js** Cursor chat.
+
+---
+
+# Task: Live session counter on the web dashboard (desktop-ready)
+
+You are working in the **Landev web app**. The **LANDEV Tracker desktop** now sends full live-clock fields on Start/Stop. Implement (or fix) the web live counter so it ticks every second while a session is active.
+
+**Do not change the Electron desktop app — web/backend + dashboard UI only.**
+
+---
+
+## Expected UX
+
+| State | Web live counter |
+|-------|------------------|
+| Desktop **Start** | Becomes active within ≤5s (immediately if `SESSION_START` trailing event is processed) |
+| Session **active** | Ticks every second: `0:01`, `0:02`, … `H:MM:SS` |
+| Page refresh while active | Resumes from `Date.now() - startedAt` (not `0:00`) |
+| Desktop **Stop** | Freezes at final duration within ≤5s |
+| Multiple Start/Stop same day | Each new Start creates a new segment with a new `startedAt` |
+
+---
+
+## Desktop contract (already shipped)
+
+### POST `/api/tracking/session/start`
+
+Desktop sends (among other fields):
+
+```json
+{
+  "projectId": "…",
+  "projectName": "Admin - New Task",
+  "description": "…",
+  "clientTimeZone": "Europe/Istanbul",
+  "workDateKey": "2026-07-15",
+  "startedAt": "2026-07-15T13:00:00.000Z",
+  "startTime": "2026-07-15T13:00:00.000Z",
+  "startTimeUtc": "2026-07-15T13:00:00.000Z",
+  "occurredAt": "2026-07-15T13:00:00.000Z",
+  "trailingEvents": [
+    {
+      "eventUuid": "…",
+      "eventKind": "SESSION_START",
+      "type": "SESSION_START",
+      "occurredAtIso": "2026-07-15T13:00:00.000Z",
+      "occurredAt": "2026-07-15T13:00:00.000Z",
+      "workDateKey": "2026-07-15",
+      "clientTimeZone": "Europe/Istanbul",
+      "projectId": "…",
+      "projectName": "Admin - New Task",
+      "source": "DESKTOP_AGENT"
+    }
+  ]
+}
+```
+
+**Web MUST:**
+1. Persist `startedAt` exactly as sent (UTC ISO).
+2. Mark session **active** immediately.
+3. Return `sessionId` / `workSessionId` in the response.
+4. Process `trailingEvents` (`SESSION_START`) so dashboards can update without waiting for the next poll.
+
+### POST `/api/tracking/session/stop`
+
+Desktop sends `stoppedAt`, `startedAt`, `durationMs`, `workDateKey`, and:
+
+```json
+"trailingEvents": [
+  {
+    "eventUuid": "…",
+    "eventKind": "SESSION_STOP",
+    "type": "SESSION_STOP",
+    "occurredAtIso": "…",
+    "workDateKey": "…",
+    "sessionId": "…",
+    "workSessionId": "…",
+    "source": "DESKTOP_AGENT"
+  }
+]
+```
+
+**Web MUST:** set stop time, clear active flag, freeze counter immediately.
+
+---
+
+## Active session API (required for live counter)
+
+`GET /api/tracking/session/active`  
+Fallbacks: `/api/tracking/session/status`, `/api/attendance/today`
+
+**Running:**
+```json
+{
+  "active": true,
+  "workSession": {
+    "id": "clx…",
+    "sessionId": "clx…",
+    "projectId": "…",
+    "projectName": "Admin - New Task",
+    "description": "…",
+    "startedAt": "2026-07-15T13:00:00.000Z",
+    "startTime": "2026-07-15T13:00:00.000Z",
+    "stoppedAt": null
+  }
+}
+```
+
+**Stopped:**
+```json
+{
+  "active": false,
+  "workSession": null
+}
+```
+
+Accept start aliases: `startedAt` | `startTime` | `startTimeUtc` | `clockInAt`.
+
+---
+
+## Web UI: live counter (required)
+
+The live counter is **client-side**. Do **not** rely on server-pushed duration every second.
+
+```tsx
+function useLiveSessionTimer(active: boolean, startedAt: string | null): string {
+  const [label, setLabel] = useState("0:00:00");
+
+  useEffect(() => {
+    if (!active || !startedAt) {
+      setLabel("0:00:00");
+      return;
+    }
+    const startedMs = Date.parse(startedAt);
+    if (!Number.isFinite(startedMs)) {
+      setLabel("0:00:00");
+      return;
+    }
+    const tick = () => {
+      const ms = Math.max(0, Date.now() - startedMs);
+      setLabel(formatHms(ms)); // H:MM:SS
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [active, startedAt]);
+
+  return label;
+}
+```
+
+Also:
+- Poll active session every **3–5 seconds** to resync `active` + `startedAt` after remote Start/Stop.
+- On Stop, show final `durationMs` or `stoppedAt - startedAt` and **stop** the interval.
+- Day total (if shown) = sum of completed segments + live open segment.
+
+**Never** use activity / APP_FOCUS sums for the live session clock.
+
+---
+
+## Acceptance tests
+
+- [ ] Desktop Start → web counter ticks within 5s
+- [ ] Refresh mid-session → counter continues from correct elapsed
+- [ ] Desktop Stop → counter freezes within 5s
+- [ ] `GET /api/tracking/session/active` while running returns `active: true` + non-null `startedAt`
+- [ ] Second Start same day → new `startedAt`, counter resets for the new segment (day total still cumulative if shown)
+
+---
+
+**Start by:** auditing session start/stop ingest + `session/active` response, then wiring `useLiveSessionTimer` on the dashboard.

@@ -1,11 +1,11 @@
 export {};
 
-type TrackingStatus = {
-  active: boolean;
-  sessionId: string | null;
-  projectId: string | null;
-  description: string | null;
-  startedAt: string | null;
+type UserProfile = {
+  id: string | null;
+  name: string;
+  username: string;
+  email: string | null;
+  roles: string[];
 };
 
 type Project = {
@@ -16,110 +16,55 @@ type Project = {
   projectNumber: string | null;
   projectAddress: string | null;
   clientName: string | null;
-  isNonChargeable?: boolean;
-  isCatalogDefault?: boolean;
 };
 
-type SyncStatus = {
-  online: boolean;
-  syncing: boolean;
-  pendingCount: number;
-  nextRetryAt: string | null;
-  lastError: string | null;
-  lastSyncAt: string | null;
-};
-
-type AppInfo = {
-  appName: string;
-  appVersion: string;
-  electronVersion: string;
-  nodeVersion: string;
-  platform: string;
-  arch: string;
-  env: string;
-  apiBaseUrl: string;
-};
-
-type StopSessionResult = {
-  ok: true;
-  queued: boolean;
-  endpointPath: string;
-  status: number | null;
-  confirmedBy: "tracking" | "attendance" | "idempotent";
+type TrackingStatus = {
+  active: boolean;
   sessionId: string | null;
-  timesheetId: string | null;
-  responsePreview: string | null;
-};
-
-type TrackingDebugSnapshot = {
-  counters: {
-    totalCaptured: number;
-    totalSynced: number;
-    missingWindowTitleCount: number;
-    fallbackAppNameCount: number;
-    normalizedAppNameCount: number;
-  };
-  lastSync: {
-    ok: boolean;
-    statusCode: number | null;
-    message: string;
-    at: string | null;
-  };
-  events: Array<{
-    capturedAt: string;
-    eventId: string;
-    eventType: string;
-    rawApplication: string;
-    rawWindowTitle: string;
-    processName: string;
-    application: string;
-    hasWindowTitle: boolean;
-    hasForegroundWindowHandle: boolean;
-    source: string;
-    windowReasonCode: string | null;
-  }>;
+  projectId: string | null;
+  projectName: string | null;
+  description: string;
+  draftDescription: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  todayCompletedMs: number;
+  appsUsed: Array<{ displayName: string; processName: string | null; seconds: number }>;
+  status: "idle" | "tracking" | "starting" | "stopping";
 };
 
 declare global {
   interface Window {
     desktopAPI: {
-      login: (payload: { username: string; password: string }) => Promise<{ ok: true; roles: string[] }>;
-      authStatus: () => Promise<{ authenticated: boolean; roles: string[] }>;
+      login: (payload: {
+        username: string;
+        password: string;
+      }) => Promise<{ ok: true; profile: UserProfile; tracking: TrackingStatus }>;
       logout: () => Promise<{ ok: true }>;
-      getAppInfo: () => Promise<AppInfo>;
-      openExternalUrl: (url: string) => Promise<{ ok: true }>;
+      authStatus: () => Promise<{
+        authenticated: boolean;
+        profile: UserProfile | null;
+        tracking: TrackingStatus;
+      }>;
       testConnection: () => Promise<{ reachable: boolean; message: string }>;
-      getProjects: () => Promise<{ projects: Project[]; roles?: string[] }>;
-      onProjectsPush: (
-        cb: (payload: { projects: Project[]; roles: string[]; fetchedAt: string }) => void
-      ) => () => void;
-      getNotificationSoundEnabled: () => Promise<{ enabled: boolean }>;
-      setNotificationSoundEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>;
-      getAppUpdateStatus: () => Promise<import("./app-update").AppUpdateStatus>;
-      checkForAppUpdates: () => Promise<import("./app-update").AppUpdateStatus>;
-      retryAppUpdate: () => Promise<import("./app-update").AppUpdateStatus>;
-      downloadAppUpdate: () => Promise<import("./app-update").AppUpdateStatus>;
-      installAppUpdate: () => Promise<{ ok: true }>;
-      onAppUpdateStatusPush: (cb: (status: import("./app-update").AppUpdateStatus) => void) => () => void;
-      getRecentTasks: () => Promise<import("./recent-task").RecentWorkTask[]>;
-      getWorkSummary: () => Promise<import("./work-summary").WorkSummary>;
-      startSession: (payload: {
+      getAppInfo: () => Promise<{
+        appName: string;
+        appVersion: string;
+        env: string;
+        apiBaseUrl: string;
+      }>;
+      getProjects: () => Promise<{ projects: Project[] }>;
+      getTrackingStatus: () => Promise<TrackingStatus>;
+      startTracking: (payload: {
         projectId: string;
-        projectName?: string;
-        isNonChargeable?: boolean;
+        projectName: string;
         description: string;
-      }) => Promise<{ sessionId: string | null }>;
-      stopSession: (payload: { stoppedAt: string }) => Promise<StopSessionResult>;
-      trackEvent: (payload: { type: string; occurredAt: string; metadata?: Record<string, unknown> }) => Promise<{ queued: boolean }>;
-      getStatus: () => Promise<TrackingStatus>;
-      getSyncStatus: () => Promise<SyncStatus>;
-      getTrackingDebugEvents: () => Promise<TrackingDebugSnapshot>;
-      getTrackingConsentStatus: () => Promise<{ accepted: boolean }>;
-      acceptTrackingConsent: () => Promise<{ accepted: true }>;
-      syncNow: () => Promise<{ ok: true; status?: SyncStatus }>;
-      onStatusPush: (cb: (status: TrackingStatus) => void) => () => void;
-      onStartFailed: (cb: (payload: { message: string }) => void) => () => void;
-      onSyncStatusPush: (cb: (status: SyncStatus) => void) => () => void;
+      }) => Promise<TrackingStatus>;
+      stopTracking: () => Promise<TrackingStatus>;
+      saveDescription: (description: string) => Promise<{ ok: true }>;
+      getRecentProjects: () => Promise<{
+        projects: Array<{ projectId: string; projectName: string; lastWorkedAt: string }>;
+      }>;
+      onTrackingStatus: (cb: (status: TrackingStatus) => void) => () => void;
     };
   }
 }

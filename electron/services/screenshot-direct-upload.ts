@@ -149,6 +149,9 @@ async function uploadBytesToSupabase(params: {
   imageBytes: Buffer;
   mimeType: string;
 }): Promise<void> {
+  // Hard guard: never PUT/POST image bytes to Vercel / API hosts.
+  api.assertScreenshotStorageUrl(params.sign.signedUrl);
+
   const strategies: Array<{ name: string; run: () => Promise<void> }> = [
     { name: "put-signed-url-as-is", run: () => putSignedUrlAsIs(params) },
     { name: "put-query-token", run: () => putWithQueryToken(params) },
@@ -306,8 +309,8 @@ async function commitWithRetries(
 }
 
 /**
- * Screenshot upload: sign → Supabase bytes → commit.
- * Image bytes never pass through Vercel; on failure callers should queue locally.
+ * Screenshot upload: sign (JSON via API) → image bytes to Supabase storage → commit (JSON via API).
+ * Image bytes never pass through Vercel. On failure callers should queue locally.
  */
 export async function uploadScreenshotDirect(
   payload: ScreenshotUploadPayload,
